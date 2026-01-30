@@ -6,6 +6,8 @@
 //
 
 #include "llm/llm.hpp"
+#define CPPHTTPLIB_NO_EXCEPTIONS
+#include "llm/httplib.h"
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
@@ -18,6 +20,67 @@
 #include "audio/audio.hpp"
 #endif
 using namespace MNN::Transformer;
+
+
+int start_http_server(Llm* llm, int port) {
+    using namespace httplib;
+    Server svr;
+
+    svr.Post("/generate", [llm](const Request& req, Response& res) {
+        if (!req.has_param("prompt")) {
+            res.status = 400;
+            res.set_content(R"({"error": "Missing 'prompt' parameter"})", "application/json");
+            std::cerr << "[HTTP] ❌ Missing 'prompt' parameter" << std::endl;
+            return;
+        }
+
+        std::string prompt = req.get_param_value("prompt");
+
+        // 🔵 打印接收到的 prompt
+        std::cout << "\n========== HTTP Request Received ==========" << std::endl;
+        std::cout << "Prompt: " << prompt << std::endl;
+        std::cout << "------------------------------------------" << std::endl;
+
+        std::ostringstream oss;
+        llm->response(prompt, &oss);
+        std::string result = oss.str();
+
+        // 🔴【修复】使用正确的 JSON 转义函数（避免破坏结构）
+        auto escape_json_string = [](const std::string& input) -> std::string {
+            std::ostringstream escaped;
+            for (char c : input) {
+                switch (c) {
+                    case '"':  escaped << "\\\""; break;
+                    case '\\': escaped << "\\\\"; break;
+                    case '\n': escaped << "\\n"; break;
+                    case '\r': escaped << "\\r"; break;
+                    case '\t': escaped << "\\t"; break;
+                    default:
+                        if (c >= 0 && c <= 0x1f) {
+                            escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int)c;
+                        } else {
+                            escaped << c;
+                        }
+                }
+            }
+            return escaped.str();
+        };
+
+        std::string escaped_result = escape_json_string(result);
+        std::string json_response = R"({"response":")" + escaped_result + R"("})";
+
+        // 🟢 打印最终返回的 response
+        std::cout << "LLM Response: " << result << std::endl;
+        std::cout << "==========================================" << std::endl << std::endl;
+
+        res.set_content(json_response, "application/json");
+    });
+
+    svr.set_mount_point("/", "./web");
+    std::cout << "Server listening on http://127.0.0.1:" << port << std::endl;
+    svr.listen("127.0.0.1", port);
+    return 0;
+}
 
 static void tuning_prepare(Llm* llm) {
     MNN_PRINT("Prepare for tuning opt Begin\n");
@@ -274,6 +337,20 @@ int main(int argc, const char* argv[]) {
         AUTOTIME;
         tuning_prepare(llm.get());
     }
+
+
+    // ===== 新增：HTTP Server 模式 =====
+    if (argc >= 3 && std::string(argv[2]) == "--server") {
+        int port = 8080;
+        if (argc >= 4) {
+            port = std::atoi(argv[3]);
+        }
+        // 设置为同步模式（避免异步问题）
+        llm->set_config(R"({"async":false})");
+        return start_http_server(llm.get(), port);
+    }
+
+
     if (argc < 3) {
         chat(llm.get());
         return 0;

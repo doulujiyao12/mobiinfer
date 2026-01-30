@@ -68,14 +68,38 @@ class GPTQ:
             self.load_safetensor(tensor)
 
     def prefix(self, name):
+        """从完整键名中提取 MNN 兼容的模块前缀（格式: {layer_idx}.{module_type}.{proj_name}）"""
         splits = name.split('.')
-        if 'lm_head' in splits[0] and len(splits) == 2:
-            return splits[0], splits[1]
-        if len(splits) < 5:
+        
+        # 处理 lm_head (MNN 可能不需要，但保持兼容)
+        if 'lm_head' in name and len(splits) >= 2 and splits[-1] in ['qweight', 'scales']:
+            return 'lm_head', splits[-1]
+        
+        # 关键修复：精确解析 layers.X.{module}.{proj}.qweight/scales
+        try:
+            # 查找 'layers' 的位置（兼容 model.language_model.layers 或 model.layers）
+            layers_idx = -1
+            for i, part in enumerate(splits):
+                if part == 'layers':
+                    layers_idx = i
+                    break
+            if layers_idx == -1 or layers_idx + 3 >= len(splits):
+                return None, None
+            
+            layer_idx = splits[layers_idx + 1]      # 例如 "0"
+            module_type = splits[layers_idx + 2]    # 例如 "self_attn" 或 "mlp"
+            proj_name = splits[layers_idx + 3]      # 例如 "q_proj", "down_proj"
+            suffix = splits[-1]                     # "qweight" 或 "scales"
+            
+            # 验证 suffix 有效性
+            if suffix not in ['qweight', 'scales']:
+                return None, None
+            
+            # 构造 MNN 兼容键: "0.self_attn.q_proj"
+            prefix = f"{layer_idx}.{module_type}.{proj_name}"
+            return prefix, suffix
+        except Exception:
             return None, None
-        pre = f'{splits[2]}.{splits[3]}.{splits[4]}'
-        suf = splits[-1]
-        return pre, suf
 
     def get(self, key : str):
         if key in self.weight_dict:

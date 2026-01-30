@@ -15,6 +15,10 @@
 # Java class files
 *.class
 
+model/
+transformers/llm/export/model/
+transformers/llm/export/log.txt
+
 # Generated files
 bin/
 gen/

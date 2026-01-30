@@ -6,7 +6,7 @@ import functools
 
 from tqdm import tqdm
 from collections import defaultdict
-from typing import Tuple, List, Union, Dict
+from typing import Tuple, List, Union, Dict, Any
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -14,13 +14,123 @@ class AwqQuantizer:
     def __init__(
         self,
         model,
-        modules_to_not_convert=None,
+        modules_to_not_convert=[
+    "blocks.0.attn.qkv",
+    "blocks.0.attn.proj",
+    "blocks.0.mlp.linear_fc1",
+    "blocks.0.mlp.linear_fc2",
+    "blocks.1.attn.qkv",
+    "blocks.1.attn.proj",
+    "blocks.1.mlp.linear_fc1",
+    "blocks.1.mlp.linear_fc2",
+    "blocks.2.attn.qkv",
+    "blocks.2.attn.proj",
+    "blocks.2.mlp.linear_fc1",
+    "blocks.2.mlp.linear_fc2",
+    "blocks.3.attn.qkv",
+    "blocks.3.attn.proj",
+    "blocks.3.mlp.linear_fc1",
+    "blocks.3.mlp.linear_fc2",
+    "blocks.4.attn.qkv",
+    "blocks.4.attn.proj",
+    "blocks.4.mlp.linear_fc1",
+    "blocks.4.mlp.linear_fc2",
+    "blocks.5.attn.qkv",
+    "blocks.5.attn.proj",
+    "blocks.5.mlp.linear_fc1",
+    "blocks.5.mlp.linear_fc2",
+    "blocks.6.attn.qkv",
+    "blocks.6.attn.proj",
+    "blocks.6.mlp.linear_fc1",
+    "blocks.6.mlp.linear_fc2",
+    "blocks.7.attn.qkv",
+    "blocks.7.attn.proj",
+    "blocks.7.mlp.linear_fc1",
+    "blocks.7.mlp.linear_fc2",
+    "blocks.8.attn.qkv",
+    "blocks.8.attn.proj",
+    "blocks.8.mlp.linear_fc1",
+    "blocks.8.mlp.linear_fc2",
+    "blocks.9.attn.qkv",
+    "blocks.9.attn.proj",
+    "blocks.9.mlp.linear_fc1",
+    "blocks.9.mlp.linear_fc2",
+    "blocks.10.attn.qkv",
+    "blocks.10.attn.proj",
+    "blocks.10.mlp.linear_fc1",
+    "blocks.10.mlp.linear_fc2",
+    "blocks.11.attn.qkv",
+    "blocks.11.attn.proj",
+    "blocks.11.mlp.linear_fc1",
+    "blocks.11.mlp.linear_fc2",
+    "blocks.12.attn.qkv",
+    "blocks.12.attn.proj",
+    "blocks.12.mlp.linear_fc1",
+    "blocks.12.mlp.linear_fc2",
+    "blocks.13.attn.qkv",
+    "blocks.13.attn.proj",
+    "blocks.13.mlp.linear_fc1",
+    "blocks.13.mlp.linear_fc2",
+    "blocks.14.attn.qkv",
+    "blocks.14.attn.proj",
+    "blocks.14.mlp.linear_fc1",
+    "blocks.14.mlp.linear_fc2",
+    "blocks.15.attn.qkv",
+    "blocks.15.attn.proj",
+    "blocks.15.mlp.linear_fc1",
+    "blocks.15.mlp.linear_fc2",
+    "blocks.16.attn.qkv",
+    "blocks.16.attn.proj",
+    "blocks.16.mlp.linear_fc1",
+    "blocks.16.mlp.linear_fc2",
+    "blocks.17.attn.qkv",
+    "blocks.17.attn.proj",
+    "blocks.17.mlp.linear_fc1",
+    "blocks.17.mlp.linear_fc2",
+    "blocks.18.attn.qkv",
+    "blocks.18.attn.proj",
+    "blocks.18.mlp.linear_fc1",
+    "blocks.18.mlp.linear_fc2",
+    "blocks.19.attn.qkv",
+    "blocks.19.attn.proj",
+    "blocks.19.mlp.linear_fc1",
+    "blocks.19.mlp.linear_fc2",
+    "blocks.20.attn.qkv",
+    "blocks.20.attn.proj",
+    "blocks.20.mlp.linear_fc1",
+    "blocks.20.mlp.linear_fc2",
+    "blocks.21.attn.qkv",
+    "blocks.21.attn.proj",
+    "blocks.21.mlp.linear_fc1",
+    "blocks.21.mlp.linear_fc2",
+    "blocks.22.attn.qkv",
+    "blocks.22.attn.proj",
+    "blocks.22.mlp.linear_fc1",
+    "blocks.22.mlp.linear_fc2",
+    "blocks.23.attn.qkv",
+    "blocks.23.attn.proj",
+    "blocks.23.mlp.linear_fc1",
+    "blocks.23.mlp.linear_fc2",
+    "merger.linear_fc1",
+    "merger.linear_fc2",
+    "deepstack_merger_list.0.linear_fc1",
+    "deepstack_merger_list.0.linear_fc2",
+    "deepstack_merger_list.1.linear_fc1",
+    "deepstack_merger_list.1.linear_fc2",
+    "deepstack_merger_list.2.linear_fc1",
+    "deepstack_merger_list.2.linear_fc2",
+    "lm_head",
+    "model.visual.deepstack_merger_list",
+    "model.visual.blocks"
+  ],
         apply_clip=True,
         n_parallel_calib_samples=None,
         max_calib_samples=128,
-        max_calib_seq_len=512,
+        max_calib_seq_len=2048,
         max_chunk_memory=1024 * 1024 * 1024,
     ) -> None:
+        print("bbb")
+        print(model)
         self.awq_model = model
         self.model = model
         self.tokenizer = model.tokenizer
@@ -625,7 +735,7 @@ class AwqQuantizer:
 
         filtered_layers = {}
         for name, linear_layer in linear_layers.items():
-            if not any(key in name for key in modules_to_not_convert):
+            if not any(name.endswith(key) or (('.' + key) in name) for key in modules_to_not_convert):
                 filtered_layers[name] = linear_layer
         return filtered_layers
     
@@ -682,65 +792,118 @@ class AwqQuantizer:
 
     @staticmethod
     def get_calib_dataset(
-        data: Union[str, List[str], List[List[int]]] = "pileval",
+        data: Union[str, List[str], List[List[int]], List[Dict[str, Any]]] = "pileval",
         tokenizer=None,
         n_samples=128,
         max_seq_len=512,
         split="train",
-        text_column="text",
+        text_column="text",  # only used for HuggingFace dataset; ignored for JSON list
     ):
+        # Handle different input types
         if isinstance(data, str):
             from datasets import load_dataset
             if data == "pileval":
                 dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
             elif data == "wikitext":
-                
                 dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
             else:
                 dataset = load_dataset(data, split=split)
-
+            # Extract text column
+            raw_texts = [ex[text_column] for ex in dataset]
         elif isinstance(data, list):
-            if isinstance(data[0], str):
-                dataset = [{text_column: text} for text in data]
-            elif isinstance(data[0][0], int):
-                dataset = data
+            if len(data) == 0:
+                raise ValueError("Input data list is empty.")
+            first = data[0]
+            if isinstance(first, str):
+                # List of raw strings
+                raw_texts = data
+            elif isinstance(first, dict) and "conversations" in first:
+                # Your JSON format: concatenate all conversation turns (human + gpt + ...)
+                raw_texts = []
+                import random
+                # 可选：打乱顺序（建议设置 random.seed 保证可复现）
+                # random.shuffle(data)  # in-place shuffle
+
+                # 更安全：创建 shuffled copy
+                shuffled_data = data[:]
+                random.shuffle(shuffled_data)  # 需要 import random
+
+                raw_texts = []
+                for item in shuffled_data:
+                    convs = item.get("conversations", [])
+                    if not convs:
+                        continue
+                    turns = []
+                    for msg in convs:
+                        if "value" in msg:
+                            # Remove <image> tag and clean up whitespace
+                            text = msg["value"].replace("<image>", "").strip()
+                            if text:  # only keep non-empty after cleaning
+                                turns.append(text)
+                        else:
+                            logging.warning("Skipping message without 'value' field.")
+                    if turns:
+                        full_dialogue = "\n".join(turns)
+                        raw_texts.append(full_dialogue)
+                    else:
+                        logging.warning("Skipping item with no valid messages after cleaning.")
+            elif isinstance(first, list) and isinstance(first[0], int):
+                # Already tokenized
+                samples = []
+                n_run = 0
+                for line_encoded in data:
+                    if len(line_encoded) > max_seq_len:
+                        continue
+                    sample = torch.tensor([line_encoded])
+                    if sample.numel() == 0:
+                        continue
+                    samples.append(sample)
+                    n_run += 1
+                    if n_run == n_samples:
+                        break
+                cat_samples = torch.cat(samples, dim=1)
+                n_split = cat_samples.shape[1] // max_seq_len
+                logging.debug(f" * Split into {n_split} blocks")
+                return [
+                    cat_samples[:, i * max_seq_len : (i + 1) * max_seq_len]
+                    for i in range(n_split)
+                ]
             else:
                 raise NotImplementedError(
-                    "Either pass a string to a huggingface dataset or a list"
-                    "that is preprocessed with one sample of text per element"
-                    " or a list of list of int for tokenized words."
+                    "Unsupported list format. Expected list of strings, list of token lists, "
+                    "or list of dicts with 'conversations'."
                 )
         else:
-            raise NotImplementedError(
-                "Either pass a string to a huggingface dataset or a list"
-                "that is preprocessed with one sample of text per element"
-                " or a list of list of int for tokenized words."
-            )
+            raise NotImplementedError("Data must be str, list of str, list of token lists, or list of dicts.")
 
+        # Now process raw_texts with tokenizer
         samples = []
         n_run = 0
-        for data in dataset:
-            if isinstance(data, list):
-                line_encoded = data
-            else:
-                line = data[text_column]
-                line = line.strip()
-                line_encoded = tokenizer.encode(line)
+        for line in raw_texts:
+            line = line.strip()
+            if not line:
+                continue
+            line_encoded = tokenizer.encode(line)
             if len(line_encoded) > max_seq_len:
                 continue
-            sample = torch.tensor([line_encoded])
+            sample = torch.tensor([line_encoded], dtype=torch.long)
             if sample.numel() == 0:
                 continue
             samples.append(sample)
             n_run += 1
-            if n_run == n_samples:
+            if n_run >= n_samples:
                 break
-        # now concatenate all samples and split according to max sequence length
+
+        if not samples:
+            raise ValueError("No valid samples collected for calibration.")
+
+        # Concatenate and split into max_seq_len blocks
         cat_samples = torch.cat(samples, dim=1)
         n_split = cat_samples.shape[1] // max_seq_len
-        logging.debug(f" * Split into {n_split} blocks")
+        logging.debug(f" * Split into {n_split} blocks of length {max_seq_len}")
         return [
-            cat_samples[:, i * max_seq_len : (i + 1) * max_seq_len] for i in range(n_split)
+            cat_samples[:, i * max_seq_len : (i + 1) * max_seq_len]
+            for i in range(n_split)
         ]
 
     @staticmethod
@@ -800,8 +963,13 @@ class AwqQuantizer:
 
     def init_quant(self, n_samples=128, max_seq_len=512):
         modules = self.awq_model.blocks
+        import json
+        with open("/data/fengdahu/tmp/dataset_calib1208/mobimind_calibration_20k.json", "r", encoding="utf-8") as f:
+            calib_data = json.load(f)
+
+        
         samples = AwqQuantizer.get_calib_dataset(
-            data=self.calib_data,
+            data=calib_data,
             tokenizer=self.tokenizer,
             n_samples=n_samples,
             max_seq_len=max_seq_len,
@@ -811,12 +979,14 @@ class AwqQuantizer:
         inps = []
         layer_kwargs = {}
         # build inps
+        self.model._calib_input_ids = samples  # ← 关键：保存 input_ids
         self.model.seq_len = samples.numel()
         self.model.context_len = samples.numel() - 2
         self.model.token_len = 0
         best_device = AwqQuantizer.get_best_device()
         inps = self.model.embedding(samples).to(best_device)
         position_ids = self.model.get_position_ids()
+        self.model._calib_input_ids = None
         rotary_pos_emb = self.model.rotary(position_ids)
         attention_mask = self.model.get_attention_mask()
         layer_kwargs["rotary_pos_emb"] = rotary_pos_emb.to(best_device)

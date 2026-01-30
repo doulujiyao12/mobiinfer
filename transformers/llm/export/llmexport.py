@@ -332,6 +332,8 @@ class LlmExporter(torch.nn.Module):
         return None
 
     def get_position_ids(self, input_ids = None) -> torch.Tensor:
+        if hasattr(self, '_calib_input_ids') and self._calib_input_ids is not None:
+            input_ids = self._calib_input_ids
         if self.visual is not None and hasattr(self.visual, 'get_position_ids') and callable(getattr(self.visual, 'get_position_ids')):
             return self.visual.get_position_ids(input_ids, self.seq_len, self.token_len)
         if self.model_type == 'chatglm':
@@ -662,6 +664,8 @@ class LlmExporter(torch.nn.Module):
             tensor_data = self.embed.embed.weight.data
 
         format_bit = getattr(self.args, 'embed_bit', 16)
+
+        print(f"Exporting embedding with bit precision: {format_bit}")
 
         if format_bit == 16:
             # BF16 format
@@ -1542,6 +1546,7 @@ def main():
         llm_exporter.response(args.test)
 
     if args.export is not None:
+        print('export model to', args.export)
         llm_exporter.export(args.export)
 
 if __name__ == '__main__':
