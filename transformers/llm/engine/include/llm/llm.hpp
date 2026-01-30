@@ -59,6 +59,13 @@ enum TuneType {
     // op encoder number for commit
     OP_ENCODER_NUMBER = 0,
 };
+enum class LlmStatus {
+    RUNNING = 0,
+    NORMAL_FINISHED = 1,
+    MAX_TOKENS_FINISHED = 2,
+    USER_CANCEL = 3,
+    INTERNAL_ERROR = 4,
+};
 enum class MatchStrictLevel : int;
 enum class NgramSelectRule : int;
 
@@ -84,6 +91,8 @@ struct LlmContext {
     std::vector<int> history_tokens;
     std::vector<int> output_tokens;
     std::string generate_str;
+    // llm status
+    LlmStatus status;
 };
 struct GenerationParams;
 class MNN_PUBLIC Llm {
@@ -112,6 +121,7 @@ public:
     void setKVCacheInfo(size_t add, size_t remove, int* reserve = nullptr, int n_reserve = 0);
     size_t getCurrentHistory() const;
     void eraseHistory(size_t begin, size_t end);
+    bool setPrefixCacheFile(const std::string& filename, int flag = 0);
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const std::string& user_content, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const ChatMessages& chat_prompts, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
@@ -179,7 +189,6 @@ private:
     std::shared_ptr<Generation> mGenerationStrategy;
     void setSpeculativeConfig();
     void updateContext(int seq_len, int gen_len);
-
 private:
     bool mInSpec = false;
     int mDraftLength = 4;
@@ -187,6 +196,11 @@ private:
     bool mAsync = true;
     int mBlockSize = 0;
     std::vector<int> mValidBlockSize;
+    bool mPrefixCacheMode = false;
+    std::string mPrefixCacheFileName;
+    int mCallIndex;
+    int mPrefixLength;
+    bool mIsPrefixFileExist = false;
 };
 
 // Embedding start

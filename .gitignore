@@ -385,3 +385,10 @@ apps/mnncli/model_market_json_data.inc
 _deps
 #aicoding
 .cursor
+
+# llm model
+transformers/llm/export/model/
+apps/Android/.qoder/settings.json
+apps/Android/MnnLlmChatOld
+
+transformers/llm/export/tmp/

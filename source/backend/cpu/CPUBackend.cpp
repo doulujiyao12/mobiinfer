@@ -104,15 +104,14 @@ void CPURuntime::_bindCPUCore() const {
 #ifdef MNN_USE_THREAD_POOL
     if (nullptr != mThreadPool) {
         mThreadPool->active();
-        mThreadPool->enqueue(std::make_pair([&](int i) {
+        ThreadPool::TASK task = std::make_pair([&](int i) {
             MNNSetSchedAffinity(lockCPUIndexes[i].first, lockCPUIndexes[i].second);
-            return 0;
-        }, mThreadNumber), mTaskIndex);
+        }, mThreadNumber);
+        mThreadPool->enqueue(&task, mTaskIndex);
         mThreadPool->deactive();
     }
 #endif
 }
-
 void CPURuntime::_resetThreadPool() const {
     mThreadNumber = std::max(1, mThreadNumber);
     mThreadNumber = std::min(mThreadNumber, MAX_THREAD_NUMBER);
@@ -326,11 +325,7 @@ Backend* CPURuntime::onCreate(const BackendConfig* config, Backend* origin) cons
         auto core = MNNGetCoreFunctions();
         if (core->supportFp16arith && precision == BackendConfig::Precision_Low) {
             res = new Arm82Backend(this, memory);
-            if (hint().useArmSme2Cores && core->supportSME2 && res->functions()->sme2Int8MatmulRelatedFuncionsHp32.Int8GemmKernel) {
-                res->mRelatedFunctions = &(res->functions()->sme2Int8MatmulRelatedFuncionsHp32);
-            } else {
-                res->mRelatedFunctions = &(res->functions()->int8MatmulRelatedFunctions);
-            }
+            res->mRelatedFunctions = &(res->functions()->int8MatmulRelatedFunctions);
             break;
         }
 #endif
@@ -458,12 +453,8 @@ CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode p
     mRuntime = const_cast<CPURuntime*>(runtime);
     auto core = MNNGetCoreFunctions();
     mThreadNumber = mRuntime->mThreadNumber;
-    if (mRuntime->hint().useArmSme2Cores && core->supportSME2 && core->sme2Int8MatmulRelatedFuncionsHp32.Int8GemmKernel) {
-        mThreadNumber = ALIMIN(2, mThreadNumber);
-        mRelatedFunctions = &core->sme2Int8MatmulRelatedFuncionsHp32;
-    } else {
-        mRelatedFunctions = &core->int8MatmulRelatedFunctions;
-    }
+    mRelatedFunctions = &core->int8MatmulRelatedFunctions;
+
     // Compute Group Rate
     do {
         if (mThreadNumber <= 1 || mRuntime->mPower == BackendConfig::Power_Low) {
@@ -499,6 +490,7 @@ CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode p
             currentRate *= decreaseRate;
             totalComputeRate += currentRate * selectSize;
             mGroupWithComputeRate.emplace_back(std::make_pair(currentRate * selectSize, selectSize));
+            groupIndex--;
         }
         for (auto& g : mGroupWithComputeRate) {
             g.first = g.first / totalComputeRate;

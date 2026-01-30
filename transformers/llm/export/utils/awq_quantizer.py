@@ -362,7 +362,7 @@ class AwqQuantizer:
 
         x_mean = (x_sum / num_elements).to(inp.dtype)
         AwqQuantizer.clear_memory(x_sum)
-        
+
         inp = inp.to(next(layers[0].parameters()).device)
         # [STEP 3]: Compute output of module
         with torch.no_grad():
@@ -738,7 +738,7 @@ class AwqQuantizer:
             if not any(name.endswith(key) or (('.' + key) in name) for key in modules_to_not_convert):
                 filtered_layers[name] = linear_layer
         return filtered_layers
-    
+
     @staticmethod
     def to_device(module, device):
         for child_name, child_module in module.named_children():
@@ -748,8 +748,8 @@ class AwqQuantizer:
                         sub_child.to(device)
             else:
                 child_module.to(device)
-    
-    
+
+
     @staticmethod
     def get_named_linears(module):
         linears = {}
@@ -764,10 +764,10 @@ class AwqQuantizer:
                     if isinstance(mod, torch.nn.Linear):
                         full_name = f"{child_name}.{name}" if name else child_name
                         linears[full_name] = mod
-        
+
         return linears
 
-    
+
     @staticmethod
     def get_op_by_name(module, op_name):
         for child_name, child_module in module.named_children():
@@ -775,7 +775,7 @@ class AwqQuantizer:
                 return child_module
             if child_name == 'self_attn':
                 for name, mod in child_module.named_children():
-                    if name != 'config':  
+                    if name != 'config':
                         full_name = f"{child_name}.{name}"
                         if full_name == op_name:
                             return mod
@@ -784,10 +784,10 @@ class AwqQuantizer:
                     full_name = f"{child_name}.{name}" if name else child_name
                     if full_name == op_name:
                         return mod
-        
+
         if op_name == "":
             return module
-        
+
         raise ValueError(f"Cannot find op {op_name} in module {module}")
 
     @staticmethod
@@ -805,6 +805,7 @@ class AwqQuantizer:
             if data == "pileval":
                 dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
             elif data == "wikitext":
+
                 dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
             else:
                 dataset = load_dataset(data, split=split)
@@ -922,7 +923,7 @@ class AwqQuantizer:
         gc.collect()
         torch.cuda.empty_cache()
 
-    
+
     @staticmethod
     def get_op_name(module, op):
         if module is op:
@@ -930,9 +931,9 @@ class AwqQuantizer:
         for child_name, child_module in module.named_children():
             if child_name == 'self_attn':
                 if child_module is op:
-                    return child_name   
+                    return child_name
                 for name, mod in child_module.named_children():
-                    if name != 'config': 
+                    if name != 'config':
                         if mod is op:
                             return f"{child_name}.{name}"
                         for sub_name, sub_mod in mod.named_modules():
@@ -942,12 +943,12 @@ class AwqQuantizer:
             else:
                 if child_module is op:
                     return child_name
-                
+
                 for name, mod in child_module.named_modules():
                     if mod is op:
                         full_name = f"{child_name}.{name}" if name else child_name
                         return full_name
-        
+
         raise ValueError(f"Cannot find op {op} in module {module}")
 
     @staticmethod
@@ -979,16 +980,13 @@ class AwqQuantizer:
         inps = []
         layer_kwargs = {}
         # build inps
-        self.model._calib_input_ids = samples  # ← 关键：保存 input_ids
-        self.model.seq_len = samples.numel()
-        self.model.context_len = samples.numel() - 2
-        self.model.token_len = 0
+        seq_len = samples.numel()
+        new_tokens = 0
         best_device = AwqQuantizer.get_best_device()
         inps = self.model.embedding(samples).to(best_device)
-        position_ids = self.model.get_position_ids()
-        self.model._calib_input_ids = None
+        position_ids = self.model.get_position_ids(seq_len, new_tokens)
         rotary_pos_emb = self.model.rotary(position_ids)
-        attention_mask = self.model.get_attention_mask()
+        attention_mask = self.model.get_attention_mask(seq_len, new_tokens)
         layer_kwargs["rotary_pos_emb"] = rotary_pos_emb.to(best_device)
         layer_kwargs["attention_mask"] = attention_mask.to(best_device)
         del samples

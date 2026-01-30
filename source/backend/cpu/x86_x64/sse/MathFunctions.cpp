@@ -69,67 +69,130 @@ void _SSE_MNNExpC8(float* dest, const float* source, float* offset, const float*
     offset[3] = total;
 }
 
-void _SSE_MNNSoftmax(float* softmaxDst, float* input, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize) {
-    const float xLimit = 87.0f;
-    const float param = 0.6931471805599453f; // ln(2)
-    const float inv_param = 1.0f / param;
-    const int32_t exp_offset = 127;
-    const float exp_scale = 8388608.0f; // 2^23
+void _SSE_MNNSoftmax(float* softmaxDst, const float* softmaxSrc, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize, int kvSeqOffset, int validOffset, int pack, bool mask) {
+    const int packUnit = 4;
+    int reduceSizeOuter = 1;
+    int reduceSizeInner = reduceSize;
+    int stride0         = packUnit;
+    if (pack > 1) {
+        reduceSizeOuter = UP_DIV(reduceSize, pack);
+        reduceSizeInner = pack;
+        stride0         = outside * reduceSizeInner;
+    }
+
+    float tmp[4];
+    float exprOffset[4] = {1.0f, 0.0f, 0.0f, 0.0f };
 
     for (int k = 0; k < outside; ++k) {
-        float* source = input + k * reduceSize;
-        float* dest = softmaxDst + k * reduceSize;
+        exprOffset[3] = 0.0f; // init sum to zero for each outer loop
+        if (mask && kvSeqOffset > k + validOffset) {
+            if (updateScale){
+                updateScale[k] = 1;
+            }
+            for (int j = 0; j < reduceSizeOuter; ++j) {
+                auto destPtr = softmaxDst + j * stride0 + k * reduceSizeInner;
+                memset(destPtr, 0, reduceSizeInner * sizeof(float));
+            }
+            continue;
+        }
 
-        float tmpfloat4[4];
-        int count  = static_cast<int32_t>(reduceSize / 4);
-        int remain = count * 4;
-        // step 1: get maxValue
-        float maxValue = source[0];
-        float oldMax = maxValue;
+        const int validReduceSize = mask ? ALIMIN(reduceSize, k + (validOffset + 1) - kvSeqOffset) : reduceSize;
+        const int remain = validReduceSize % packUnit;
+        const int sizeDiv = validReduceSize / packUnit;
+        const float floatLowest = std::numeric_limits<float>::lowest();
+
+        // 1. newMax
+        float oldMax = floatLowest;
         if (runningMax) {
             oldMax = runningMax[k];
         }
-        if (count > 0) {
-            auto maxVal = _mm_loadu_ps(source);
-            for (int i = 1; i < count; i++) {
-                maxVal = _mm_max_ps(maxVal, _mm_loadu_ps(source + i * 4));
+
+        __m128 maxVec = _mm_set1_ps(floatLowest);
+        for (int j = 0; j < sizeDiv; ++j) {
+            auto srcPtr = softmaxSrc + j * stride0 + k * reduceSizeInner;
+            __m128 srcVec = _mm_loadu_ps(srcPtr);
+            maxVec = _mm_max_ps(maxVec, srcVec);
+        }
+
+        _mm_storeu_ps(tmp, maxVec);
+        float newMax = tmp[0];
+        for (int i = 1; i < 4; ++i) {
+            newMax = ALIMAX(newMax, tmp[i]);
+        }
+
+        if (remain > 0) {
+            auto srcPtr = softmaxSrc + sizeDiv * stride0 + k * reduceSizeInner;
+            for (int i = 0; i < remain; ++i) {
+                newMax = ALIMAX(newMax, srcPtr[i]);
             }
-            _mm_storeu_ps(tmpfloat4, maxVal);
-            maxValue = tmpfloat4[0] > tmpfloat4[1] ? tmpfloat4[0] : tmpfloat4[1];
-            maxValue = maxValue > tmpfloat4[2] ? maxValue : tmpfloat4[2];
-            maxValue = maxValue > tmpfloat4[3] ? maxValue : tmpfloat4[3];
-        }
-        for (int i = remain; i < reduceSize; i++) {
-            maxValue = maxValue > source[i] ? maxValue : source[i];
         }
 
-        float newMax = ALIMAX(oldMax, maxValue);
+        const float finalMax = ALIMAX(oldMax, newMax);
+        exprOffset[2] = -finalMax;
 
-        // step 2: get exp(x - newMax) and sum(exp(x - newMax))
-        float exprOffset[4] = {1.0f, 0.0f, 0.0f, 0.0f };
-        exprOffset[2] = -newMax;
-        MNNExp(dest, source, exprOffset, reduceSize);
-        float sumValue = exprOffset[3];
+        // 2. exp(x - finalMax) and Sum
+        for (int j = 0; j < sizeDiv; ++j) {
+            auto idx = j * stride0 + k * reduceSizeInner;
+            auto srcPtr = softmaxSrc + idx;
+            auto dstPtr = softmaxDst + idx;
+            MNNExp(dstPtr, srcPtr, exprOffset, packUnit);
+        }
 
+        float sum = exprOffset[3];
+
+        if (remain > 0) {
+            auto idx = sizeDiv * stride0 + k * reduceSizeInner;
+            auto srcPtr = softmaxSrc + idx;
+            auto dstPtr = softmaxDst + idx;
+
+            for (int i = 0; i < remain; ++i) {
+                float val = expf(srcPtr[i] - finalMax);
+                sum += val;
+                dstPtr[i] = val;
+            }
+        }
+
+        // 3. Normalization or update state
         if (runningMax != nullptr && runningSum != nullptr && updateScale != nullptr) {
-            // === Step 3: Update running variables ===
-            float scale = expf(oldMax - newMax);
-            runningSum[k] = runningSum[k] * scale + sumValue;
-            runningMax[k] = newMax;
-            updateScale[k] = scale;
+            float scaleForSum = expf(oldMax - finalMax);
+            runningSum[k] = runningSum[k] * scaleForSum + sum;
+            runningMax[k] = finalMax;
+            updateScale[k] = scaleForSum;
         } else {
-            // step 3: get x / sum and store
-            for (int i = 0; i < count; ++i) {
-                // using  1 / ((1 / x) * sum) instead x * (1 / sum) or x / sum for some bugs in intel cpu
-                auto x = _mm_rcp_ps(_mm_loadu_ps(dest + 4 * i));
-                auto y = _mm_set1_ps(sumValue);
-                auto z = _mm_rcp_ps(_mm_mul_ps(x, y));
-                _mm_storeu_ps(dest + 4 * i, z);
+            if (runningMax != nullptr && runningSum != nullptr) {
+                sum += runningSum[k] * expf(oldMax - finalMax);
             }
-            auto scale = 1.f / sumValue;
-            for (int i = remain; i < reduceSize; i++) {
-                dest[i] *= scale;
+            float scale = 1.0f / (sum + 1e-20f);
+
+            __m128 scaleVec = _mm_set1_ps(scale);
+
+            for (int j = 0; j < sizeDiv; ++j) {
+                auto pDest = softmaxDst + j * stride0 + k * reduceSizeInner;
+                __m128 data = _mm_loadu_ps(pDest);
+                data = _mm_mul_ps(data, scaleVec);
+                _mm_storeu_ps(pDest, data);
             }
+            if (remain > 0) {
+                auto pDest = softmaxDst + sizeDiv * stride0 + k * reduceSizeInner;
+                for (int i = 0; i < remain; ++i) {
+                    pDest[i] *= scale;
+                }
+            }
+        }
+
+        // 4. memset 0
+        if (pack > 1) {
+            if (validReduceSize % pack > 0) {
+                memset(softmaxDst + (UP_DIV(validReduceSize, pack) - 1) * stride0 + k * reduceSizeInner + (validReduceSize % pack), 0, (pack - (validReduceSize % pack)) * sizeof(float));
+            }
+            auto validOuter = UP_DIV(validReduceSize, pack);
+            auto allOuter = UP_DIV(reduceSize, pack);
+            for (int j = validOuter; j < allOuter; ++j) {
+                auto destPtr = softmaxDst + j * stride0 + k * reduceSizeInner;
+                memset(destPtr, 0, pack * sizeof(float));
+            }
+        } else {
+             memset(softmaxDst + k * reduceSizeInner + validReduceSize, 0, (reduceSize - validReduceSize) * sizeof(float));
         }
     }
 }

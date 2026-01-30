@@ -16,16 +16,19 @@ class Vision(torch.nn.Module):
         self.quant_block = 128
         self.transformer_fuse = True
         self.group_conv_native = False
-        self.model_type = base.model_type
+        self.model_type = base.config.model_type
         self.visual = visual.eval()
         self.embed_ = base.embed
         self.tokenizer = base.tokenizer
-        self.config = base.config
-        self.hidden_size = base.hidden_size
-        self.llm_config = base.llm_config
+        self.config = base.config.origin_config
+        self.hidden_size = base.config.hidden_size
+        self.llm_config = { "is_visual": True }
         self.rope_ratio = 1.0
         self.init_config()
         self.load()
+
+    def get_config(self):
+        return self.llm_config
 
     @staticmethod
     def get_vision(model_type):
@@ -72,7 +75,7 @@ class Vision(torch.nn.Module):
         raise NotImplementedError
 
     def embed(self, input_ids, images = None, videos = None):
-        raise NotImplementedError
+        return self.embed_(input_ids)
 
     def deepstacks(self):
         return None
@@ -124,8 +127,8 @@ class InternVLVision(Vision):
         super().__init__(visual, base)
         self.quant_bit = 8
         self.vision_model = visual
-        self.mlp1 = base.model.mlp1
-        self.select_layer = base.model.select_layer
+        self.mlp1 = visual.mlp1
+        self.select_layer = visual.select_layer
 
     def load(self):
         self.image_size = self.config.force_image_size
@@ -135,6 +138,7 @@ class InternVLVision(Vision):
         # self.llm_config['vision_start'] = self.tokenizer.img_start_id
         # self.llm_config['vision_end'] = self.tokenizer.img_end_id
         # self.llm_config['image_pad'] = self.tokenizer.img_pad_id
+
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -146,6 +150,7 @@ class InternVLVision(Vision):
                    (c / (scale_factor * scale_factor)).int())
         x = x.permute(0, 2, 1, 3).contiguous()
         return x
+
     def extract_feature(self, pixel_values):
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
@@ -168,6 +173,7 @@ class InternVLVision(Vision):
         # For mnn's embedding, the order is (seq, batch, hidden)
         vit_embeds = vit_embeds.permute(1, 0, 2)
         return vit_embeds
+
     def init_config(self):
         self.llm_config['is_visual'] = True
         IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -178,6 +184,7 @@ class InternVLVision(Vision):
         self.llm_config['image_mean'] = IMAGENET_MEAN
         self.llm_config['image_norm'] = IMAGENET_STD
         self.llm_config['image_size_unit'] = 14
+
     def export(self, onnx_path):
         input_images = torch.randn((1, 3, self.image_size, self.image_size), dtype=torch.float32)
         onnx_model = f'{onnx_path}/visual.onnx'
@@ -189,6 +196,7 @@ class InternVLVision(Vision):
                         "input_images": { 0: "size", 2: "height", 3: "width"},
                     })
         return onnx_model
+
     def forward(self, images):
         return self.extract_feature(images)
 
@@ -856,8 +864,8 @@ class Idefics3Vision(Vision):
         self.image_mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         self.image_norm = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         super().__init__(visual, base)
-        self.connector = base.model.model.connector.float()
         self.visual = self.visual.float()
+        self.connector = self.visual.connector.float()
         self.quant_bit = 8
         self.transformer_fuse = False
 
@@ -1040,7 +1048,7 @@ class MobileCLIPVision(QwenVision):
     def __init__(self, visual, base):
         super().__init__(visual, base)
         self.visual = visual.float()
-        self.mm_projector = base.model.model.mm_projector.float()
+        self.mm_projector = self.visual.mm_projector.float()
         self.quant_bit = 8
         self.group_conv_native = False
 
@@ -1087,7 +1095,7 @@ class MiniCPMVision(Vision):
         self.encoder = self.visual.encoder
         self.post_layernorm = self.visual.post_layernorm
         # rebuild resampler
-        self.resampler = base.model.resampler.float()
+        self.resampler = self.visual.resampler.float()
         attrs = ['query', 'kv_proj', 'ln_kv', 'ln_q', 'attn', 'ln_post', 'proj', 'pos_embed', 'embed_dim']
         for attr in attrs:
             setattr(self, attr, getattr(self.resampler, attr))
@@ -1109,13 +1117,13 @@ class MiniCPMVision(Vision):
         self.vision_id_end_token = '</image_id>'
         self.vision_slice_start_token = '<slice>'
         self.vision_slice_end_token = '</slice>'
-        self.vision_start_id = self.tokenizer.encode(self.vision_start_token)[1]
-        self.vision_end_id = self.tokenizer.encode(self.vision_end_token)[1]
-        self.image_pad_id = self.tokenizer.encode(self.image_pad_token)[1]
-        self.vision_id_start_id = self.tokenizer.encode(self.vision_id_start_token)[1]
-        self.vision_id_end_id = self.tokenizer.encode(self.vision_id_end_token)[1]
-        self.vision_slice_start_id = self.tokenizer.encode(self.vision_slice_start_token)[1]
-        self.vision_slice_end_id = self.tokenizer.encode(self.vision_slice_end_token)[1]
+        self.vision_start_id = self.tokenizer.encode(self.vision_start_token)[-1]
+        self.vision_end_id = self.tokenizer.encode(self.vision_end_token)[-1]
+        self.image_pad_id = self.tokenizer.encode(self.image_pad_token)[-1]
+        self.vision_id_start_id = self.tokenizer.encode(self.vision_id_start_token)[-1]
+        self.vision_id_end_id = self.tokenizer.encode(self.vision_id_end_token)[-1]
+        self.vision_slice_start_id = self.tokenizer.encode(self.vision_slice_start_token)[-1]
+        self.vision_slice_end_id = self.tokenizer.encode(self.vision_slice_end_token)[-1]
         self.llm_config['image_size_unit'] = self.patch_size
         self.llm_config['image_size'] = self.image_size
         # self.llm_config['image_max_size'] = self.image_max_size

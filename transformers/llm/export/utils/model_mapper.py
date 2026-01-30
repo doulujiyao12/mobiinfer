@@ -55,10 +55,10 @@ class ModelMapper:
                 'num_key_value_heads': 'language_config.num_key_value_heads',
             },
             'model': {
-                'lm_': 'language_model.lm_head',
-                'embed_': 'language_model.model.embed_tokens',
-                'blocks_': 'language_model.model.layers',
-                'final_layernorm_': 'language_model.model.norm',
+                'lm': 'language_model.lm_head',
+                'embed': 'language_model.model.embed_tokens',
+                'blocks': 'language_model.model.layers',
+                'final_layernorm': 'language_model.model.norm',
                 'visual': 'vision_model'
             },
             'decoder': {
@@ -88,10 +88,10 @@ class ModelMapper:
                 'rope_scaling': 'thinker_config.text_config.rope_scaling'
             },
             'model': {
-                'lm_': 'thinker.lm_head',
-                'embed_': 'thinker.model.embed_tokens',
-                'blocks_': 'thinker.model.layers',
-                'final_layernorm_': 'thinker.model.norm',
+                'lm': 'thinker.lm_head',
+                'embed': 'thinker.model.embed_tokens',
+                'blocks': 'thinker.model.layers',
+                'final_layernorm': 'thinker.model.norm',
                 'visual': 'thinker.visual',
                 'audio': 'thinker.audio_tower',
                 'talker': 'talker',
@@ -111,10 +111,10 @@ class ModelMapper:
                 'rope_theta': 'rotary_emb_base',
             },
             'model': {
-                'lm_': 'lm_head',
-                'embed_': 'transformer.wte',
-                'blocks_': 'transformer.h',
-                'final_layernorm_': 'transformer.ln_f',
+                'lm': 'lm_head',
+                'embed': 'transformer.wte',
+                'blocks': 'transformer.h',
+                'final_layernorm': 'transformer.ln_f',
                 'visual': 'transformer.visual'
             },
             'decoder': {
@@ -221,10 +221,10 @@ class ModelMapper:
                 'num_hidden_layers': 'num_layers'
             },
             'model': {
-                'lm_': 'lm_head',
-                'embed_': 'transformer.word_embeddings',
-                'blocks_': 'transformer.layers',
-                'final_layernorm_': 'transformer.final_layernorm',
+                'lm': 'lm_head',
+                'embed': 'transformer.word_embeddings',
+                'blocks': 'transformer.layers',
+                'final_layernorm': 'transformer.final_layernorm',
             },
             'decoder': {
                 'self_attn': 'attention',
@@ -249,10 +249,10 @@ class ModelMapper:
                 'rope_ratio': 'rope_ratio'
             },
             'model': {
-                'lm_': 'transformer.output_layer',
-                'embed_': 'transformer.embedding.word_embeddings',
-                'blocks_': 'transformer.encoder.layers',
-                'final_layernorm_': 'transformer.encoder.final_layernorm',
+                'lm': 'transformer.output_layer',
+                'embed': 'transformer.embedding.word_embeddings',
+                'blocks': 'transformer.encoder.layers',
+                'final_layernorm': 'transformer.encoder.final_layernorm',
             },
             'decoder': {
                 'self_attn': 'self_attention',
@@ -276,10 +276,10 @@ class ModelMapper:
                 'rotary_dim': 'rotary_dim'
             },
             'model': {
-                'lm_': 'lm_head.linear',
-                'embed_': 'transformer.embd.wte',
-                'blocks_': 'transformer.h',
-                'final_layernorm_': 'lm_head.ln',
+                'lm': 'lm_head.linear',
+                'embed': 'transformer.embd.wte',
+                'blocks': 'transformer.h',
+                'final_layernorm': 'lm_head.ln',
             },
             'decoder': {
                 'self_attn': 'mixer',
@@ -293,33 +293,27 @@ class ModelMapper:
         }
         self.regist('phi-msft', phi_map)
 
-    def regist_phi3(self):
-        phi3_map = {
-            'config': {
-                'hidden_size': 'hidden_size',
-                'num_attention_heads': 'num_attention_heads',
-                'num_hidden_layers': 'num_hidden_layers',
-                'rope_theta': 'rope_theta',
-                'head_dim': 'head_dim',
-                'num_key_value_heads': 'num_key_value_heads',
-            },
+        phi2_map = {
+            'config': self.default_config,
             'model': {
-                'lm_': 'lm_head',
-                'embed_': 'model.embed_tokens',
-                'blocks_': 'model.layers',
-                'final_layernorm_': 'model.norm'
+                'lm': 'lm_head',
+                'embed': 'model.embed_tokens',
+                'blocks': 'model.layers',
+                'final_layernorm': 'model.final_layernorm'
             },
             'decoder': {
                 'self_attn': 'self_attn',
                 'mlp': 'mlp',
-                'input_layernorm': 'input_layernorm',
-                'post_attention_layernorm': 'post_attention_layernorm'
+                'input_layernorm': 'input_layernorm'
             },
             'attention': {
-                'qkv_proj': 'qkv_proj',
+                'q_proj': 'q_proj',
+                'k_proj': 'k_proj',
+                'v_proj': 'v_proj',
+                'o_proj': 'dense'
             }
         }
-        # self.regist('phi3', phi3_map)
+        self.regist('phi', phi2_map)
 
     def regist_intervl(self):
         intervl_map = {
@@ -332,11 +326,13 @@ class ModelMapper:
                 'num_key_value_heads': 'llm_config.num_key_value_heads',
             },
             'model': {
-                'lm_': 'language_model.lm_head',
-                'embed_': 'language_model.model.embed_tokens',
-                'blocks_': 'language_model.model.layers',
-                'final_layernorm_': 'language_model.model.norm',
-                'visual': 'vision_model'
+                'lm': 'language_model.lm_head',
+                'embed': 'language_model.model.embed_tokens',
+                'blocks': 'language_model.model.layers',
+                'final_layernorm': 'language_model.model.norm',
+                'visual': 'vision_model',
+                'visual.mlp1': 'mlp1',
+                'visual.select_layer': 'select_layer'
             },
             'decoder': {
                 'self_attn': 'self_attn',
@@ -384,10 +380,10 @@ class ModelMapper:
                 'eoi_token_index': 'eoi_token_index', #'<end_of_image>'
             },
             'model': {
-                'lm_': 'language_model.lm_head',
-                'embed_': 'language_model.model.embed_tokens',
-                'blocks_': 'language_model.model.layers',
-                'final_layernorm_': 'language_model.model.norm',
+                'lm': 'language_model.lm_head',
+                'embed': 'language_model.model.embed_tokens',
+                'blocks': 'language_model.model.layers',
+                'final_layernorm': 'language_model.model.norm',
                 'vision_tower': 'vision_tower',
                 'visual': 'vision_tower.vision_model',
                 'multi_modal_projector': 'multi_modal_projector'
@@ -431,10 +427,10 @@ class ModelMapper:
                 'sliding_window': 'sliding_window'
             },
             'model': {
-                'lm_': 'lm_head',
-                'embed_': 'model.embed_tokens',
-                'blocks_': 'model.layers',
-                'final_layernorm_': 'model.norm',
+                'lm': 'lm_head',
+                'embed': 'model.embed_tokens',
+                'blocks': 'model.layers',
+                'final_layernorm': 'model.norm',
                 'rotary_emb': 'model.rotary_emb',
                 'rotary_emb_local': 'model.rotary_emb_local'
             },
@@ -467,10 +463,10 @@ class ModelMapper:
             'rope_theta': 'rope_freq_constant'
         }
         openelm_model = {
-            'lm_': 'lm_head',
-            'embed_': 'transformer.token_embeddings',
-            'blocks_': 'transformer.layers',
-            'final_layernorm_': 'transformer.norm'
+            'lm': 'lm_head',
+            'embed': 'transformer.token_embeddings',
+            'blocks': 'transformer.layers',
+            'final_layernorm': 'transformer.norm'
         }
         openelm_decoder = {
             'self_attn': 'attn',
@@ -503,11 +499,12 @@ class ModelMapper:
             'rope_scaling': 'text_config.rope_scaling'
         }
         idefics3_model = {
-            'lm_': 'lm_head',
-            'embed_': 'model.text_model.embed_tokens',
-            'blocks_': 'model.text_model.layers',
-            'final_layernorm_': 'model.text_model.norm',
-            'visual': 'model.vision_model'
+            'lm': 'lm_head',
+            'embed': 'model.text_model.embed_tokens',
+            'blocks': 'model.text_model.layers',
+            'final_layernorm': 'model.text_model.norm',
+            'visual': 'model.vision_model',
+            'visual.connector': 'model.connector'
         }
         idefics3_map = {
             'config': idefics3_config,
@@ -521,6 +518,7 @@ class ModelMapper:
     def regist_fastvlm(self):
         fastvlm_model = copy.deepcopy(self.default_model)
         fastvlm_model['visual'] = 'model.vision_tower'
+        fastvlm_model['visual.mm_projector'] = 'model.mm_projector'
         fastvlm_map = {
             'config': self.default_config,
             'model': fastvlm_model,
@@ -529,14 +527,41 @@ class ModelMapper:
         }
         self.regist('llava_qwen2', fastvlm_map)
 
+    def regist_qwen2audio(self):
+        qwen2audio_config = {
+            'hidden_size': 'text_config.hidden_size',
+            'head_dim': 'text_config.head_dim',
+            'num_attention_heads': 'text_config.num_attention_heads',
+            'num_hidden_layers': 'text_config.num_hidden_layers',
+            'num_key_value_heads': 'text_config.num_key_value_heads',
+            'rope_theta': 'text_config.rope_theta',
+            'rope_scaling': 'text_config.rope_scaling',
+            'max_position_embeddings': 'text_config.max_position_embeddings'
+        }
+        qwen2audio_model = {
+            'lm': 'language_model.lm_head',
+            'embed': 'language_model.model.embed_tokens',
+            'blocks': 'language_model.model.layers',
+            'final_layernorm': 'language_model.model.norm',
+            'audio': 'audio_tower',
+            'audio.multi_modal_projector': 'multi_modal_projector'
+        }
+        qwen2audio_map = {
+            'config': qwen2audio_config,
+            'model': qwen2audio_model,
+            'decoder': self.default_decoder,
+            'attention': self.default_attention
+        }
+        self.regist('qwen2_audio', qwen2audio_map)
+
     def regist_qwenvl(self):
         if TRANSFORMERS_VERSION <= '4.52.1':
             return
         qwen2vl_model = {
-            'lm_': 'lm_head',
-            'embed_': 'model.language_model.embed_tokens',
-            'blocks_': 'model.language_model.layers',
-            'final_layernorm_': 'model.language_model.norm',
+            'lm': 'lm_head',
+            'embed': 'model.language_model.embed_tokens',
+            'blocks': 'model.language_model.layers',
+            'final_layernorm': 'model.language_model.norm',
             'visual': 'model.visual'
         }
         qwen2vl_map = {
@@ -570,7 +595,6 @@ class ModelMapper:
             'model': qwen2vl_model,
             'decoder': self.default_decoder,
             'attention': qwen3_attention
-
         }
         qwen3vlmoe_mlp = {
             'num_experts': 'num_experts',
@@ -651,13 +675,15 @@ class ModelMapper:
     def regist_minicpmv(self):
         minicpmv_config = copy.deepcopy(self.default_config)
         minicpmv_config['scale_emb'] = 'scale_emb'
+        minicpmv_config['patch_size'] = 'vision_config.patch_size'
+        minicpmv_config['image_size'] = 'vision_config.image_size'
         minicpmv_model = {
-            'lm_': 'llm.lm_head',
-            'embed_': 'llm.model.embed_tokens',
-            'blocks_': 'llm.model.layers',
-            'final_layernorm_': 'llm.model.norm',
+            'lm': 'llm.lm_head',
+            'embed': 'llm.model.embed_tokens',
+            'blocks': 'llm.model.layers',
+            'final_layernorm': 'llm.model.norm',
             'visual': 'vpm',
-            'resampler': 'resampler'
+            'visual.resampler': 'resampler'
         }
         minicpmv_map = {
             'config': minicpmv_config,
@@ -684,10 +710,10 @@ class ModelMapper:
             'max_position_embeddings': 'max_position_embeddings'
         }
         self.default_model = {
-            'lm_': 'lm_head',
-            'embed_': 'model.embed_tokens',
-            'blocks_': 'model.layers',
-            'final_layernorm_': 'model.norm',
+            'lm': 'lm_head',
+            'embed': 'model.embed_tokens',
+            'blocks': 'model.layers',
+            'final_layernorm': 'model.norm',
             'visual': 'visual'
         }
         self.default_decoder = {
@@ -711,14 +737,35 @@ class ModelMapper:
         }
 
     @staticmethod
-    def do_map(dst, src, map):
-        for dst_attr, src_attr in map.items():
-            attributes = src_attr.split('.')
-            obj = src
-            for attr in attributes:
-                if hasattr(obj, attr):
-                    obj = getattr(obj, attr)
+    def do_map(dst, src, mapping):
+        # Sort mapping by key to ensure parents are set before children
+        # e.g., 'visual' is processed before 'visual.connector' for SmolVLM
+        for dst_path, src_path in sorted(mapping.items(), key=lambda x: x[0]):
+            # --- 1. Retrieve value from source ---
+            val = src
+            for attr in src_path.split('.'):
+                if hasattr(val, attr):
+                    val = getattr(val, attr)
                 else:
-                    obj = None
+                    val = None
                     break
-            setattr(dst, dst_attr, obj)
+
+            # --- 2. Navigate to destination parent node ---
+            dst_parts = dst_path.split('.')
+            target = dst
+
+            # Traverse to the second-to-last object
+            path_valid = True
+            for attr in dst_parts[:-1]:
+                if hasattr(target, attr):
+                    target = getattr(target, attr)
+                    if target is None:
+                        path_valid = False
+                        break
+                else:
+                    path_valid = False
+                    break
+
+            # --- 3. Set value ---
+            if path_valid and target:
+                setattr(target, dst_parts[-1], val)

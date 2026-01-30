@@ -336,6 +336,10 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
      "splitBlockQuant",
      "Split Block Quant Convolution"
      )
+    (
+     "dumpPass",
+     "Enable verbose output for each optimization pass, showing what changes each pass made (like LLVM's -debug-pass)"
+     )
     ;
 
     auto result = options.parse(argc, argv);
@@ -470,8 +474,15 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     if (result.count("fp16")) {
         modelPath.saveHalfFloat = true;
     }
+    if (result.count("weightQuantAsymmetric")) {
+        modelPath.weightQuantAsymmetric = result["weightQuantAsymmetric"].as<bool>();
+    }
     if (result.count("hqq")) {
-        modelPath.useHQQ = true;
+        if(modelPath.weightQuantAsymmetric) {
+            modelPath.useHQQ = true;
+        } else {
+            std::cout << "Warning, MNN Convert only support Hqq with weight asymmetric quant! Disable Hqq currently" <<  std::endl;
+        }
     }
     if (result.count("forTraining")) {
         modelPath.forTraining = true;
@@ -487,9 +498,6 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
         if (modelPath.useHQQ) {
             MNN_PRINT("Use HQQ to quant weight\n");
         }
-    }
-    if (result.count("weightQuantAsymmetric")) {
-        modelPath.weightQuantAsymmetric = result["weightQuantAsymmetric"].as<bool>();
     }
     if (result.count("weightQuantBlock")) {
         modelPath.weightQuantBlock = result["weightQuantBlock"].as<int>();
@@ -550,6 +558,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     if (result.count("useOriginRNNImpl")) {
         modelPath.useOriginRNNImpl = true;
     }
+    if (result.count("dumpPass")) {
+        modelPath.dumpPass = true;
+    }
     return true;
 }
 
@@ -576,17 +587,17 @@ static void computeUnaryBuffer(MNN::NetT* net) {
             if (type == UnaryOpOperation_ABS || type == UnaryOpOperation_NEG || type == UnaryOpOperation_SIGN) {
                 continue;
             }
-            op->main.AsUnaryOp()->tableInt8.resize(255);
-            auto unaryParam = op->main.AsUnaryOp()->tableInt8.data();
 
             auto outputId = op->outputIndexes[0];
-            if (describes.find(outputId) == describes.end()) {
+            auto inputId = op->inputIndexes[0];
+            if (describes.find(outputId) == describes.end() || describes.find(inputId) == describes.end()) {
                 continue;
             }
+            op->main.AsUnaryOp()->tableInt8.resize(255);
+            auto unaryParam = op->main.AsUnaryOp()->tableInt8.data();
             auto unaryDes = describes.find(outputId)->second;
             float outScale = unaryDes->quantInfo->scale;
             float outZero  = unaryDes->quantInfo->zero;
-            auto inputId = op->inputIndexes[0];
             if (describes.find(inputId) == describes.end()) {
                 auto iter = describes.find(outputId);
 
@@ -961,7 +972,6 @@ int Cli::testconvert(const std::string& defaultCacheFile, const std::string& dir
     }
     rtmgr->setHint(MNN::Interpreter::INIT_THREAD_NUMBER, 2);
 
-    rtmgr->setExternalFile("./convert_cache.mnn.weight");
     std::shared_ptr<MNN::Express::Module> net(MNN::Express::Module::load(inputNames, outputNames, defaultCacheFile.c_str(), rtmgr, &mConfig));
     std::shared_ptr<MNN::Express::Module> net2;
     net2.reset(MNN::Express::Module::clone(net.get()));
@@ -1000,14 +1010,6 @@ int Cli::testconvert(const std::string& defaultCacheFile, const std::string& dir
             inputs[i] = _Input(mInfo->inputs[i].dim, mInfo->inputs[i].order, mInfo->inputs[i].type);
         }
         auto info = inputs[i]->getInfo();
-        auto iter = inputInfo.find(inputNames[i]);
-        if (iter != inputInfo.end()) {
-            auto ptr = inputs[i]->writeMap<float>();
-            for (int v=0; v<mInfo->inputs[i].size; ++v) {
-                ptr[v] = iter->second;
-            }
-            continue;
-        }
         if (info->type == halide_type_of<float>()){
             auto ptr = inputs[i]->writeMap<float>();
             LOAD_DATA(float)

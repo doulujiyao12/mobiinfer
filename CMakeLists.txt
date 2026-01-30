@@ -80,6 +80,7 @@ option(MNN_LOW_MEMORY "Build MNN support low memory for weight quant model." OFF
 option(MNN_CPU_WEIGHT_DEQUANT_GEMM "Build MNN CPU weight dequant related gemm kernels." OFF)
 option(MNN_BUILD_AUDIO "Build audio api in MNN." OFF)
 option(MNN_SME2 "Use Arm sme2 instructions" ON)
+option(MNN_METAL_TENSOR "Use Metal4 tensor instructions" ON)
 
 if (MNN_BUILD_MINI)
     set(MNN_SKIPBUILD_GEOMETRY ON CACHE BOOL "<docstring>" FORCE)
@@ -258,6 +259,7 @@ option(MNN_VULKAN "Enable Vulkan" OFF)
 option(MNN_ARM82 "Enable ARMv8.2's FP16 Compute" ON)
 option(MNN_SUPPORT_FP16_ARMV7 "Enable ARMv8.2's FP16 Compute for armv7 arch, may cause library not valid for 32 bit cpu" OFF)
 option(MNN_KLEIDIAI "Enable KLEIDIAI" ON)
+option(MNN_KLEIDIAI_DEFAULT_ON "Use KLEIDIAI kernels by default" OFF)
 option(MNN_ONEDNN "Enable oneDNN" OFF)
 option(MNN_AVX2 "Open AVX2 Compile for x86 if possible" ON)
 option(MNN_AVX512 "Enable AVX512" OFF)
@@ -277,7 +279,7 @@ if (NOT MNN_CUDA OR NOT CMAKE_SYSTEM_NAME MATCHES "^Linux")
   set(MNN_CUDA_PROFILE OFF)
 endif()
 
-if (NOT MNN_QNN) 
+if (NOT MNN_QNN)
   set(MNN_QNN_ONLINE_FINALIZE OFF)
 endif()
 
@@ -373,6 +375,9 @@ endif()
 IF(MNN_DEBUG_MEMORY)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
 endif()
 
 set(MNN_DEPS "")
@@ -936,6 +941,11 @@ if (NOT MNN_BUILD_SHARED_LIBS)
 endif()
 list(APPEND MNN_TARGETS MNN)
 list(REMOVE_ITEM MNN_TARGETS MNN)
+
+# Cache MNN_DEPS and MNN_INCLUDES for external projects
+set(MNN_LIBS ${MNN_DEPS} CACHE INTERNAL "MNN targets")
+set(MNN_INCLUDE_DIRS ${MNN_INCLUDES} CACHE INTERNAL "MNN include directories")
+
 IF(MNN_BUILD_DEMO)
 include(${CMAKE_CURRENT_LIST_DIR}/demo/exec/CMakeLists.txt)
 ENDIF()
