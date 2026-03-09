@@ -26,6 +26,7 @@ class Audio(torch.nn.Module):
         audio_models = {
             'qwen2_audio_encoder': Qwen2Audio,
             'qwen2_5_omni_audio_encoder': Qwen2_5OmniAudio,
+            'funaudiochat_audio_encoder': FunAudioChatAudio,
         }
         if model_type in audio_models:
             return audio_models[model_type]
@@ -227,7 +228,7 @@ class Qwen2_5OmniAudio(Qwen2Audio):
         embed_pos = self.audio.positional_embedding.positional_embedding[:seq_len, :]
         hidden_states = inputs_embeds + embed_pos
         for block in self.blocks:
-            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            hidden_states = block(hidden_states, attention_mask=attention_mask)
         hidden_states = hidden_states.permute(0, 2, 1)
         hidden_states = self.audio.avg_pooler(hidden_states)
         hidden_states = hidden_states.permute(0, 2, 1)
@@ -271,3 +272,33 @@ class Qwen2_5OmniAudio(Qwen2Audio):
                         1: "size", 2: "size"
                     }})
         return onnx_model
+
+class FunAudioChatAudio(Qwen2_5OmniAudio):
+    def __init__(self, audio, base):
+        super().__init__(audio, base)
+        self.audio_pad_id = 151669
+
+    def load(self):
+        # model
+        self.audio = self.audio.float()
+        self.audio_tower = self.audio.audio_tower.float()
+        # config
+        self.group_size = self.audio.config.group_size
+        # call parent load
+        super().load()
+
+    def forward(self, input_features, attention_mask = None):
+        # call parent forward to get audio_features before group pooling
+        audio_features = super().forward(input_features, attention_mask)
+        # group pooling and continual_output_matching
+        batch, seqlen, hidden_size = audio_features.shape
+        padding_feature = torch.zeros(
+            (batch, (self.group_size - seqlen % self.group_size) % self.group_size, hidden_size),
+            dtype=torch.long,
+            device=audio_features.device,
+        )
+        audio_features = torch.cat([audio_features, padding_feature], dim=1)
+        audio_features = audio_features.reshape(batch, -1, self.group_size, hidden_size)
+        audio_features = audio_features.mean(dim=2)
+        audio_features = self.audio_tower.continual_output_matching(audio_features)
+        return audio_features

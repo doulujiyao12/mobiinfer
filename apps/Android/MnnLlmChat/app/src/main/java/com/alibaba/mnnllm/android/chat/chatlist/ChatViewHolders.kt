@@ -216,6 +216,7 @@ object ChatViewHolders {
                 false
             }
             imageGenerated.setOnClickListener(this)
+            imageGenerated.setOnLongClickListener(this)
             thinkingToggle.setOnClickListener {
                 val chatDataItem = it.tag as ChatDataItem
                 chatDataItem.toggleThinking()
@@ -254,31 +255,13 @@ object ChatViewHolders {
             }
             shareImageButton.setOnClickListener {
                 val chatDataItem = it.tag as ChatDataItem
-                shareImage(chatDataItem)
+                val imageUri = chatDataItem.imageUri
+                if (imageUri != null) {
+                    com.alibaba.mnnllm.android.utils.ImageUtils.showImageMenu(it.context, imageUri)
+                }
             }
         }
 
-        private fun shareImage(chatDataItem: ChatDataItem) {
-            val imageUri = chatDataItem.imageUri ?: return
-            val context = itemView.context
-            
-            val shareUri = if (imageUri.scheme == "file") {
-                androidx.core.content.FileProvider.getUriForFile(
-                    context,
-                    context.packageName + ".fileprovider",
-                    java.io.File(imageUri.path!!)
-                )
-            } else {
-                imageUri
-            }
-            
-            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/*"
-                putExtra(Intent.EXTRA_STREAM, shareUri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(Intent.createChooser(shareIntent, context.getString(R.string.share_image)))
-        }
 
         private fun  updatePointerDownLocation(v:View, event: MotionEvent) {
             val location = IntArray(2)
@@ -293,8 +276,18 @@ object ChatViewHolders {
                     updateThinkingView(data, itemView.context)
                 }
                 if (data.displayText != null) {
-                    markdown.setMarkdown(viewText, data.displayText!!)
+                    if (AssistantTextRenderPolicy.usePlainText(data)) {
+                        viewText.text = data.displayText
+                    } else {
+                        markdown.setMarkdown(viewText, data.displayText!!)
+                    }
                 }
+                imageGenerated.visibility =
+                    if (data.imageUri != null) View.VISIBLE else View.GONE
+                if (data.imageUri != null) {
+                    imageGenerated.setImageURI(data.imageUri)
+                }
+                shareImageButton.visibility = if (data.imageUri != null) View.VISIBLE else View.GONE
                 return
             }
 
@@ -302,22 +295,18 @@ object ChatViewHolders {
             if (TextUtils.isEmpty(data.displayText)) {
                 viewText.visibility = View.GONE
             } else {
-                markdown.setMarkdown(viewText, data.displayText!!)
+                if (AssistantTextRenderPolicy.usePlainText(data)) {
+                    viewText.text = data.displayText
+                } else {
+                    markdown.setMarkdown(viewText, data.displayText!!)
+                }
                 viewText.visibility = View.VISIBLE
             }
 
-            if (data.hasOmniAudio) {
-                viewAssistantLoading.visibility = if (data.loading) {
-                    View.VISIBLE
-                } else {
-                    View.GONE
-                }
+            viewAssistantLoading.visibility = if (AssistantLoadingVisibilityDecider.shouldShow(data)) {
+                View.VISIBLE
             } else {
-                viewAssistantLoading.visibility = if (!TextUtils.isEmpty(data.displayText) || !TextUtils.isEmpty(data.thinkingText)) {
-                  View.GONE
-                } else {
-                    View.VISIBLE
-                }
+                View.GONE
             }
             val showMetrics = PreferenceUtils.getBoolean(
                 itemView.context,
@@ -385,8 +374,21 @@ object ChatViewHolders {
         }
 
         override fun onLongClick(v: View): Boolean {
-            val textView = v as TextView
-            val chatDataItem = v.getTag() as ChatDataItem
+            Log.d(TAG, "onLongClick: v.id=${v.id}")
+            val chatDataItem = v.tag as? ChatDataItem ?: return false
+            if (v.id == R.id.image_generated) {
+                val imageUri = chatDataItem.imageUri
+                if (imageUri != null) {
+                    v.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                    com.alibaba.mnnllm.android.utils.ImageUtils.showImageMenu(v.context, imageUri)
+                    return true
+                }
+                Log.w(TAG, "onLongClick: imageUri is null")
+                return false
+            }
+            
+            val textView = v as? TextView ?: return false
+            v.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
             PopupWindowHelper().showPopupWindow(
                 v.getContext(), v, this.lastTouchX, this.lastTouchY
             ) { v ->

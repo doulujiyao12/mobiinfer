@@ -18,6 +18,7 @@ import com.alibaba.mnnllm.android.R
 import com.alibaba.mnnllm.android.model.ModelTypeUtils
 import com.alibaba.mnnllm.android.model.ModelUtils
 import com.alibaba.mnnllm.android.modelsettings.SettingsBottomSheetFragment
+import com.alibaba.mnnllm.android.modelsettings.DiffusionSettingsBottomSheetFragment
 import com.alibaba.mnnllm.android.utils.DialogUtils
 import com.alibaba.mnnllm.android.utils.FileUtils
 import com.alibaba.mnnllm.android.widgets.ModelAvatarView
@@ -197,12 +198,28 @@ class ModelItemHolder(
         if (modelWrapper.hasUpdate) {
             btnUpdate.visibility = View.VISIBLE
             if (isUpdating) {
-                btnUpdate.text = btnUpdate.resources.getString(R.string.download_state_updating)
+                val downloadInfo = modelWrapper.modelItem.modelId?.let { modelDownloadManager.getDownloadInfo(it) }
+                val isPreparing = downloadInfo?.downloadState == DownloadState.PREPARING
+                
+                val statusText = if (isPreparing) {
+                     btnUpdate.resources.getString(R.string.download_pending)
+                } else {
+                     btnUpdate.resources.getString(R.string.download_state_updating)
+                }
+                
+                btnUpdate.text = statusText
                 btnUpdate.isEnabled = false
-                tvStatus.text = if (formattedSize.isNotEmpty()) {
-                    "${formattedSize} (${tvStatus.resources.getString(R.string.download_state_updating)})"
+                
+                val statusMsg = if (isPreparing) {
+                    tvStatus.resources.getString(R.string.download_preparing)
                 } else {
                     tvStatus.resources.getString(R.string.download_state_updating)
+                }
+                
+                tvStatus.text = if (formattedSize.isNotEmpty()) {
+                    "$formattedSize ($statusMsg)"
+                } else {
+                    statusMsg
                 }
             } else {
                 btnUpdate.text = btnUpdate.resources.getString(R.string.update)
@@ -233,7 +250,7 @@ class ModelItemHolder(
         
         modelWrapper.modelItem.modelId?.let { modelId ->
             val downloadInfo = modelDownloadManager.getDownloadInfo(modelId)
-            return downloadInfo.downloadState == DownloadState.DOWNLOADING
+            return downloadInfo.downloadState == DownloadState.DOWNLOADING || downloadInfo.downloadState == DownloadState.PREPARING
         }
         return false
     }
@@ -289,16 +306,19 @@ class ModelItemHolder(
             } else if (item.itemId == R.id.menu_settings) {
                 val context = v.context
                 val modelId = modelItem.modelId
-                if (ModelTypeUtils.isDiffusionModel(modelId!!)) {
-                    Toast.makeText(context, R.string.diffusion_model_not_alloed, Toast.LENGTH_SHORT).show()
-                    return@setOnMenuItemClickListener true
-                }
                 val fragmentManager = (context as? AppCompatActivity)?.supportFragmentManager
                 if (fragmentManager != null) {
-                    val settingsSheet = SettingsBottomSheetFragment()
-                    settingsSheet.setModelId(modelId)
-                    settingsSheet.setConfigPath(modelItem.localPath)
-                    settingsSheet.show(fragmentManager, SettingsBottomSheetFragment.TAG)
+                    if (ModelTypeUtils.isDiffusionModel(modelId!!)) {
+                        val settingsSheet = DiffusionSettingsBottomSheetFragment()
+                        settingsSheet.setModelId(modelId)
+                        settingsSheet.setConfigPath(modelItem.localPath)
+                        settingsSheet.show(fragmentManager, DiffusionSettingsBottomSheetFragment.TAG)
+                    } else {
+                        val settingsSheet = SettingsBottomSheetFragment()
+                        settingsSheet.setModelId(modelId)
+                        settingsSheet.setConfigPath(modelItem.localPath)
+                        settingsSheet.show(fragmentManager, SettingsBottomSheetFragment.TAG)
+                    }
                 }
             } else if (item.itemId == R.id.menu_show_model_info) {
                 // Show model info directly

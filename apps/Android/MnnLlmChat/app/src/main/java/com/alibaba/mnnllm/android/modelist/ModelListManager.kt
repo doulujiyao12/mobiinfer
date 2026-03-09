@@ -2,6 +2,7 @@ package com.alibaba.mnnllm.android.modelist
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Build
 import com.alibaba.mls.api.ModelItem
 import com.alibaba.mls.api.download.DownloadPersistentData
 import com.alibaba.mnnllm.android.chat.model.ChatDataManager
@@ -18,6 +19,7 @@ import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,27 +27,33 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.File
 import java.nio.file.Files
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 @SuppressLint("StaticFieldLeak")
 object ModelListManager {
     // Application scope for automatic initialization
     private val applicationScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val marketSyncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private const val TAG = "ModelListManager"
     private const val CACHE_FILE_NAME = "model_list_cache.json"
     private const val CACHE_VERSION = 2
     private const val MAX_CACHE_AGE_DAYS = 9999L
+    private const val MODEL_TYPE_LLM = "LLM"
+    private const val MODEL_TYPE_UNKNOWN = "UNKNOWN"
+    private const val MODEL_TYPE_DIFFUSION = "DIFFUSION"
 
     // Gson instance for serialization
     private val gson = Gson()
@@ -73,6 +81,9 @@ object ModelListManager {
     private var isInitialized = false
     private var isInitializing = false
     private lateinit var context: Context
+    private var marketDataSyncJob: Job? = null
+    private var tagWarmupJob: Job? = null
+    private var lastSyncedMarketDataKey: String? = null
 
     // Data classes for Flow state management
     sealed class ModelListState {
@@ -98,6 +109,7 @@ object ModelListManager {
         MODEL_PINNED,
         MODEL_UNPINNED,
         MANUAL_REFRESH,
+        MARKET_DATA_UPDATED,
         INITIALIZATION
     }
 
@@ -265,6 +277,7 @@ object ModelListManager {
             try {
                 this.context = context
                 cacheFile = File(context.cacheDir, CACHE_FILE_NAME)
+                startMarketDataSyncIfNeeded()
 
                 // Handle builtin models before loading
                 copyBuiltinModelsIfNeeded(context)
@@ -434,23 +447,39 @@ object ModelListManager {
         if (modelItem != null) {
             return modelItem.getTags()
         }
-        
-        // If not in memory, wait for first successful state
-        return try {
-            val successState: ModelListState.Success = runBlocking {
-                modelListState
-                    .filterIsInstance<ModelListState.Success>()
-                    .first()
+
+        // Never block callers (especially UI thread). Use current state snapshot only.
+        val successState = modelListState.value as? ModelListState.Success ?: return emptyList()
+        val wrapper = successState.models.find { it.modelItem.modelId == modelId }
+        if (wrapper != null) {
+            return wrapper.modelItem.getTags()
+        }
+
+        // Compensation: asynchronously warm up model list data for subsequent reads.
+        scheduleTagWarmup(modelId)
+        return emptyList()
+    }
+
+    private fun scheduleTagWarmup(modelId: String) {
+        val runningJob = tagWarmupJob
+        if (runningJob != null && runningJob.isActive) {
+            return
+        }
+        tagWarmupJob = applicationScope.launch {
+            try {
+                if (!::context.isInitialized) {
+                    return@launch
+                }
+                if (!isInitialized && !isInitializing) {
+                    initialize(context)
+                    return@launch
+                }
+                if (modelListState.value !is ModelListState.Success) {
+                    refreshModelList()
+                }
+            } catch (e: Exception) {
+                Timber.w(e, "scheduleTagWarmup failed for modelId=$modelId")
             }
-            
-            // Find the model in the success state
-            val wrapper: ModelItemWrapper? = successState.models.find { wrapper: ModelItemWrapper -> 
-                wrapper.modelItem.modelId == modelId 
-            }
-            wrapper?.modelItem?.getTags() ?: emptyList()
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to get model tags for $modelId")
-            emptyList()
         }
     }
 
@@ -459,7 +488,18 @@ object ModelListManager {
      */
     fun getExtraTags(modelId: String): List<String> {
         val modelItem = modelIdModelMap[modelId]
-        return modelItem?.getExtraTags() ?: emptyList()
+        if (modelItem == null) {
+            return emptyList()
+        }
+
+        // Prefer framework-provided extra tags when available.
+        val frameworkExtraTags = modelItem.getExtraTags()
+        if (frameworkExtraTags.isNotEmpty()) {
+            return frameworkExtraTags
+        }
+
+        // Fallback for local/legacy ModelItem implementations where getExtraTags() returns empty.
+        return (modelItem.modelMarketItem as? ModelMarketItem)?.extraTags ?: emptyList()
     }
 
     /**
@@ -601,12 +641,13 @@ object ModelListManager {
                     null
                 }
             }
+            val filteredModels = filterPrimaryListModels(models)
 
-            if (models.isEmpty() && cache.models.isNotEmpty()) {
+            if (filteredModels.isEmpty() && cache.models.isNotEmpty()) {
                 return@withContext null
             }
 
-            models
+            filteredModels
         } catch (e: Exception) {
             Timber.w(e, "Failed to load model list from disk cache")
             // Delete corrupted cache
@@ -642,7 +683,9 @@ object ModelListManager {
         cached.zip(fresh).forEach { (c, f) ->
             if (c.isPinned != f.isPinned ||
                 c.downloadSize != f.downloadSize ||
-                c.lastChatTime != f.lastChatTime
+                c.lastChatTime != f.lastChatTime ||
+                c.modelItem.modelName != f.modelItem.modelName ||
+                c.modelItem.getTags() != f.modelItem.getTags()
             ) {
                 Timber.d("Model properties changed for ${c.modelItem.modelId}")
                 return true
@@ -719,8 +762,10 @@ object ModelListManager {
                 }
             }
 
+            val filteredModels = filterPrimaryListModels(modelWrappers)
+
             // Sort models: pinned as first priority, then recently used first, then by download time
-            val sortedModels = modelWrappers.sortedWith(
+            val sortedModels = filteredModels.sortedWith(
                 compareByDescending<ModelItemWrapper> {
                     if (it.isPinned) 1 else 0
                 }.thenByDescending {
@@ -735,10 +780,10 @@ object ModelListManager {
             )
             
             // Clear and cache modelId model to a map
-            modelIdModelMap.clear()
-            sortedModels.forEach {
-                modelIdModelMap[it.modelItem.modelId!!] = it.modelItem
-            }
+                modelIdModelMap.clear()
+                sortedModels.forEach {
+                    modelIdModelMap[it.modelItem.modelId!!] = it.modelItem
+                }
 
             return sortedModels
         } catch (e: Exception) {
@@ -762,25 +807,18 @@ object ModelListManager {
                 downloadedModel.modelId,
                 downloadedModel.modelPath
             )
-            // Use ModelMarketCache instead of IO operation
-            modelItem.modelMarketItem =
-                ModelMarketCache.getModelFromCache(downloadedModel.modelId)
+            val marketItem = resolveMarketItemForModel(modelItem.modelId!!, modelItem.modelName)
+            if (marketItem != null) {
+                modelItem.modelMarketItem = marketItem
+                modelItem.tags = marketItem.tags
+            }
 
             // Ensure modelName is set
             if (modelItem.modelName.isNullOrEmpty()) {
-                val marketItem = modelItem.modelMarketItem as? com.alibaba.mnnllm.android.modelmarket.ModelMarketItem
                 if (marketItem?.modelName != null) {
                     modelItem.modelName = marketItem.modelName
-                    // Properly copy tags for display
-                    modelItem.tags = marketItem.tags
                 } else {
                     modelItem.modelName = ModelUtils.getModelName(downloadedModel.modelId)
-                }
-            } else {
-                // If modelName is already set, we still need to copy tags
-                val marketItem = modelItem.modelMarketItem as? com.alibaba.mnnllm.android.modelmarket.ModelMarketItem
-                if (marketItem != null) {
-                    modelItem.tags = marketItem.tags
                 }
             }
 
@@ -850,15 +888,12 @@ object ModelListManager {
             // Load market tags for local model
 //            localModel.loadMarketTags(context)
 
-            // Use ModelMarketCache instead of IO operation
-            localModel.modelMarketItem =
-                ModelMarketCache.getModelFromCache(localModel.modelId!!)
-
-            // Copy tags from market item to model item
-            val marketItemForTags = localModel.modelMarketItem as? com.alibaba.mnnllm.android.modelmarket.ModelMarketItem
-            if (marketItemForTags != null) {
-                localModel.tags = marketItemForTags.tags
+            val marketItem = resolveMarketItemForModel(localModel.modelId!!, localModel.modelName)
+            if (marketItem != null) {
+                localModel.modelMarketItem = marketItem
+                localModel.tags = marketItem.tags
             }
+
 
             // JOIN_POINT: Add local tag logic here
             val currentTags = localModel.tags?.toMutableList() ?: mutableListOf()
@@ -869,7 +904,6 @@ object ModelListManager {
 
             // Ensure modelName is set
             if (localModel.modelName.isNullOrEmpty()) {
-                val marketItem = localModel.modelMarketItem as? com.alibaba.mnnllm.android.modelmarket.ModelMarketItem
                 if (marketItem?.modelName != null) {
                     localModel.modelName = marketItem.modelName
                 } else {
@@ -939,12 +973,20 @@ object ModelListManager {
 
             // Collect all model IDs first to batch database queries
             val modelIds = mutableListOf<String>()
+            val missingConfigModelIds = mutableListOf<String>()
             val modelPaths = mutableMapOf<String, String>()
             val modelTypes = mutableMapOf<String, String>()
 
             files.forEach { file ->
                 val isBuiltinModel = directory.name == "builtin"
                 
+                // Logic 0: Skip HuggingFace cache directories (format: models--{org}--{repo})
+                // These are HuggingFace Hub cache container directories, not actual models
+                if (file.isDirectory && file.name.startsWith("models--")) {
+                    logger?.append("${indent}[SKIP HF CACHE] ${file.name}\n")
+                    return@forEach
+                }
+
                 // Logic 1: Priority Recurse
                 // This must be checked BEFORE processing as a model to ensure we don't treat "modelscope" as a model and stop recursing
                 if (file.isDirectory && (file.name == "modelscope" || file.name == "modelers" || file.name == "builtin")) {
@@ -979,9 +1021,16 @@ object ModelListManager {
                              // Collect model info for batch processing
                              modelIds.add(modelId)
                              modelPaths[modelId] = modelPath
-                             modelTypes[modelId] = if (isBuiltinModel) "LLM" else "UNKNOWN"
+                             modelTypes[modelId] = if (isBuiltinModel) MODEL_TYPE_LLM else MODEL_TYPE_UNKNOWN
                         } else {
-                             status = "[SKIPPED] No Config ($configPath)"
+                             if (isBuiltinModel) {
+                                 status = "[SKIPPED] No Config ($configPath)"
+                             } else {
+                                 // For downloaded models, allow DB marker based fallback (e.g. diffusion models).
+                                 status = "[PENDING TYPE CHECK] ID=$modelId No Config"
+                                 missingConfigModelIds.add(modelId)
+                                 modelPaths[modelId] = modelPath
+                             }
                         }
                     } else {
                          status = "[SKIPPED] Invalid Model Path"
@@ -992,9 +1041,9 @@ object ModelListManager {
             }
 
             // Batch process all collected models
-            if (modelIds.isNotEmpty()) {
+            if (modelIds.isNotEmpty() || missingConfigModelIds.isNotEmpty()) {
                 // Get model types for non-builtin models
-                val nonBuiltinModels = modelIds.filter { modelTypes[it] == "UNKNOWN" }
+                val nonBuiltinModels = modelIds.filter { modelTypes[it] == MODEL_TYPE_UNKNOWN }
                 if (nonBuiltinModels.isNotEmpty()) {
                     withContext(Dispatchers.Main) {
                         nonBuiltinModels.forEach { modelId ->
@@ -1012,9 +1061,39 @@ object ModelListManager {
                     }
                 }
 
-                // Filter out non-LLM models, but keep UNKNOWN so they can be fixed/added to DB later
-                val llmModels = modelIds.filter { modelTypes[it] == "LLM" || modelTypes[it] == "UNKNOWN" }
-                logger?.append("${indent}  > Filtering: ${modelIds.size} candidates -> ${llmModels.size} valid (Keep LLM + UNKNOWN)\n")
+                // For missing-config directories, include only diffusion models.
+                if (missingConfigModelIds.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        missingConfigModelIds.forEach { modelId ->
+                            try {
+                                val modelType = chatDataManager.getDownloadModelType(modelId)
+                                logger?.append("${indent}  > Check Missing-Config DB Type for $modelId: $modelType\n")
+                                if (shouldIncludeMissingConfigModelForScan(modelId, modelType)) {
+                                    modelIds.add(modelId)
+                                    modelTypes[modelId] = resolveModelTypeForDownloadHistory(modelId, modelType)
+                                    logger?.append("${indent}    -> Included missing-config model: $modelId (type=${modelTypes[modelId]})\n")
+                                } else {
+                                    logger?.append("${indent}    -> Skipped missing-config model: $modelId\n")
+                                }
+                            } catch (e: Exception) {
+                                logger?.append("${indent}  > Error checking missing-config type for $modelId: ${e.message}\n")
+                                Timber.w(e, "Failed to check missing-config type for $modelId")
+                            }
+                        }
+                    }
+                }
+
+                // Keep LLM and DIFFUSION. Keep UNKNOWN only when it doesn't look like a voice-only model.
+                val llmModels = modelIds.filter { modelId ->
+                    val modelType = modelTypes[modelId]
+                    when {
+                        modelType.equals(MODEL_TYPE_LLM, ignoreCase = true) -> true
+                        modelType.equals(MODEL_TYPE_DIFFUSION, ignoreCase = true) -> true
+                        modelType.equals(MODEL_TYPE_UNKNOWN, ignoreCase = true) -> !isLikelyVoiceModel(modelId)
+                        else -> false
+                    }
+                }
+                logger?.append("${indent}  > Filtering: ${modelIds.size} candidates -> ${llmModels.size} valid (LLM + DIFFUSION + UNKNOWN(non-voice))\n")
 
                 if (llmModels.isNotEmpty()) {
                     // Batch get download times and last chat times
@@ -1034,12 +1113,13 @@ object ModelListManager {
 
                                 // Record download history if needed
                                 if (downloadTime <= 0) {
-                                    logger?.append("${indent}  > [${if (dryRun) "DRY RUN" else "ACTION"}] Recording download history for $modelId\n")
+                                    val modelTypeForHistory = resolveModelTypeForDownloadHistory(modelId, modelTypes[modelId])
+                                    logger?.append("${indent}  > [${if (dryRun) "DRY RUN" else "ACTION"}] Recording download history for $modelId type=$modelTypeForHistory\n")
                                     if (!dryRun) {
                                         chatDataManager.recordDownloadHistory(
                                             modelId,
                                             modelPaths[modelId]!!,
-                                            "LLM"
+                                            modelTypeForHistory
                                         )
                                     }
                                 }
@@ -1100,6 +1180,161 @@ object ModelListManager {
             Timber.e(e, "Debug scan failed")
         }
         return sb.toString()
+    }
+
+    private fun startMarketDataSyncIfNeeded() {
+        if (Build.FINGERPRINT.contains("robolectric", ignoreCase = true)) {
+            return
+        }
+        if (marketDataSyncJob != null) {
+            return
+        }
+        marketDataSyncJob = marketSyncScope.launch {
+            ModelRepository.marketDataFlow
+                .filterNotNull()
+                .collect { marketData ->
+                    val currentSyncKey = buildMarketSyncKey(marketData.version)
+                    if (!isInitialized || isInitializing) {
+                        Timber.d(
+                            "Market data changed while model list not ready: ${lastSyncedMarketDataKey} -> $currentSyncKey"
+                        )
+                        return@collect
+                    }
+                    if (currentSyncKey == lastSyncedMarketDataKey) {
+                        return@collect
+                    }
+                    val previousSyncKey = lastSyncedMarketDataKey
+                    lastSyncedMarketDataKey = currentSyncKey
+                    try {
+                        Timber.d("Market data changed: $previousSyncKey -> $currentSyncKey, refreshing model list")
+                        notifyModelListMayChange(ChangeReason.MARKET_DATA_UPDATED)
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to refresh model list for market version change")
+                    }
+                }
+        }
+    }
+
+    private fun buildMarketSyncKey(version: String): String {
+        val env = if (::context.isInitialized) {
+            ModelRepository.getMarketEnvironment(context)
+        } else {
+            "unknown"
+        }
+        return "$env:$version"
+    }
+
+    private suspend fun resolveMarketItemForModel(
+        modelId: String,
+        modelNameHint: String?
+    ): ModelMarketItem? {
+        val exact = ModelMarketCache.getModelFromCache(modelId)
+        if (exact != null) {
+            return exact
+        }
+
+        val allMarketItems = ModelMarketCache.getAllCachedModels().values
+        if (allMarketItems.isEmpty()) {
+            return null
+        }
+
+        val expectedSuffix = normalizeKey(modelId.substringAfterLast('/'))
+        if (expectedSuffix.isNotEmpty()) {
+            val bySuffix = allMarketItems.firstOrNull {
+                normalizeKey(it.modelId.substringAfterLast('/')) == expectedSuffix
+            }
+            if (bySuffix != null) {
+                return bySuffix
+            }
+        }
+
+        val expectedName = normalizeKey(modelNameHint ?: ModelUtils.getModelName(modelId))
+        if (expectedName.isNotEmpty()) {
+            return allMarketItems.firstOrNull { normalizeKey(it.modelName) == expectedName }
+        }
+
+        return null
+    }
+
+    private fun normalizeKey(value: String?): String {
+        return value
+            ?.trim()
+            ?.lowercase(Locale.ROOT)
+            ?.replace("_", "")
+            ?.replace("-", "")
+            ?.replace(" ", "")
+            ?: ""
+    }
+
+    private fun filterPrimaryListModels(models: List<ModelItemWrapper>): List<ModelItemWrapper> {
+        if (models.isEmpty()) {
+            return models
+        }
+        val filtered = models.filterNot { wrapper ->
+            shouldExcludeFromPrimaryList(wrapper.modelItem)
+        }
+        if (filtered.size != models.size) {
+            val removedIds = models.asSequence()
+                .mapNotNull { it.modelItem.modelId }
+                .filter { modelId -> filtered.none { it.modelItem.modelId == modelId } }
+                .toList()
+            Timber.d("Filtered out non-LLM models from primary list: $removedIds")
+        }
+        return filtered
+    }
+
+    private fun shouldExcludeFromPrimaryList(modelItem: ModelItem): Boolean {
+        val modelId = modelItem.modelId ?: return false
+        val tags = modelItem.getTags()
+        if (ModelTypeUtils.isAsrModelByTags(tags) || ModelTypeUtils.isTtsModelByTags(tags)) {
+            return true
+        }
+
+        // Keep local debug/dev models visible by default. Only explicit ASR/TTS tags can hide them.
+        if (modelId.startsWith("local/")) {
+            return false
+        }
+
+        val modelName = modelItem.modelName ?: ModelUtils.getModelName(modelId).orEmpty()
+        if (ModelTypeUtils.isTtsModel(modelName) || ModelTypeUtils.isTtsModel(modelId)) {
+            return true
+        }
+
+        return isLikelyVoiceModel(modelId) || isLikelyVoiceModel(modelName)
+    }
+
+    private fun isLikelyVoiceModel(value: String?): Boolean {
+        if (value.isNullOrBlank()) {
+            return false
+        }
+        val normalized = value.lowercase(Locale.ROOT)
+        return normalized.contains("tts") ||
+            normalized.contains("asr") ||
+            normalized.contains("bert-vits") ||
+            normalized.contains("sherpa") ||
+            normalized.contains("whisper") ||
+            normalized.contains("zipformer")
+    }
+
+    internal fun shouldIncludeMissingConfigModelForScan(
+        modelId: String,
+        modelType: String?
+    ): Boolean {
+        if (modelType.equals(MODEL_TYPE_DIFFUSION, ignoreCase = true)) {
+            return true
+        }
+        return modelType == null && ModelTypeUtils.isDiffusionModel(modelId)
+    }
+
+    internal fun resolveModelTypeForDownloadHistory(
+        modelId: String,
+        modelType: String?
+    ): String {
+        if (modelType.equals(MODEL_TYPE_DIFFUSION, ignoreCase = true) ||
+            ModelTypeUtils.isDiffusionModel(modelId)) {
+            return MODEL_TYPE_DIFFUSION
+        }
+        return MODEL_TYPE_LLM
     }
 
     /**

@@ -11,10 +11,9 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.alibaba.mnnllm.android.chat.ChatActivity
-import com.alibaba.mnnllm.api.openai.service.ApiServiceCoordinator
+import com.alibaba.mnnllm.api.openai.di.ServiceLocator
 import com.alibaba.mnnllm.api.openai.manager.ApiNotificationManager
 import com.alibaba.mnnllm.api.openai.manager.CurrentModelManager
 import timber.log.Timber
@@ -27,11 +26,13 @@ class OpenAIService : Service() {
     companion object {
         private var isServiceRunning = false
         private var serviceConnection: ServiceConnection? = null
+        private var activeInstance: OpenAIService? = null
+
+        fun getInstance(): OpenAIService? = activeInstance
 
         fun startService(context: Context, modelId: String? = null) {
             if (context !is ChatActivity) {
-                Timber.tag("ServiceStartCondition").w("Invalid context. Not starting service.")
-                return
+                Timber.tag("ServiceStartCondition").w("Context is not ChatActivity, but proceeding with service start.")
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -40,8 +41,18 @@ class OpenAIService : Service() {
                         Manifest.permission.POST_NOTIFICATIONS
                     ) != PackageManager.PERMISSION_GRANTED
                 ) {
-                    Timber.tag("ServiceStartCondition").w("Notification permission not granted, cannot start foreground service")
-                    return
+                    if (context is android.app.Activity) {
+                        Timber.tag("ServiceStartCondition").i("Requesting POST_NOTIFICATIONS permission.")
+                        androidx.core.app.ActivityCompat.requestPermissions(
+                            context,
+                            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                            1001 // Request code
+                        )
+                    } else {
+                        Timber.tag("ServiceStartCondition").w("Context is not Activity, cannot request permission.")
+                    }
+                    Timber.tag("ServiceStartCondition").w("Notification permission not granted, but proceeding. Notification might be hidden.")
+                    // Do not return here; let the service start.
                 }
             }
 
@@ -129,19 +140,16 @@ class OpenAIService : Service() {
 
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!isServiceRunning) {
-            Timber.tag("ServiceLifecycle").w("Service started illegally and will be stopped immediately.")
-            stopSelf()
-            return START_NOT_STICKY
+        isServiceRunning = true
+
+        val previousModelId = currentModelId
+        val requestedModelId = intent?.getStringExtra("modelId")
+        if (!requestedModelId.isNullOrBlank()) {
+            currentModelId = requestedModelId
+            CurrentModelManager.setCurrentModelId(requestedModelId)
+            Timber.tag(TAG).i("Service started with modelId: $requestedModelId")
         }
-        
-        //getpass modelId
-        intent?.getStringExtra("modelId")?.let { modelId ->
-            currentModelId = modelId
-            CurrentModelManager.setCurrentModelId(modelId)
-            Timber.tag(TAG).i("Service started with modelId: $modelId")
-        }
-        
+
         val notification = coordinator.getNotification()
         if (notification != null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -150,11 +158,20 @@ class OpenAIService : Service() {
                 startForeground(ApiNotificationManager.NOTIFICATION_ID, notification)
             }
         }
+
+        val startModelId = if (!requestedModelId.isNullOrBlank()) requestedModelId else currentModelId
+        val startSuccess = coordinator.startServer(startModelId)
+        if (!startSuccess && !requestedModelId.isNullOrBlank()) {
+            currentModelId = previousModelId
+            syncCurrentModelManager(previousModelId)
+            Timber.tag(TAG).w("Failed to switch service runtime model, rolled back to previous modelId: $previousModelId")
+        }
         return START_NOT_STICKY
     }
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         coordinator = ApiServiceCoordinator(this)
         coordinator.initialize()
     }
@@ -167,6 +184,9 @@ class OpenAIService : Service() {
     override fun onDestroy() {
         Timber.tag(TAG).i("Service is being destroyed")
         cleanup()
+        if (activeInstance == this) {
+            activeInstance = null
+        }
         super.onDestroy()
     }
 
@@ -192,6 +212,7 @@ class OpenAIService : Service() {
         
         //clearglobalmodelID
         CurrentModelManager.clearCurrentModelId()
+        ServiceLocator.getLlmRuntimeController().releaseSession()
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -211,7 +232,7 @@ class OpenAIService : Service() {
 
 
     fun initializeWithSession() {
-        val success = coordinator.startServer()
+        val success = coordinator.startServer(currentModelId)
         if (!success) {
             Timber.tag(TAG).w("Failed to start server through coordinator")
         }
@@ -226,4 +247,12 @@ class OpenAIService : Service() {
     fun isServerRunning(): Boolean = coordinator.isServerRunning
     
     fun getCurrentModelId(): String? = currentModelId
+
+    private fun syncCurrentModelManager(modelId: String?) {
+        if (modelId.isNullOrBlank()) {
+            CurrentModelManager.clearCurrentModelId()
+        } else {
+            CurrentModelManager.setCurrentModelId(modelId)
+        }
+    }
 }

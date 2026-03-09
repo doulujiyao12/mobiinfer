@@ -33,6 +33,7 @@ import com.alibaba.mnnllm.android.llm.AudioDataListener
 import com.alibaba.mnnllm.android.llm.LlmSession
 import com.alibaba.mnnllm.android.mainsettings.MainSettings.isApiServiceEnabled
 import com.alibaba.mnnllm.android.modelsettings.SettingsBottomSheetFragment
+import com.alibaba.mnnllm.android.modelsettings.DiffusionSettingsBottomSheetFragment
 import com.alibaba.mnnllm.api.openai.ui.ApiSettingsBottomSheetFragment
 import com.alibaba.mnnllm.api.openai.ui.ApiConsoleBottomSheetFragment
 import com.alibaba.mnnllm.android.utils.AudioPlayService
@@ -44,6 +45,8 @@ import com.alibaba.mnnllm.android.chat.voice.VoiceChatFragment
 import com.alibaba.mnnllm.android.chat.voice.VoiceModelsChecker
 import com.alibaba.mnnllm.android.chat.voice.VoiceModelMarketBottomSheet
 import com.alibaba.mnnllm.android.modelist.ModelItemWrapper
+import com.alibaba.mnnllm.android.utils.CrashReportContext
+import com.alibaba.mnnllm.android.utils.ConfigInfoDialog
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filter
@@ -81,6 +84,9 @@ class ChatActivity : AppCompatActivity() {
     var modelId: String? = null
     private var currentUserMessage: ChatDataItem? = null
     private var sessionName: String? = null
+    private var useDiffusionWaitHint: Boolean = false
+    private var hasMeaningfulDiffusionProgress: Boolean = false
+    private var showDiffusionPercentWhenZero: Boolean = false
     private lateinit var binding: ActivityChatBinding
     private var audioPlayer: AudioChunksPlayer? = null
     private lateinit var chatPresenter: ChatPresenter
@@ -107,6 +113,7 @@ class ChatActivity : AppCompatActivity() {
         if (this.modelName.isEmpty() || this.modelId.isNullOrEmpty()) {
             finish()
         }
+        CrashReportContext.setCurrentModel(this.modelId, intent.getStringExtra("chatSessionId"))
         dateFormat = SimpleDateFormat("hh:mm aa", Locale.getDefault())
         layoutModelLoading = findViewById(R.id.layout_model_loading)
         updateActionBar()
@@ -189,6 +196,7 @@ class ChatActivity : AppCompatActivity() {
     private fun setupSession() {
         chatSession = chatPresenter.createSession()
         sessionId = chatSession!!.sessionId
+        CrashReportContext.setCurrentModel(modelId, sessionId)
         onSessionCreated()
         Log.d(TAG, "current SessionId: $sessionId")
         chatPresenter.load()
@@ -355,7 +363,7 @@ class ChatActivity : AppCompatActivity() {
                     true
                 )
             )
-        menu.findItem(R.id.menu_item_model_settings).isVisible = !isDiffusion
+        menu.findItem(R.id.menu_item_model_settings).isVisible = true
         menu.findItem(R.id.menu_item_benchmark_test).isVisible = benchmarkModule.enabled
         // Voice chat is only available for non-diffusion models
         menu.findItem(R.id.start_voice_chat).isVisible = !isDiffusion
@@ -380,16 +388,30 @@ class ChatActivity : AppCompatActivity() {
         } else if (item.itemId == android.R.id.home) {
             finish()
         } else if (item.itemId == R.id.menu_item_model_settings) {
-            SettingsBottomSheetFragment().apply {
-                setModelId(modelId!!)
-                setConfigPath(intent.getStringExtra("configFilePath"))
-                setSession(chatSession as LlmSession)
-                addOnSettingsDoneListener{needRecreate->
-                    if (needRecreate) {
-                        recreate()
+            val session = chatSession
+            if (session is LlmSession) {
+                SettingsBottomSheetFragment().apply {
+                    setModelId(modelId!!)
+                    setConfigPath(intent.getStringExtra("configFilePath"))
+                    setSession(session)
+                    addOnSettingsDoneListener{needRecreate->
+                        if (needRecreate) {
+                            recreate()
+                        }
                     }
-                }
-            }.show(supportFragmentManager, SettingsBottomSheetFragment.TAG)
+                }.show(supportFragmentManager, SettingsBottomSheetFragment.TAG)
+            } else {
+                // For Sana and other diffusion models
+                DiffusionSettingsBottomSheetFragment().apply {
+                    setModelId(modelId!!)
+                    setConfigPath(intent.getStringExtra("configFilePath"))
+                    addOnSettingsDoneListener{needRecreate->
+                        if (needRecreate) {
+                            recreate()
+                        }
+                    }
+                }.show(supportFragmentManager, DiffusionSettingsBottomSheetFragment.TAG)
+            }
             return true
         } else if (item.itemId == R.id.menu_item_benchmark_test) {
             chatSession!!.setKeepHistory(false)
@@ -404,6 +426,9 @@ class ChatActivity : AppCompatActivity() {
             return true
         } else if (item.itemId == R.id.menu_item_api_console) {
             ApiConsoleBottomSheetFragment.newInstance(this).show(supportFragmentManager, "ApiConsoleBottomSheetFragment")
+            return true
+        } else if (item.itemId == R.id.menu_item_config_info) {
+            showConfigInfo()
             return true
         }
         return super.onOptionsItemSelected(item)
@@ -435,6 +460,7 @@ class ChatActivity : AppCompatActivity() {
             this.sessionName = null
             chatPresenter.reset{newSessionId ->
                 sessionId = newSessionId
+                CrashReportContext.setCurrentModel(modelId, sessionId)
             }
         } else {
             Toast.makeText(this, "Cannot Create New Session when generating", Toast.LENGTH_LONG).show()
@@ -495,6 +521,16 @@ class ChatActivity : AppCompatActivity() {
         setIsGenerating(true)
         val recentItem = chatListComponent.recentItem
         recentItem?.loading = true
+        recentItem?.forceShowLoadingWithText = false
+        useDiffusionWaitHint = DiffusionWaitHintPolicy.shouldShowWaitHint(modelName)
+        hasMeaningfulDiffusionProgress = false
+        showDiffusionPercentWhenZero = ModelTypeUtils.isSanaModel(modelName)
+        if (useDiffusionWaitHint && recentItem != null) {
+            recentItem.text = getString(R.string.diffusion_wait_hint_no_progress)
+            recentItem.displayText = recentItem.text
+            recentItem.forceShowLoadingWithText = true
+            chatListComponent.updateAssistantResponse(recentItem)
+        }
     }
 
     /**
@@ -543,14 +579,30 @@ class ChatActivity : AppCompatActivity() {
             if ("100" == progress) {
                 chatDataItem.text = getString(R.string.diffusion_generated_message)
                 chatDataItem.displayText = chatDataItem.text
+                chatDataItem.forceShowLoadingWithText = false
                 if (!diffusionDestPath.isNullOrEmpty()) {
-                    chatDataItem.imageUri = Uri.parse(diffusionDestPath)
+                    chatDataItem.imageUri = Uri.fromFile(java.io.File(diffusionDestPath))
+                    Log.d(TAG, "onDiffusionGenerateProgress: Set imageUri to ${chatDataItem.imageUri}")
                 } else {
                     Log.w(TAG, "onDiffusionGenerateProgress: diffusionDestPath is null or empty")
                 }
             } else {
-                chatDataItem.text = getString(R.string.diffusion_generate_progress, progress)
+                val numericProgress = progress?.toIntOrNull()
+                if (DiffusionProgressHintPolicy.isMeaningfulProgress(progress)) {
+                    hasMeaningfulDiffusionProgress = true
+                }
+                chatDataItem.text = if (useDiffusionWaitHint) {
+                    val shouldShowPercent = hasMeaningfulDiffusionProgress || (showDiffusionPercentWhenZero && numericProgress != null)
+                    if (shouldShowPercent) {
+                        getString(R.string.diffusion_opencl_wait_hint, (numericProgress ?: 0).toString())
+                    } else {
+                        getString(R.string.diffusion_wait_hint_no_progress)
+                    }
+                } else {
+                    getString(R.string.diffusion_generate_progress, progress ?: "0")
+                }
                 chatDataItem.displayText = chatDataItem.text
+                chatDataItem.forceShowLoadingWithText = useDiffusionWaitHint
             }
             chatListComponent.updateAssistantResponse(chatDataItem)
         } catch (e: Exception) {
@@ -562,6 +614,10 @@ class ChatActivity : AppCompatActivity() {
         setIsGenerating(false)
         val recentItem = chatListComponent.recentItem!!
         recentItem.loading = false
+        recentItem.forceShowLoadingWithText = false
+        useDiffusionWaitHint = false
+        hasMeaningfulDiffusionProgress = false
+        showDiffusionPercentWhenZero = false
         
         // Handle error cases
         if (benchMarkResult.containsKey("error") && benchMarkResult["error"] as Boolean) {
@@ -603,6 +659,10 @@ class ChatActivity : AppCompatActivity() {
             setIsGenerating(false)
             val recentItem = chatListComponent.recentItem
             recentItem?.loading = false
+            recentItem?.forceShowLoadingWithText = false
+            useDiffusionWaitHint = false
+            hasMeaningfulDiffusionProgress = false
+            showDiffusionPercentWhenZero = false
             
             Log.d(TAG, "Generation stopped by external request")
         } else {
@@ -612,6 +672,16 @@ class ChatActivity : AppCompatActivity() {
 
     val sessionDebugInfo: String
         get() = chatSession!!.debugInfo
+
+    private fun showConfigInfo() {
+        val session = chatSession
+        if (session is LlmSession) {
+            val configJson = session.dumpConfig()
+            ConfigInfoDialog.show(this, configJson)
+        } else {
+            Toast.makeText(this, "Config info not available for this model type", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     private fun initializeVoiceModelsChecker() {
         Log.d(TAG, "Initializing VoiceModelsChecker")
@@ -700,6 +770,7 @@ class ChatActivity : AppCompatActivity() {
             this.sessionName = null
             chatPresenter.reset { newSessionId ->
                 sessionId = newSessionId
+                CrashReportContext.setCurrentModel(modelId, sessionId)
                 // Create voice chat fragment with the new session
                 val voiceChatFragment = VoiceChatFragment.newInstance(modelName, modelId!!, chatPresenter)
                 supportFragmentManager.beginTransaction()
@@ -768,6 +839,7 @@ class ChatActivity : AppCompatActivity() {
             }, onSessionCreated = { newSession ->
                 chatSession = newSession
                 sessionId = newSession.sessionId
+                CrashReportContext.setCurrentModel(modelId, sessionId)
                 onSessionCreated()
             }
         )
@@ -779,6 +851,7 @@ class ChatActivity : AppCompatActivity() {
     private fun updateModelInfo(selectedModelId: String, selectedModelName: String) {
         this.modelId = selectedModelId
         this.modelName = selectedModelName
+        CrashReportContext.setCurrentModel(this.modelId, sessionId)
         isDiffusion = ModelTypeUtils.isDiffusionModel(selectedModelName)
         isAudioModel = ModelTypeUtils.isAudioModel(selectedModelId)
         

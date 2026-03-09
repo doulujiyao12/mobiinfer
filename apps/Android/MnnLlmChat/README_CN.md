@@ -51,8 +51,53 @@
   cd ../../../apps/Android/MnnLlmChat
   ./installDebug.sh
   ```
-
 # Releases
+
+## Version 0.8.1.2
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/apks/mnn_chat_0_8_1_2.apk)
++ 问题修复：
+  + 修复已知问题并提升整体稳定性。
+
+## Version 0.8.1.1
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_8_1_1.apk)
++ 问题修复：
+  + 修复若干已知问题并提升整体稳定性。
+  + 提升模型切换与聊天流程的可靠性。
+
+## Version 0.8.1
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_8_1.apk)
++ 更新亮点：
+  + 支持 Qwen3.5 切换思考模式。
+  + 提高 API 稳定性，兼容 Anthropic 协议。
+
+## Version 0.8.0.1
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_8_0_1.apk)
++ 问题修复：
+  + 修复 Qwen3.5 的 benchmark 崩溃问题
+
+## Version 0.8.0
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_8_0.apk)
++ 新功能：
+  + 支持 Qwen3.5
+
+## Version 0.7.8
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_7_8.apk)
++ 新增：
+  + 稳定性改进
+
+## Version 0.7.7
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_7_7.apk)
++ 问题修复：
+  + 修复下载删除失败问题
++ 新功能：
+  + 支持 Sana 图像编辑模型
+
+## Version 0.7.6
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_7_6.apk)
++ 问题修复：
+  + 修复 huggingface 下载错误
++ 界面更新：
+  + 支持多图输入
 
 ## Version 0.7.5
 + 点击这里 [下载](https://meta.alicdn.com/data/mnn/mnn_chat_0_7_5.apk)
