@@ -169,6 +169,23 @@ Prompt::Prompt(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> c
     setParams(config);
 }
 
+std::string Prompt::dump() const {
+    std::ostringstream os;
+    os << "mPromptTemplate: " << mPromptTemplate << "\n";
+    os << "mSystemPrompt: " << mSystemPrompt << "\n";
+    os << "mBos: " << mBos << "\n";
+    os << "mSystemTemplate: " << mSystemTemplate << "\n";
+    os << "mUserTemplate: " << mUserTemplate << "\n";
+    os << "mAssistantTemplate: " << mAssistantTemplate << "\n";
+    os << "mAssistantPrefix: " << mAssistantPrefix << "\n";
+    os << "mAssistantSuffix: " << mAssistantSuffix << "\n";
+    os << "mSystemName: " << mSystemName << "\n";
+    os << "mUserName: " << mUserName << "\n";
+    os << "mAssistantName: " << mAssistantName << "\n";
+    os << "mCommonTemplate: " << (mCommonTemplate ? "set" : "null") << "\n";
+    return os.str();
+}
+
 std::string Prompt::applyTemplate(std::string user_content, bool add_system_prompt, bool add_generation_prompt) {
     std::vector<ChatMessage> prompts;
     if (add_system_prompt) {

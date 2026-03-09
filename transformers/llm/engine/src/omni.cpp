@@ -12,6 +12,10 @@
 #include <regex>
 #include <algorithm>
 #include <random>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
 #include "omni.hpp"
@@ -32,6 +36,95 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+namespace {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+static constexpr bool kIsX86 = true;
+#else
+static constexpr bool kIsX86 = false;
+#endif
+
+static bool shouldDumpX86Log(const std::shared_ptr<LlmConfig>& config) {
+    if (!kIsX86 || config == nullptr) {
+        return false;
+    }
+    return false;
+    const auto backend = config->backend_type(true);
+    return backend == "cpu" || backend == "auto";
+}
+
+static std::string getX86LogPath(const std::shared_ptr<LlmConfig>& config) {
+    const char* envPath = std::getenv("MNN_OMNI_LOG_PATH");
+    if (envPath != nullptr && envPath[0] != '\0') {
+        return std::string(envPath);
+    }
+    if (config != nullptr) {
+        return config->config_.value("omni_log_path", std::string("omni_x86.log"));
+    }
+    return "omni_x86.log";
+}
+
+static std::string typeToString(const halide_type_t& type) {
+    std::string code;
+    switch (type.code) {
+        case halide_type_float: code = "f"; break;
+        case halide_type_int: code = "i"; break;
+        case halide_type_uint: code = "u"; break;
+        default: code = "t"; break;
+    }
+    return code + std::to_string(type.bits);
+}
+
+static void dumpIdsToLog(std::ofstream& ofs, const std::string& name, const std::vector<int>& ids) {
+    ofs << name << " size=" << ids.size() << " values:";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ofs << (i == 0 ? " " : ", ") << ids[i];
+    }
+    ofs << "\n";
+}
+
+static void dumpVarpToLog(std::ofstream& ofs, const std::string& name, VARP var) {
+    if (var == nullptr) {
+        ofs << name << " = <null>\n";
+        return;
+    }
+    auto info = var->getInfo();
+    if (info == nullptr) {
+        ofs << name << " = <no info>\n";
+        return;
+    }
+    ofs << name << " shape=[";
+    for (size_t i = 0; i < info->dim.size(); ++i) {
+        ofs << info->dim[i];
+        if (i + 1 < info->dim.size()) ofs << ", ";
+    }
+    ofs << "] type=" << typeToString(info->type) << " size=" << info->size << "\n";
+
+    VARP readVar = var;
+    if (!(info->type.code == halide_type_float && info->type.bits == 32)) {
+        readVar = _Cast(var, halide_type_of<float>());
+    }
+    auto readInfo = readVar->getInfo();
+    if (readInfo == nullptr) {
+        ofs << name << " <no readable info>\n";
+        return;
+    }
+    auto ptr = readVar->readMap<float>();
+    if (ptr == nullptr) {
+        ofs << name << " <null map>\n";
+        return;
+    }
+    ofs << std::setprecision(8) << name << " values:";
+    const int lineBreak = 16;
+    for (int i = 0; i < readInfo->size; ++i) {
+        if (i % lineBreak == 0) {
+            ofs << "\n";
+        }
+        ofs << ptr[i] << " ";
+    }
+    ofs << "\n";
+}
+}
 
 template <typename T>
 static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
@@ -141,6 +234,7 @@ bool Omni::load() {
 
 #ifdef LLM_SUPPORT_VISION
 std::vector<int> Omni::defaultVisionProcess(VARP image) {
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     mVisionHeight = UP_DIV(mVisionHeight, mVisionSizeUnit) * mVisionSizeUnit;
     mVisionWidth  = UP_DIV(mVisionWidth, mVisionSizeUnit) * mVisionSizeUnit;
     image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
@@ -148,7 +242,21 @@ std::vector<int> Omni::defaultVisionProcess(VARP image) {
                             mVisionMean, mVisionNorm);
     image = Express::_Unsqueeze(image, {0});
     image = Express::_Convert(image, NC4HW4);
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] defaultVisionProcess input\n";
+            dumpVarpToLog(ofs, "vision_input", image);
+        }
+    }
     auto imageEmbedding = mVisionModule->forward(image);
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] defaultVisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
 
     mVisionEmbeddings.push_back(imageEmbedding);
     int visionLen = imageEmbedding->getInfo()->dim[0];
@@ -162,6 +270,7 @@ std::vector<int> Omni::defaultVisionProcess(VARP image) {
 
 std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     AUTOTIME;
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     const auto inputNames = mVisionModule->getInfo()->inputNames;
     bool hasWindowIndex = inputNames.size() == 4 && inputNames[3] == "window_index";
     bool isQwen3VL = inputNames.size() == 5 && inputNames[3] == "idx_tensor";
@@ -215,7 +324,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
             wpos_ptr[index] = j;
         }
     }
-    VARP attention_mask, window_index;
+    VARP attention_mask, window_index, idx_tensor, weight_tensor;
     VARPS moduleInputs= {patches, position_ids};
     if (hasWindowIndex) {
         // Qwen2.5-VL: build window_index
@@ -293,8 +402,8 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
         for (int i = 0; i < grid_w; ++i) {
             w_idxs[i] = static_cast<float>(i) * (num_grid - 1) / (grid_w - 1);
         }
-        auto idx_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<int>());
-        auto weight_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<float>());
+        idx_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<int>());
+        weight_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<float>());
         auto idx_ptr = idx_tensor->writeMap<int>();
         auto weight_ptr = weight_tensor->writeMap<float>();
         for (int i = 0; i < grid_h; ++i) {
@@ -334,6 +443,22 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     attention_mask->setName("attention_mask");
     MNN::Express::Variable::save({patches, position_ids, attention_mask}, "input.mnn");
 #endif
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] qwen2VisionProcess inputs\n";
+            dumpVarpToLog(ofs, "patches", patches);
+            dumpVarpToLog(ofs, "position_ids", position_ids);
+            dumpVarpToLog(ofs, "attention_mask", attention_mask);
+            if (hasWindowIndex) {
+                dumpVarpToLog(ofs, "window_index", window_index);
+            }
+            if (isQwen3VL) {
+                dumpVarpToLog(ofs, "idx_tensor", idx_tensor);
+                dumpVarpToLog(ofs, "weight_tensor", weight_tensor);
+            }
+        }
+    }
     auto outputs = mVisionModule->onForward(moduleInputs);
     auto imageEmbedding = outputs[0];
     if (outputs.size() == 2) {
@@ -343,6 +468,13 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     imageEmbedding->setName("image_embeds");
     MNN::Express::Variable::save({imageEmbedding}, "output.mnn");
 #endif
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] qwen2VisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
     mVisionEmbeddings.push_back(imageEmbedding);
     int visionLen = imageEmbedding->getInfo()->dim[0];
     std::vector<int> imgIds(visionLen, mVisionPad);
@@ -353,6 +485,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
 
 std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     // SmolVLM
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     constexpr int visionLen = 64;
     bool splitImage = mVisionHeight > mVisionSizeUnit || mVisionWidth > mVisionSizeUnit;
     auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0,
@@ -396,7 +529,21 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
             mVisionSizeUnit
         });
         patches = _Concat({patches, globalImage}, 0);
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess input\n";
+                dumpVarpToLog(ofs, "pixel_values", patches);
+            }
+        }
         auto imageEmbedding = mVisionModule->forward(patches);
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess output\n";
+                dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+            }
+        }
         auto embeddingDims = imageEmbedding->getInfo()->dim;
         for (int i = 0; i < embeddingDims[0]; i++) {
             auto embedding = _Squeeze(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {0});
@@ -417,7 +564,21 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
         }
         imgIds.push_back(endRow);
     } else {
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess input(global)\n";
+                dumpVarpToLog(ofs, "pixel_values", globalImage);
+            }
+        }
         auto imageEmbedding = mVisionModule->forward(globalImage);
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess output(global)\n";
+                dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+            }
+        }
         mVisionEmbeddings.push_back(_Squeeze(imageEmbedding, {0}));
     }
     // global image ids
@@ -500,6 +661,7 @@ std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_si
 }
 
 std::vector<int> Omni::minicpmVisionProcess(VARP image) {
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     constexpr int visionLen = 64, patchesPerSide = 70;
     const int patchSize = mVisionSizeUnit;
     auto bestSize = minicpmBestSize(std::make_pair(mVisionHeight, mVisionWidth), patchSize);
@@ -588,7 +750,24 @@ std::vector<int> Omni::minicpmVisionProcess(VARP image) {
     // tgt size
     auto tgt_sizes = Express::_Input({B, 2}, NCHW, halide_type_of<int>());
     ::memcpy(tgt_sizes->writeMap<int>(), tgtSize.data(), tgtSize.size() * sizeof(int));
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] minicpmVisionProcess inputs\n";
+            dumpVarpToLog(ofs, "pixel_values", pixel_values);
+            dumpVarpToLog(ofs, "position_ids", position_ids);
+            dumpVarpToLog(ofs, "attention_mask", attention_mask);
+            dumpVarpToLog(ofs, "tgt_sizes", tgt_sizes);
+        }
+    }
     auto imageEmbedding = mVisionModule->onForward({pixel_values, position_ids, attention_mask, tgt_sizes})[0];
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] minicpmVisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
     for (int i = 0; i < B; i++) {
         auto embedding = _Permute(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {1, 0, 2});
         mVisionEmbeddings.push_back(embedding);
@@ -897,7 +1076,16 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
         if (mConfig->has_deepstack() && mExtraArgs.size() == 1) {
             mExtraArgs[0] = Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0));
         }
-        return Llm::embedding(input_ids);
+        auto single_embedding = Llm::embedding(input_ids);
+        if (shouldDumpX86Log(mConfig)) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[text] embedding(single)\n";
+                dumpIdsToLog(ofs, "text_ids", input_ids);
+                dumpVarpToLog(ofs, "text_embeds", single_embedding);
+            }
+        }
+        return single_embedding;
     }
     std::vector<VARP> embeddings;
     std::vector<VARP> deepstacks;
@@ -928,6 +1116,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mAudioPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if (shouldDumpX86Log(mConfig)) {
+                std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+                if (ofs) {
+                    ofs << "\n[text] embedding(before audio)\n";
+                    dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                    dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+                }
+            }
             auto mul_embedding = mAudioEmbeddings[audio_idx++];
             embeddings.push_back(txt_embedding);
             embeddings.push_back(mul_embedding);
@@ -943,6 +1139,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mVisionPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if (shouldDumpX86Log(mConfig)) {
+                std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+                if (ofs) {
+                    ofs << "\n[text] embedding(before vision)\n";
+                    dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                    dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+                }
+            }
             if (hasDeepStack) {
                 deepstacksTxt();
                 auto deepstack_embedding = mDeepStackEmbeddings[vision_idx];
@@ -960,6 +1164,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     mDeepStackEmbeddings.clear();
     if (!cur_txt_ids.empty()) {
         auto txt_embedding = Llm::embedding(cur_txt_ids);
+        if (shouldDumpX86Log(mConfig)) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[text] embedding(tail)\n";
+                dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+            }
+        }
         embeddings.push_back(txt_embedding);
         deepstacksTxt();
     }

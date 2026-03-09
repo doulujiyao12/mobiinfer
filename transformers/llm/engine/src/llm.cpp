@@ -263,6 +263,7 @@ bool Llm::load() {
     }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
     mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
+    printf("%s\n", mPrompt->dump().c_str());
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     // 3. load model
     Module::Config module_config;

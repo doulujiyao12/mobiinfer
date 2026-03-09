@@ -1,4 +1,4 @@
-import json
+python3 tools/script/make_llm_test.py llm.mnn test_dataimport json
 import os
 import re
 import math

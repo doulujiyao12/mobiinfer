@@ -88,7 +88,31 @@ class OmniQuantizer:
             else:
                 custom_calib_data = True
                 with open(data, 'r', encoding='utf-8') as f:
-                    dataset = f.read().splitlines()
+                    if data.endswith('.json'):
+                        raw = json.load(f)
+                        dataset = []
+                        if isinstance(raw, list):
+                            for item in raw:
+                                if isinstance(item, dict) and 'conversations' in item:
+                                    convs = item.get('conversations') or []
+                                    for msg in convs:
+                                        if isinstance(msg, dict) and msg.get('from') == 'human':
+                                            value = msg.get('value')
+                                            if isinstance(value, str) and value.strip():
+                                                dataset.append(value)
+                                elif isinstance(item, str) and item.strip():
+                                    dataset.append(item)
+                        elif isinstance(raw, dict):
+                            convs = raw.get('conversations') or []
+                            for msg in convs:
+                                if isinstance(msg, dict) and msg.get('from') == 'human':
+                                    value = msg.get('value')
+                                    if isinstance(value, str) and value.strip():
+                                        dataset.append(value)
+                        else:
+                            dataset = []
+                    else:
+                        dataset = f.read().splitlines()
         else:
             raise NotImplementedError("Data loading error")
 

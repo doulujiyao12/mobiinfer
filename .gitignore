@@ -392,3 +392,13 @@ apps/Android/.qoder/settings.json
 apps/Android/MnnLlmChatOld
 
 transformers/llm/export/tmp/
+transformers/llm/export/model_em8/
+transformers/llm/export/model_em_bf16/
+transformers/llm/export/model_fp16/
+transformers/llm/export/model_mobilenet/
+transformers/llm/export/model_qwen3_0.6/
+transformers/llm/export/modelfp16_visual8
+transformers/llm/export/modelfp16hqq/
+tools/script/make_llm_test_old.py
+tools/script/make_llm_test.py
+tools/logits_diff*

@@ -471,6 +471,8 @@ class Qwen2Vision(Vision):
         )
         image = convert_to_rgb(image)
         image = to_numpy_array(image)
+        height, width = image.shape[0], image.shape[1]
+        print(f"[Qwen2Vision.img_process] image size: {width}x{height}")
         resized_height, resized_width = self.smart_resize(self.image_height, self.image_width, self.patch_size * self.merge_size, self.min_pixels, self.max_pixels)
         format = infer_channel_dimension_format(image)
         resample = PILImageResampling.BICUBIC
@@ -712,6 +714,17 @@ class Qwen2_5OmniVision(Qwen2_5Vision):
         self.merger = self.visual.merger
 
 class Qwen3Vision(Qwen2Vision):
+    """
+    Qwen3Vision extends Qwen2Vision to handle vision processing with deepstack features.
+    
+    This class implements vision embedding functionality with support for deepstack 
+    visual features, which allows extracting multi-level features from different 
+    layers of the vision transformer for enhanced multimodal understanding.
+    
+    Args:
+        visual: Vision model configuration containing deepstack parameters
+        base: Base configuration for the vision model
+    """
     def __init__(self, visual, base):
         super().__init__(visual, base)
         self.patch_size = 16
@@ -741,6 +754,25 @@ class Qwen3Vision(Qwen2Vision):
         self.llm_config['has_deepstack'] = True
 
     def get_idx_weight(self, grid_thw):
+        """
+        Compute interpolation indices and weights for positional embedding.
+        
+        This method calculates bilinear interpolation indices and corresponding weights
+        for mapping variable-sized image grids to a fixed positional embedding grid.
+        It handles the spatial dimensions (height and width) while preserving temporal
+        information.
+        
+        Args:
+            grid_thw: Tensor of shape [N, 3] containing temporal, height, and width 
+                     dimensions for each image grid
+            
+        Returns:
+            tuple: (idx_tensor, weight_tensor)
+                - idx_tensor: Long tensor of shape [4, total_patches] containing 
+                             interpolation indices
+                - weight_tensor: Float tensor of shape [4, total_patches] containing 
+                               corresponding interpolation weights
+        """
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
@@ -758,6 +790,19 @@ class Qwen3Vision(Qwen2Vision):
 
             base_h = h_idxs_floor * self.num_grid_per_side
             base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+            
+            
+            # 列向量 [3, 1]  +  行向量 [1, 3]  →  矩阵 [3, 3]
+            # # PyTorch 会自动将两者扩展为 [3, 3] 后相加
+
+            # [0]             [0, 1, 2]          [0+0, 0+1, 0+2]
+            # [4]   +         [0, 1, 2]    =     [4+0, 4+1, 4+2]
+            # [8]             [0, 1, 2]          [8+0, 8+1, 8+2]
+
+            # # 结果矩阵 (2D 网格索引)
+            # [[0, 1, 2],
+            # [4, 5, 6],
+            # [8, 9, 10]]
 
             indices = [
                 (base_h[None].T + w_idxs_floor[None]).flatten(),
@@ -784,9 +829,29 @@ class Qwen3Vision(Qwen2Vision):
         idx_tensor = idx_tensor.view(4, t, h // merge_size, merge_size, w // merge_size, merge_size).permute(0, 1, 2, 4, 3, 5).reshape(4, -1)
         weight_tensor = weight_tensor.repeat(1, t)
         weight_tensor = weight_tensor.view(4, t, h // merge_size, merge_size, w // merge_size, merge_size).permute(0, 1, 2, 4, 3, 5).reshape(4, -1)
+        # 初始 patch 网格: 4×4 = 16 patches
+        # Step 3: reshape(4, -1) → 展平
+        # 最终顺序: [0,1,4,5, 2,3,6,7, 8,9,12,13, 10,11,14,15]
+        #          ←块00→ ←块01→ ←块10→  ←块11→
+        
         return idx_tensor, weight_tensor
 
     def embed(self, input_ids, images = None, videos = None):
+        """
+        Generate embeddings for input tokens, incorporating image embeddings where applicable.
+        
+        This method processes input token IDs and replaces image placeholder tokens with
+        actual image embeddings. It also handles deepstack embeddings for multi-level
+        feature representation.
+        
+        Args:
+            input_ids: Input token IDs tensor
+            images: Optional images tensor (not used in this implementation)
+            videos: Optional videos tensor (not used in this implementation)
+            
+        Returns:
+            Tensor: Final embeddings with image tokens replaced by image embeddings
+        """
         input_embeds = self.embed_(input_ids)
         if self.image_embeds is not None and len(self.image_embeds) > 0:
             image_mask = (input_ids == self.image_pad_id).squeeze()
@@ -797,12 +862,33 @@ class Qwen3Vision(Qwen2Vision):
         return input_embeds
 
     def deepstacks(self):
+        """
+        Retrieve and reset the accumulated deepstack embeddings.
+        
+        This method returns the current deepstack embeddings and resets the internal
+        state for the next forward pass.
+        
+        Returns:
+            Tensor: Deepstack embeddings of shape [3, seq_len, hidden_dim]
+        """
         deepstack_embeds = self.deepstack_embeds
         self.deepstack_feature_list = []
         self.deepstack_embeds = None
         return deepstack_embeds
 
     def images_forward(self, images):
+        """
+        Process input images through the vision transformer pipeline.
+        
+        This method handles the complete forward pass for images, including reshaping,
+        position ID generation, attention mask creation, and deepstack feature extraction.
+        
+        Args:
+            images: Input images tensor
+            
+        Returns:
+            Tensor: Image embeddings after processing through the vision transformer
+        """
         flatten_patches, grid_thw = self.vision_reshape(images)
         idx_tensor, weight_tensor = self.get_idx_weight(grid_thw)
         position_ids = self.vision_position_ids(grid_thw)
@@ -812,6 +898,50 @@ class Qwen3Vision(Qwen2Vision):
         return image_embeds
 
     def forward(self, flatten_patches, position_ids, attention_mask, idx_tensor, weight_tensor):
+        """
+        Forward pass through the vision transformer with deepstack feature extraction.
+        
+        This method processes flattened image patches through the vision transformer blocks,
+        applying positional embeddings and extracting deepstack features from specified layers.
+        
+        Args:
+            flatten_patches: Flattened image patches tensor
+            position_ids: Position IDs for rotary embeddings
+            attention_mask: Attention mask for the transformer
+            idx_tensor: Interpolation indices for positional embedding
+            weight_tensor: Interpolation weights for positional embedding
+            
+        Returns:
+            tuple: (image_embeds, deepstack_feature)
+                - image_embeds: Final image embeddings after processing
+                - deepstack_feature: Stacked deepstack features from specified layers
+        """
+        log_path = "qwen3vision_python.log"
+        try:
+            prev_printopts = torch.get_printoptions()
+        except AttributeError:
+            # Older torch versions keep print options in torch._tensor_str.
+            prev_printopts = torch._tensor_str.get_printoptions()
+        torch.set_printoptions(profile="full")
+        try:
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write("[Qwen3Vision.forward] flatten_patches:\n")
+                log_file.write(f"  shape={tuple(flatten_patches.shape)} dtype={flatten_patches.dtype}\n")
+                log_file.write(repr(flatten_patches) + "\n")
+                log_file.write("[Qwen3Vision.forward] position_ids:\n")
+                log_file.write(f"  shape={tuple(position_ids.shape)} dtype={position_ids.dtype}\n")
+                log_file.write(repr(position_ids) + "\n")
+                log_file.write("[Qwen3Vision.forward] attention_mask:\n")
+                log_file.write(f"  shape={tuple(attention_mask.shape)} dtype={attention_mask.dtype}\n")
+                log_file.write(repr(attention_mask) + "\n")
+                log_file.write("[Qwen3Vision.forward] idx_tensor:\n")
+                log_file.write(f"  shape={tuple(idx_tensor.shape)} dtype={idx_tensor.dtype}\n")
+                log_file.write(repr(idx_tensor) + "\n")
+                log_file.write("[Qwen3Vision.forward] weight_tensor:\n")
+                log_file.write(f"  shape={tuple(weight_tensor.shape)} dtype={weight_tensor.dtype}\n")
+                log_file.write(repr(weight_tensor) + "\n")
+        finally:
+            torch.set_printoptions(**prev_printopts)
         rotary_pos_emb = self.rotary(position_ids)
         hidden_states = self.patch_embed(flatten_patches)
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(2)
@@ -834,6 +964,18 @@ class Qwen3Vision(Qwen2Vision):
 
     @spinner_run(f'export visual to ')
     def export(self, onnx_path):
+        """
+        Export the vision model to ONNX format for deployment.
+        
+        This method creates dummy inputs and exports the model to ONNX format with
+        appropriate input/output names and dynamic axes configuration.
+        
+        Args:
+            onnx_path: Directory path where the ONNX model will be saved
+            
+        Returns:
+            str: Full path to the exported ONNX model file
+        """
         patch = torch.randn([256, 1536])
         posision_ids = torch.zeros([2, 256], dtype=torch.int32)
         attention_mask = torch.zeros([1, 256, 256], dtype=torch.float)

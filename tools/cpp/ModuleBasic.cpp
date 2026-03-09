@@ -29,7 +29,7 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
     auto info = output->getInfo();
     auto ptr = output->readMap<float>();
     if (info && info->size <= 0) {
-        MNN_PRINT("skip checking value for zero content tensor %s\n", name.c_str());
+        printf("skip checking value for zero content tensor %s\n", name.c_str());
         return true;
     }
 
@@ -52,14 +52,14 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
         outputOrigin.open(outputFileOs.str().c_str());
     }
     if (outputOrigin.fail()) {
-        MNN_PRINT("Skip check %s\n", name.c_str());
+        printf("Skip check %s\n", name.c_str());
         return true;
     }
-    MNN_PRINT("before compare %s: (", name.c_str());
+    printf("before compare %s: (", name.c_str());
     for (int i=0; i<info->dim.size(); ++i) {
-        MNN_PRINT("%d, ", info->dim[i]);
+        printf("%d, ", info->dim[i]);
     }
-    MNN_PRINT(")\n");
+    printf(")\n");
     auto outputPtr = output->readMap<float>();
     float diffAbsMaxV = 0.0f;
     float absMaxV = 0.0f;
@@ -77,7 +77,7 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
         diffAbsMaxV = fmaxf(diff, diffAbsMaxV);
     }
 
-    MNN_PRINT("For %s, max = %f, diffmax = %f, diff rate = %f\n", name.c_str(), absMaxV, diffAbsMaxV, diffAbsMaxV / fmaxf(absMaxV, 1e-6));
+    printf("For %s, max = %f, diffmax = %f, diff rate = %f\n", name.c_str(), absMaxV, diffAbsMaxV, diffAbsMaxV / fmaxf(absMaxV, 1e-6));
     if (absMaxV * 0.01f < diffAbsMaxV || MNN_IS_NAN(absMaxV)) {
         MNN_ERROR("TESTERROR %s value error : absMaxV:%f - DiffMax %f\n", name.c_str(), absMaxV, diffAbsMaxV);
         return false;
@@ -105,9 +105,9 @@ static inline std::vector<int> parseIntList(const std::string& str, char delim) 
 }
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        MNN_PRINT("=======================================================================================================================================\n");
+        printf("=======================================================================================================================================\n");
         MNN_ERROR("Usage: ./ModuleBasic.out ${test.mnn} ${Dir} [runMask] [forwardType] [runLoops] [numberThread] [precision | memory] [cacheFile] [cpuIds] [enableKleidiAI]\n");
-        MNN_PRINT("=======================================================================================================================================\n");
+        printf("=======================================================================================================================================\n");
         return 0;
     }
     BackendConfig backendConfigTmp;
@@ -116,7 +116,7 @@ int main(int argc, char *argv[]) {
 
     std::string modelName = argv[1];
     std::string directName = argv[2];
-    MNN_PRINT("Test %s from input info: %s\n", modelName.c_str(), directName.c_str());
+    printf("Test %s from input info: %s\n", modelName.c_str(), directName.c_str());
     std::map<std::string, float> inputInfo;
     std::map<std::string, std::vector<int>> inputShape;
     std::vector<std::string> inputNames;
@@ -137,11 +137,11 @@ int main(int argc, char *argv[]) {
     std::vector<VARP> inputs;
     std::vector<VARP> outputs;
     if (runMask & 128) {
-        MNN_PRINT("Use input.mnn and output.mnn for test\n");
+        printf("Use input.mnn and output.mnn for test\n");
         inputs = MNN::Express::Variable::load((directName + "/input.mnn").c_str());
         outputs = MNN::Express::Variable::load((directName + "/output.mnn").c_str());
         if (inputs.size() > 0 && outputs.size() > 0) {
-            MNN_PRINT("Has input.mnn, use input.mnn and output.mnn instead of json\n");
+            printf("Has input.mnn, use input.mnn and output.mnn instead of json\n");
         }
         for (auto v : inputs) {
             inputNames.emplace_back(v->name());
@@ -173,7 +173,7 @@ int main(int argc, char *argv[]) {
                 auto obj = iter->GetObject();
                 std::string name = obj["name"].GetString();
                 inputNames.emplace_back(name);
-                MNN_PRINT("%s\n", name.c_str());
+                printf("%s\n", name.c_str());
                 if (obj.HasMember("value")) {
                     float value = obj["value"].GetFloat();
                     inputInfo.insert(std::make_pair(name, value));
@@ -193,7 +193,7 @@ int main(int argc, char *argv[]) {
             auto array = document["outputs"].GetArray();
             for (auto iter = array.begin(); iter !=array.end(); iter++) {
                 std::string name = iter->GetString();
-                MNN_PRINT("output: %s\n", name.c_str());
+                printf("output: %s\n", name.c_str());
                 outputNames.emplace_back(name);
             }
         }
@@ -213,7 +213,7 @@ int main(int argc, char *argv[]) {
     auto type = MNN_FORWARD_CPU;
     if (argc > 4) {
         type = (MNNForwardType)atoi(argv[4]);
-        MNN_PRINT("Use extra forward type: %d\n", type);
+        printf("Use extra forward type: %d\n", type);
     }
 
     // Default single thread
@@ -240,9 +240,9 @@ int main(int argc, char *argv[]) {
     if (argc > 9) {
         cpuIds = parseIntList(argv[9], ',');
     }
-    MNN_PRINT("cpuIds: ");
+    printf("cpuIds: ");
     for (auto id : cpuIds) {
-        MNN_PRINT("%d ", id);
+        printf("%d ", id);
     }
     bool enableKleidiAI = false;
     if (argc > 10) {
@@ -252,7 +252,7 @@ int main(int argc, char *argv[]) {
     if (argc > 11) {
         mixedRatio = atoi(argv[11]);
     }
-    MNN_PRINT("\n");
+    printf("\n");
     FUNC_PRINT(precision);
     FUNC_PRINT(memory);
     FUNC_PRINT(power);
@@ -353,7 +353,7 @@ int main(int argc, char *argv[]) {
         AUTOTIME;
         net.reset(Module::load(inputNames, outputNames, modelName.c_str(), rtmgr, &mConfig));
         if (net == nullptr) {
-            MNN_PRINT("Error: can't load module\n");
+            printf("Error: can't load module\n");
             return 0;
         }
         if (runMask & 64) {
@@ -426,7 +426,7 @@ int main(int argc, char *argv[]) {
 
     bool modelError = false;
     for (int repeat = 0; repeat < repeatNumber; ++repeat) {
-        MNN_PRINT("Run for %d time\n", repeat);
+        printf("Run for %d time\n", repeat);
         std::vector<VARP> subInputs = inputs;
         if (repeat % 2 == 1) {
             for (int i=0; i<inputs.size(); ++i) {
@@ -472,7 +472,7 @@ int main(int argc, char *argv[]) {
             std::ostringstream fileNameOs;
             fileNameOs << "output/" << repeat <<"_"<< i << ".txt";
             auto fileName = fileNameOs.str();
-            MNN_PRINT("Write %s output to %s\n", name.c_str(), fileName.c_str());
+            printf("Write %s output to %s\n", name.c_str(), fileName.c_str());
             std::ofstream _output(fileName.c_str());
             auto ptr = v->readMap<float>();
             for (int v=0; v<info->size; ++v) {
@@ -523,12 +523,12 @@ int main(int argc, char *argv[]) {
             sum += time;
         }
         if (nullptr != gTimeTraceInfo) {
-            MNN_PRINT("Per Op Trace: \n");
+            printf("Per Op Trace: \n");
             gTimeTraceInfo->dump(true);
-            MNN_PRINT("Per Type Trace: \n");
+            printf("Per Type Trace: \n");
             gTimeTraceInfo->dump(false);
         }
-        MNN_PRINT("Avg= %f ms, min= %f ms, max= %f ms\n", sum / (float)t, minTime, maxTime);
+        printf("Avg= %f ms, min= %f ms, max= %f ms\n", sum / (float)t, minTime, maxTime);
     }
     rtmgr->updateCache();
     return 0;

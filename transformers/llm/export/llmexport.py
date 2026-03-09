@@ -107,6 +107,7 @@ class LlmExporter(torch.nn.Module):
 
         # tie word embeddings
         self.args.tie_word_embeddings = not self.args.seperate_embed and self.model.lm.lm.weight.equal(self.model.embed.embed.weight)
+        print(f'tie_word_embeddings: {self.args.tie_word_embeddings}')
         # Pass properties from model to exporter
         self.visual = self.model.visual
         self.audio = self.model.audio
@@ -509,6 +510,7 @@ class LlmExporter(torch.nn.Module):
     def export_language(self):
         # export_embedding
         if self.mnn_converter and self.args.tie_word_embeddings:
+            print("tie_word_embeddings")
             pass # mnn tie_word_embeddings need't export embedding
         else:
             self.export_embed()
@@ -542,7 +544,7 @@ class LlmExporter(torch.nn.Module):
         self.export_mtp()
         self.export_tokenizer()
         self.export_config(export_mnn)
-        if export_mnn:
+        if export_mnn and self.args.cleanup_onnx:
             # delete onnx file
             try:
                 for file in glob.glob(f'{self.onnx_path}/*'):
@@ -665,13 +667,14 @@ class EmbeddingExporter(LlmExporter):
             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
-            # delete onnx file
-            try:
-                for file in glob.glob(f'{self.onnx_path}/*'):
-                    os.remove(file)
-                os.rmdir(self.onnx_path)
-            except Exception as e:
-                print(f"remove onnx error: {e}")
+            if self.args.cleanup_onnx:
+                # delete onnx file
+                try:
+                    for file in glob.glob(f'{self.onnx_path}/*'):
+                        os.remove(file)
+                    os.rmdir(self.onnx_path)
+                except Exception as e:
+                    print(f"remove onnx error: {e}")
 
 def build_args(parser):
     parser.add_argument('--path', type=str, required=True,
@@ -691,6 +694,7 @@ def build_args(parser):
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
+    parser.add_argument('--cleanup_onnx', action='store_true', help='Delete intermediate onnx files after export.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
     parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual quant bit, 4 or 8, default is setting in utils/vision.py by different vit model.')
