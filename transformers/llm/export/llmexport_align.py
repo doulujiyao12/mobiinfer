@@ -62,12 +62,12 @@ class LlmExporter(torch.nn.Module):
         self.model_type = self.config.model_type
 
         if self.args.awq or self.args.smooth:
-            self.model.float()
+            self.model.bfloat16()
         if self.args.export is not None:
             # set norm's weight as float for export
             def visit_module(module):
                 if not isinstance(module, torch.nn.Linear) and hasattr(module, 'weight'):
-                    module.float()
+                    module.bfloat16()
                 for name, child in module.named_children():
                     visit_module(child)
             visit_module(self.model)
@@ -137,19 +137,9 @@ class LlmExporter(torch.nn.Module):
         while new_tokens < self.max_new_tokens:
             attention_mask = self.model.get_attention_mask(seq_len, new_tokens)
             position_ids = self.model.get_position_ids(seq_len, new_tokens, input_ids)
-            input_embeds = self.model.embedding(input_ids).bfloat16()
+            input_embeds = self.model.embedding(input_ids)
             deepstack_embeds = self.model.visual.deepstacks() if self.model.visual is not None else None
-            # print(f'seq_len: {seq_len}, new_tokens: {new_tokens}')
-            # print(f'position_ids')
-            # print(position_ids.size())
-            # print(f'input_embeds')
-            # print(input_embeds.size())
-            # with open('debug.txt', 'w') as f:
-            #     f.write(f'seq_len: {seq_len}, new_tokens: {new_tokens}\n')
-            #     f.write(f'position_ids: {position_ids}\n')
-            #     f.write(f'input_embeds: {input_embeds.size()}\n')
-            #     f.write(f'input_ids_size: {input_ids.size()}\n')
-            #     f.write(f'input_ids: {input_ids}\n')
+
             logits, _, _ = self.model.forward(
                 input_ids=input_embeds,
                 attention_mask=attention_mask,
@@ -172,6 +162,49 @@ class LlmExporter(torch.nn.Module):
 
         if hasattr(self.model, 'talker') and self.model.talker is not None:
             self.model.talker.generate()
+
+    @torch.no_grad()
+    def response_align(self):
+        test_dir = self.args.align
+        with open(os.path.join(test_dir, 'input.json'), 'r') as f:
+            meta = json.load(f)
+        
+        inputs = {}
+        for item in meta['inputs']:
+            name = item['name']
+            shape = item['shape']
+            path = os.path.join(test_dir, f"{name}.txt")
+            if not os.path.exists(path):
+                inputs[name] = None
+                continue
+            with open(path, 'r') as f:
+                data = [float(line.strip()) for line in f if line.strip()]
+                
+            dtype = torch.bfloat16
+            if name == 'position_ids':
+                dtype = torch.long
+            elif name == 'logits_index':
+                dtype = torch.int32
+                
+            inputs[name] = torch.tensor(data, dtype=dtype).reshape(shape)
+
+        logits, _, _ = self.model.forward(
+            input_ids=inputs.get('input_ids'),
+            attention_mask=inputs.get('attention_mask'),
+            position_ids=inputs.get('position_ids'),
+            logits_index=inputs.get('logits_index'),
+            deepstack_embeds=inputs.get('deepstack_embeds')
+        )
+
+        if self.args.dump_logits:
+            with open('logits.txt', 'w') as f:
+                for x in logits.flatten().cpu().float().tolist():
+                    f.write(f'{x}\n')
+
+        token_id = torch.argmax(logits[:, -1, :])
+        word = self.tokenizer.id_to_str(token_id)
+        print("First decode token:", word)
+        return word
 
     def export_mtp(self):
         if self.mtp is None:
@@ -320,7 +353,7 @@ class LlmExporter(torch.nn.Module):
             q_weight = torch.round((weight - min_val) / scale) + clip_min
             q_weight = torch.clip(q_weight, clip_min, clip_max)
             dq_weight = (q_weight - clip_min) * scale + min_val
-            dq_weight = dq_weight.reshape(oc, ic).float()
+            dq_weight = dq_weight.reshape(oc, ic).bfloat16()
             linear.weight.data = dq_weight
             return linear
         with torch.no_grad():
@@ -697,6 +730,7 @@ def build_args(parser):
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
+    parser.add_argument('--dump_hidden_states', type=str, default=None, help='dump hidden states to this directory.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
@@ -727,6 +761,8 @@ def build_args(parser):
     parser.add_argument('--quant_config', type=str, default=None, help='path to the JSON file for op-wise quantization configuration.')
     parser.add_argument('--generate_for_npu', action='store_true', help='Whether or not to generate model for NPU deployment, default is False.')
     parser.add_argument('--skip_weight', action='store_true', help='Whether or not to skip loading model weights, useful for testing export flow.')
+    parser.add_argument('--align', type=str, default=None, help='test data dir for alignment.')
+    parser.add_argument('--dump_logits', action='store_true', help='dump logits.')
     # omni quant
     parser.add_argument('--omni_epochs', type=int, default=20, help='OmniQuant 优化的轮数')
     parser.add_argument('--omni_lr', type=float, default=5e-3, help='OmniQuant 的学习率')
@@ -761,6 +797,9 @@ def main():
     # some actions
     if args.test is not None:
         llm_exporter.response(args.test)
+
+    if args.align is not None:
+        llm_exporter.response_align()
 
     if args.export is not None:
         print('export model to', args.export)

@@ -404,6 +404,18 @@ tools/script/make_llm_test_old.py
 tools/script/make_llm_test.py
 tools/logits_diff*
 
+
+debug1.txt
+debug2.txt
+dumptxt/
+layer_figure/
+layer_figurex86/
+logits.txt
+logits_comparison.png
+transformers/llm/export/logits.txt
+transformers/llm/export/logits_comparison.png
+transformers/llm/export/model-2B
+
 transformers/llm/export/model_npu
 
 # iOS

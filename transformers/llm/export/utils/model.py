@@ -1,4 +1,6 @@
 import torch
+import os
+import numpy as np
 import importlib
 from packaging.version import Version
 from transformers import PreTrainedModel, AutoConfig, AutoModel, AutoModelForCausalLM
@@ -196,6 +198,11 @@ class LlmModel(PreTrainedModel):
             hidden_states = self.blocks[i](hidden_states, rotary_pos_emb, layer_attention_mask)
             if deepstack_embeds is not None and i in range(deepstack_embeds.shape[0]):
                 hidden_states += deepstack_embeds[i]
+
+            if self.args is not None and hasattr(self.args, 'dump_hidden_states') and self.args.dump_hidden_states:
+                if not os.path.exists(self.args.dump_hidden_states):
+                    os.makedirs(self.args.dump_hidden_states)
+                np.savetxt(os.path.join(self.args.dump_hidden_states, 'hidden_states_{}.txt'.format(i)), hidden_states.float().cpu().detach().numpy().flatten())
 
         talker_embeds = None
         if hasattr(self, 'talker') and self.talker is not None:

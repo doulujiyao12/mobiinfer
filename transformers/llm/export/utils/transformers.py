@@ -19,6 +19,7 @@ class Embedding(torch.nn.Module):
 
     def forward(self, input_ids):
         inputs_embeds = self.embed(input_ids).view(-1, 1, self.hidden_size)
+        
         return inputs_embeds
 
 class RMSNorm(torch.nn.Module):
