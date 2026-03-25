@@ -9,13 +9,13 @@
 #define LLMCONFIG_Hpp
 
 #include <vector>
+#include <unordered_map>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <fstream>
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
 #include <MNN/MNNDefine.h>
+#include "ujson.hpp"
 
 
 namespace MNN {
@@ -44,222 +44,11 @@ static inline std::string file_name(const std::string& path) {
     }
 }
 
-static inline bool merge_json(rapidjson::Value& destination, const rapidjson::Value& source,
-                rapidjson::Document::AllocatorType& allocator) {
-    if (!source.IsObject() || !destination.IsObject()) {
-        return false;
-    }
-
-    for (auto it = source.MemberBegin(); it != source.MemberEnd(); ++it) {
-        const char* key = it->name.GetString();
-        if (destination.HasMember(key)) {
-            if (destination[key].IsObject() && it->value.IsObject()) {
-                // Recursively merge the two JSON objects
-                merge_json(destination[key], it->value, allocator);
-            } else {
-                // Overwrite the value in the destination
-                destination[key].CopyFrom(it->value, allocator);
-            }
-        } else {
-            // Add the value to the destination
-            rapidjson::Value newKey(key, allocator);
-            rapidjson::Value newValue;
-            newValue.CopyFrom(it->value, allocator);
-            destination.AddMember(newKey, newValue, allocator);
-        }
-    }
-    return true;
-}
-
-class rapid_json_wrapper {
-public:
-    rapidjson::Document document;
-    rapid_json_wrapper() {}
-    rapid_json_wrapper(rapidjson::Document doc) : document(std::move(doc)) {}
-    rapid_json_wrapper(const rapid_json_wrapper &other) {
-        document.CopyFrom(other.document, document.GetAllocator());
-    }
-    rapid_json_wrapper& operator=(const rapid_json_wrapper& other) {
-        if (this != &other) {
-            document.SetObject();
-            document.CopyFrom(other.document, document.GetAllocator());
-        }
-        return *this;
-    }
-    rapid_json_wrapper(rapid_json_wrapper&& other) noexcept : document(std::move(other.document)) {}
-    rapid_json_wrapper& operator=(rapid_json_wrapper&& other) noexcept {
-        if (this != &other) {
-            document.SetObject();
-            document.GetAllocator().Clear();
-            document = std::move(other.document);
-        }
-        return *this;
-    }
-    static rapid_json_wrapper parse(const std::ifstream& ifile) {
-        std::ostringstream ostr;
-        ostr << ifile.rdbuf();
-        rapidjson::Document document;
-        document.Parse(ostr.str().c_str());
-        rapid_json_wrapper json_wrapper(std::move(document));
-        return json_wrapper;
-    }
-    static rapid_json_wrapper parse(const char* str) {
-        rapidjson::Document document;
-        document.Parse(str);
-        rapid_json_wrapper json_wrapper(std::move(document));
-        return json_wrapper;
-    }
-    bool empty() { return document.IsNull(); }
-    bool merge(const char* str) {
-        rapidjson::Document input_doc;
-        input_doc.Parse(str);
-        if (input_doc.HasParseError()) {
-            MNN_PRINT("Config Parse Error: %d\n", input_doc.GetParseError());
-            return false;
-        }
-        // merge
-        rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
-        return merge_json(document, input_doc, allocator);
-    }
-    bool merge_and_clear(rapid_json_wrapper& source_) {
-        // rapid_json_wrapper has document object
-        rapidjson::Value& source = source_.document;
-        rapidjson::Value& destination = this->document;
-        rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
-
-        for (auto it = source.MemberBegin(); it != source.MemberEnd(); ++it) {
-            const char* key = it->name.GetString();
-            if (destination.HasMember(key)) {
-                if (destination[key].IsObject() && it->value.IsObject()) {
-                    // Recursively merge the two JSON objects
-                    merge_json(destination[key], it->value, allocator);
-                } else {
-                    // Overwrite the value in the destination
-                    destination[key].CopyFrom(it->value, allocator);
-                }
-            } else {
-                // Add the value to the destination
-                rapidjson::Value newKey(key, allocator);
-                rapidjson::Value newValue;
-                newValue.CopyFrom(it->value, allocator);
-                destination.AddMember(newKey, newValue, allocator);
-            }
-        }
-
-        // clear source content
-        source.SetNull();
-        return true;
-    }
-    std::string dump() {
-        rapidjson::StringBuffer buffer;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-        document.Accept(writer);
-        return buffer.GetString();
-    }
-    // read value
-    rapid_json_wrapper value(const char* key) const {
-        if (document.HasMember(key)  && document[key].IsObject()) {
-            rapidjson::Document subDoc;
-            subDoc.CopyFrom(document[key], subDoc.GetAllocator());
-            return rapid_json_wrapper(std::move(subDoc));
-        }
-        return rapid_json_wrapper();
-    }
-    float value(const char* key, const float& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsFloat()) return value.GetFloat();
-        }
-        return default_value;
-    }
-    int value(const char* key, const int& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsInt()) return value.GetInt();
-        }
-        return default_value;
-    }
-    bool value(const char* key, const bool& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsBool()) return value.GetBool();
-        }
-        return default_value;
-    }
-    std::string value(const char* key, const std::string& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsString()) return value.GetString();
-        }
-        return default_value;
-    }
-    std::vector<int64_t> value(const char* key, const std::vector<int64_t>& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsArray()) {
-                std::vector<int64_t> result;
-                for (auto& v : value.GetArray()) {
-                    result.push_back(v.GetInt64());
-                }
-                return result;
-            }
-        }
-        return default_value;
-    }
-    std::vector<int> value(const char* key, const std::vector<int>& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsArray()) {
-                std::vector<int> result;
-                for (auto& v : value.GetArray()) {
-                    if (v.IsInt()) {
-                        result.push_back(v.GetInt());
-                    }
-                }
-                return result;
-            }
-        }
-        return default_value;
-    }
-    std::vector<float> value(const char* key, const std::vector<float>& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsArray()) {
-                std::vector<float> result;
-                for (auto& v : value.GetArray()) {
-                    if (v.IsFloat()) {
-                        result.push_back(v.GetFloat());
-                    }
-                }
-                return result;
-            }
-        }
-        return default_value;
-    }
-    std::vector<std::string> value(const char* key, const std::vector<std::string>& default_value) const {
-        if (document.HasMember(key)) {
-            const auto& value = document[key];
-            if (value.IsArray()) {
-                std::vector<std::string> result;
-                for (auto& v : value.GetArray()) {
-                    if (v.IsString()) {
-                        result.push_back(v.GetString());
-                    }
-                }
-                return result;
-            }
-        }
-        return default_value;
-    }
-    std::string value(const char key[], const char default_value[]) const {
-        return value(key, std::string(default_value));
-    }
-};
 
 class LlmConfig {
 public:
     std::string base_dir_;
-    rapid_json_wrapper config_, mllm_config_, cur_config_;
+    ujson::json config_, mllm_config_, cur_config_;
     LlmConfig() {}
     LlmConfig(const LlmConfig& other)
         : base_dir_(other.base_dir_),
@@ -271,7 +60,9 @@ public:
         if (has_suffix(path, ".json")) {
             std::ifstream config_file(path);
             if (config_file.is_open()) {
-                config_ = rapid_json_wrapper::parse(config_file);
+                std::ostringstream ostr;
+                ostr << config_file.rdbuf();
+                config_ = ujson::json::parse(ostr.str());
             } else {
                 std::cerr << "Unable to open config file: " << path << std::endl;
                 std::cerr << "Error: " << std::strerror(errno) << " (errno: " << errno << ")" << std::endl;
@@ -285,11 +76,10 @@ public:
                     "llm_model": ")" + model_name + R"(",
                     "llm_weight": ")" + model_name + R"(.weight"
                 })";
-                config_ = rapid_json_wrapper::parse(json_str.c_str());
+                config_ = ujson::json::parse(json_str);
                 base_dir_ = base_dir(path);
             } else {
-                const char* json_cstr = "{}";
-                config_ = rapid_json_wrapper::parse(json_cstr);
+                config_ = ujson::json::parse("{}");
                 base_dir_ = path;
             }
         }
@@ -298,12 +88,14 @@ public:
         // load llm_config for model info
         std::ifstream llm_config_file(llm_config());
         if (llm_config_file.is_open()) {
-            auto llm_config_ = rapid_json_wrapper::parse(llm_config_file);
-            config_.merge_and_clear(llm_config_);
+            std::ostringstream ostr;
+            ostr << llm_config_file.rdbuf();
+            auto llm_config_ = ujson::json::parse(ostr.str());
+            config_.merge(llm_config_);
         } else {
             std::cerr << "Unable to open llm_config file: " << llm_config() << std::endl;
         }
-        mllm_config_ = config_.value("mllm");
+        mllm_config_ = config_.contains("mllm") ? config_["mllm"] : ujson::json();
     }
 
     // < model file config start
@@ -371,6 +163,10 @@ public:
 
     bool all_logits() const {
         return config_.value("all_logits", false);
+    }
+
+    int timeout_ms() const {
+        return config_.value("timeout_ms", -1);
     }
     // generate config end >
 
@@ -459,6 +255,10 @@ public:
 
     bool is_audio() const {
         return config_.value("is_audio", false);
+    }
+
+    std::string audio_type() const {
+        return config_.value("audio_type", "whisper");
     }
 
     bool is_mrope() const {
@@ -558,7 +358,7 @@ public:
 
     // < sampler config start
     std::string sampler_type() const {
-        return config_.value("sampler_type", "greedy");
+        return config_.value("sampler_type", "mixed");
     }
 
     std::vector<std::string> mixed_samplers() const {
@@ -569,19 +369,31 @@ public:
         return config_.value("temperature", 1.0f);
     }
 
+    // backward compatible: top_k > topK
     int topK() const {
+        int val = config_.value("top_k", -1);
+        if (val >= 0) return val;
         return config_.value("topK", 40);
     }
 
+    // backward compatible: top_p > topP
     float topP() const {
+        float val = config_.value("top_p", -1.0f);
+        if (val >= 0.0f) return val;
         return config_.value("topP", 0.9f);
     }
 
+    // backward compatible: min_p > minP
     float minP() const {
+        float val = config_.value("min_p", -1.0f);
+        if (val >= 0.0f) return val;
         return config_.value("minP", 0.1f);
     }
 
+    // backward compatible: tfs_z > tfsZ
     float tfsZ() const {
+        float val = config_.value("tfs_z", -1.0f);
+        if (val >= 0.0f) return val;
         return config_.value("tfsZ", 1.0f);
     }
 
@@ -589,8 +401,15 @@ public:
         return config_.value("typical", 1.0f);
     }
 
-    float penalty() const {
-        return config_.value("penalty", 0.0f);
+    // backward compatible: repetition_penalty > penalty
+    float repetition_penalty() const {
+        float val = config_.value("repetition_penalty", -1.0f);
+        if (val >= 0.0f) return val;
+        return config_.value("penalty", 1.0f);
+    }
+
+    float presence_penalty() const {
+        return config_.value("presence_penalty", 0.0f);
     }
 
     int ngram() const {
@@ -603,6 +422,30 @@ public:
 
     std::string penalty_sampler() const {
         return config_.value("penalty_sampler", "greedy");
+    }
+
+    float frequency_penalty() const {
+        return config_.value("frequency_penalty", 0.0f);
+    }
+
+    int penalty_window() const {
+        return config_.value("penalty_window", 0);
+    }
+
+    std::unordered_map<int, float> logit_bias() const {
+        std::unordered_map<int, float> result;
+        if (config_.contains("logit_bias")) {
+            auto bias = config_["logit_bias"];
+            for (auto it = bias.begin(); it != bias.end(); ++it) {
+                int key = std::atoi(it.key().c_str());
+                result[key] = it.value().get<float>();
+            }
+        }
+        return result;
+    }
+
+    std::vector<int> banned_tokens() const {
+        return config_.value("banned_tokens", std::vector<int>{});
     }
     // sampler config end >
 

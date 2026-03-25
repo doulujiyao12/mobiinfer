@@ -18,6 +18,7 @@ TEST_CLASS="${API_UIAUTOMATOR_TEST_CLASS:-com.alibaba.mnnllm.android.api.ApiSett
 INSTRUMENTATION="com.alibaba.mnnllm.android.test/androidx.test.runner.AndroidJUnitRunner"
 LOG_FILE="$OUT_DIR/instrumentation.log"
 SUMMARY_FILE="$OUT_DIR/summary.txt"
+GESTURE_NOTE="UiAutomator step 09 does not assert history-drawer swipe gesture. For left-swipe verification use mobile-mcp (mobile_swipe_on_screen + screenshot + list_elements)."
 
 export ANDROID_SERIAL="$DEVICE_ID"
 
@@ -25,6 +26,10 @@ pushd "$PROJECT_DIR" >/dev/null
 ./gradlew :app:assembleStandardDebug :app:assembleStandardDebugAndroidTest >/dev/null
 ./gradlew :app:installStandardDebug :app:installStandardDebugAndroidTest >/dev/null
 popd >/dev/null
+
+# Android 13+ may surface the notification runtime permission on first launch.
+# Grant it up front so the UiAutomator flow is not blocked by a system dialog.
+adb -s "$DEVICE_ID" shell pm grant com.alibaba.mnnllm.android android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
 
 set +e
 adb -s "$DEVICE_ID" shell am instrument -w -r -e class "$TEST_CLASS" "$INSTRUMENTATION" >"$LOG_FILE" 2>&1
@@ -45,6 +50,7 @@ fi
   echo "DEVICE_ID=$DEVICE_ID"
   echo "TEST_CLASS=$TEST_CLASS"
   echo "LOG_FILE=$LOG_FILE"
+  echo "GESTURE_NOTE=$GESTURE_NOTE"
 } >"$SUMMARY_FILE"
 
 cat "$SUMMARY_FILE"

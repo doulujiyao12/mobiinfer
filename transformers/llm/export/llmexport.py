@@ -98,6 +98,12 @@ class LlmExporter(torch.nn.Module):
                      self.llm_config['jinja']['bos'] = self.tokenizer.bos_token
                  if self.tokenizer.eos_token:
                      self.llm_config['jinja']['eos'] = self.tokenizer.eos_token
+        # glm_ocr's HF template is too complex for minja parser, use simplified version
+        if self.model_type == 'glm_ocr':
+            self.llm_config['jinja'] = {
+                'chat_template': "[gMASK]<sop>{% for message in messages %}{% if message.role == \"user\" %}<|user|>\n{{ message.content }}{% elif message.role == \"assistant\" %}<|assistant|>\n{{ message.content }}{% elif message.role == \"system\" %}<|system|>\n{{ message.content }}{% endif %}{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}",
+                'eos': '<|endoftext|>'
+            }
 
         # tie word embeddings
         self.args.tie_word_embeddings = not self.args.seperate_embed and self.model.lm.lm.weight.equal(self.model.embed.embed.weight)
@@ -275,9 +281,21 @@ class LlmExporter(torch.nn.Module):
                 "precision": "low",
                 "memory": "low",
                 # "system_prompt": "You are a helpful assistant.",
-                "sampler_type":'penalty',
-                "penalty":1.1
+                "sampler_type": "mixed",
+                "temperature": 0.8,
+                "top_k": 40,
+                "top_p": 0.9,
+                "min_p": 0.05,
+                "tfs_z": 1.0,
+                "typical": 0.95,
+                "repetition_penalty": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "penalty_window": 0,
+                "n_gram": 8,
+                "ngram_factor": 1.0
             }
+            config['tokenizer_file'] = 'tokenizer.mtok'
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
             if hasattr(self, 'talker') and self.talker is not None:
@@ -336,6 +354,7 @@ class LlmExporter(torch.nn.Module):
     def unload_param(self):
         self.unloaded_ops = {}
         self.experts = []
+        self.expert_layer_ids = []
         def build_faker(real, name):
             faker = FakeLinear(real.in_features, real.out_features, real.bias is not None, name)
             self.unloaded_ops[name] = real
@@ -361,6 +380,7 @@ class LlmExporter(torch.nn.Module):
                                 setattr(self.model.blocks[i].mlp.shared_expert, name, build_faker(child, f'/layers.{i}/mlp/shared_expert/{name}/Linear'))
                     if is_moe and isinstance(child, torch.nn.ModuleList): # experts
                         self.experts.append(child)
+                        self.expert_layer_ids.append(i)
                         for j in range(len(child)):
                             for name, cchild in child[j].named_children():
                                 if isinstance(cchild, torch.nn.Linear):

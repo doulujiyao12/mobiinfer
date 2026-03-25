@@ -31,7 +31,9 @@ public:
             return true;
         }
         auto exe = new AttentionBufExecution(bn, mKVCache);
-        exe->mKVCacheManager = mKVCacheManager;
+        if (bn->getMetaPtr() == backend()->getMetaPtr()) {
+            exe->mKVCacheManager = mKVCacheManager;
+        }
         *dst = exe;
         return true;
     }
@@ -79,6 +81,7 @@ private:
 private:
     bool mHasMask = false;
     bool mIsAddMask = false;
+    bool mCausalMaskScalar = false; // scalar mask input means causal mask
     int mBatch, mKvSeqLen, mKvMaxLen;
     int mQseqSplitNum = 1;
     std::shared_ptr<Tensor> mTempK, mTempV;

@@ -5,6 +5,8 @@ package com.alibaba.mnnllm.android.chat
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
@@ -19,6 +21,7 @@ import kotlinx.coroutines.flow.first
 import com.alibaba.mls.api.ApplicationProvider
 import com.alibaba.mnnllm.android.llm.ChatSession
 import com.alibaba.mnnllm.android.R
+import com.alibaba.mnnllm.android.BuildConfig
 import com.alibaba.mnnllm.android.audio.AudioChunksPlayer
 import com.alibaba.mnnllm.android.benchmark.BenchmarkModule
 import com.alibaba.mnnllm.android.modelist.ModelListManager
@@ -52,6 +55,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -100,6 +104,9 @@ class ChatActivity : AppCompatActivity() {
 
     private var benchmarkModule: BenchmarkModule = BenchmarkModule(activity = this)
     private lateinit var voiceModelsChecker: VoiceModelsChecker
+    private var isMockStreamSession: Boolean = false
+    private val mockStreamHandler = Handler(Looper.getMainLooper())
+    private var mockStreamRunnable: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -112,6 +119,7 @@ class ChatActivity : AppCompatActivity() {
         this.modelId = intent.getStringExtra("modelId")
         if (this.modelName.isEmpty() || this.modelId.isNullOrEmpty()) {
             finish()
+            return
         }
         CrashReportContext.setCurrentModel(this.modelId, intent.getStringExtra("chatSessionId"))
         dateFormat = SimpleDateFormat("hh:mm aa", Locale.getDefault())
@@ -123,6 +131,12 @@ class ChatActivity : AppCompatActivity() {
             }
         }
         setupView(this.modelId!!, this.modelName)
+        if (shouldStartMockStream()) {
+            isMockStreamSession = true
+            chatListComponent.setup(modelName, emptyList())
+            startMockStream()
+            return
+        }
         this.setupSession()
         initializeVoiceModelsChecker()
     }
@@ -200,6 +214,129 @@ class ChatActivity : AppCompatActivity() {
         onSessionCreated()
         Log.d(TAG, "current SessionId: $sessionId")
         chatPresenter.load()
+    }
+
+    private fun shouldStartMockStream(): Boolean {
+        if (!BuildConfig.DEBUG) {
+            return false
+        }
+        return intent.getBooleanExtra(EXTRA_MOCK_STREAM_ENABLE, false)
+    }
+
+    private fun startMockStream() {
+        val textLength = intent.getIntExtra(
+            EXTRA_MOCK_STREAM_TEXT_LENGTH,
+            DEFAULT_MOCK_STREAM_TEXT_LENGTH
+        ).coerceAtLeast(1)
+        val intervalMs = intent.getLongExtra(
+            EXTRA_MOCK_STREAM_INTERVAL_MS,
+            DEFAULT_MOCK_STREAM_INTERVAL_MS
+        ).coerceAtLeast(1L)
+        val lineWidth = intent.getIntExtra(
+            EXTRA_MOCK_STREAM_LINE_WIDTH,
+            DEFAULT_MOCK_STREAM_LINE_WIDTH
+        ).coerceAtLeast(1)
+        val detachAtChars = intent.getIntExtra(
+            EXTRA_MOCK_STREAM_DETACH_AT_CHARS,
+            DEFAULT_MOCK_STREAM_DETACH_AT_CHARS
+        )
+        val pauseOnDetach = intent.getBooleanExtra(
+            EXTRA_MOCK_STREAM_PAUSE_ON_DETACH,
+            false
+        )
+        val mockText = resolveMockStreamText(textLength, lineWidth)
+        val userData = createUserMessage("mock long stream")
+        onGenerateStart(userData)
+        val processor = GenerateResultProcessor()
+        processor.generateBegin()
+        mockStreamRunnable?.let(mockStreamHandler::removeCallbacks)
+
+        var nextIndex = 0
+        var didDetachFromBottom = false
+        var mockStreamPaused = false
+        chatListComponent.setOnResumeAutoScrollListener {
+            mockStreamPaused = false
+        }
+        val streamRunnable = object : Runnable {
+            override fun run() {
+                if (isDestroyed) {
+                    return
+                }
+                if (mockStreamPaused) {
+                    mockStreamHandler.postDelayed(this, intervalMs)
+                    return
+                }
+                if (nextIndex >= mockText.length) {
+                    val bench = HashMap<String, Any>().apply {
+                        put("response", processor.getRawResult())
+                        put("prompt_len", 1L)
+                        put("decode_len", mockText.length.toLong())
+                        put("prefill_time", 1L)
+                        put("decode_time", mockText.length.toLong() * intervalMs * 1000L)
+                    }
+                    onGenerateFinished(bench)
+                    mockStreamRunnable = null
+                    return
+                }
+                val chunk = mockText[nextIndex].toString()
+                nextIndex += 1
+                processor.process(chunk)
+                onLlmGenerateProgress(chunk, processor)
+                if (!didDetachFromBottom && detachAtChars > 0 && nextIndex >= detachAtChars) {
+                    didDetachFromBottom = true
+                    if (pauseOnDetach) {
+                        mockStreamPaused = true
+                    }
+                    chatListComponent.detachFromBottomForTest()
+                }
+                mockStreamHandler.postDelayed(this, intervalMs)
+            }
+        }
+        mockStreamRunnable = streamRunnable
+        mockStreamHandler.post(streamRunnable)
+    }
+
+    private fun resolveMockStreamText(textLength: Int, lineWidth: Int): String {
+        val inlineContent = intent.getStringExtra(EXTRA_MOCK_STREAM_CONTENT)
+        if (!inlineContent.isNullOrEmpty()) {
+            return inlineContent
+        }
+
+        val contentFile = intent.getStringExtra(EXTRA_MOCK_STREAM_CONTENT_FILE)
+        if (!contentFile.isNullOrEmpty()) {
+            return try {
+                File(contentFile).readText()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to read mock stream content file: $contentFile", e)
+                buildMockStreamText(textLength, lineWidth)
+            }
+        }
+
+        return buildMockStreamText(textLength, lineWidth)
+    }
+
+    private fun buildMockStreamText(length: Int, lineWidth: Int): String {
+        val base = "mockstreamoutput"
+        val builder = StringBuilder(length + 64)
+        var sourceIndex = 0
+        var currentLineWidth = 0
+        while (builder.length < length) {
+            if (currentLineWidth >= lineWidth) {
+                builder.append("\n\n")
+                currentLineWidth = 0
+                if (builder.length >= length) {
+                    break
+                }
+            }
+            val nextChar = base[sourceIndex]
+            builder.append(nextChar)
+            sourceIndex = (sourceIndex + 1) % base.length
+            currentLineWidth = if (nextChar == '\n') 0 else currentLineWidth + 1
+        }
+        if (builder.length > length) {
+            builder.setLength(length)
+        }
+        return builder.toString()
     }
 
     private fun setupOmni() {
@@ -353,6 +490,15 @@ class ChatActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Called when model load fails (e.g. native init returned null). Shows error and finishes.
+     */
+    fun onModelLoadFailed(errorMessage: String) {
+        Log.e(TAG, "Model load failed: $errorMessage")
+        Toast.makeText(this, getString(R.string.model_load_failed, errorMessage), Toast.LENGTH_LONG).show()
+        finish()
+    }
+
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_chat, menu)
         menu.findItem(R.id.show_performance_metrics)
@@ -498,6 +644,8 @@ class ChatActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        mockStreamRunnable?.let(mockStreamHandler::removeCallbacks)
+        mockStreamRunnable = null
         audioPlayer?.destroy()
         audioPlayer = null
         
@@ -506,7 +654,9 @@ class ChatActivity : AppCompatActivity() {
         wavFileWriter = null
         bufferedAudioFilePath = null
         
-        chatPresenter.destroy()
+        if (::chatPresenter.isInitialized) {
+            chatPresenter.destroy()
+        }
         MainScope().launch {
             ApiServiceManager.stopApiService(ApplicationProvider.get())
         }
@@ -636,6 +786,10 @@ class ChatActivity : AppCompatActivity() {
         
         recentItem.benchmarkInfo = ModelUtils.generateBenchMarkString(benchMarkResult)
         chatListComponent.updateAssistantResponse(recentItem)
+
+        if (isMockStreamSession) {
+            return
+        }
         
         // Always save to database, even for errors, to maintain conversation history
         try {
@@ -877,6 +1031,18 @@ class ChatActivity : AppCompatActivity() {
 
     companion object {
         const val TAG: String = "ChatActivity"
+        const val EXTRA_MOCK_STREAM_ENABLE = "mock_stream_enable"
+        const val EXTRA_MOCK_STREAM_CONTENT = "mock_stream_content"
+        const val EXTRA_MOCK_STREAM_CONTENT_FILE = "mock_stream_content_file"
+        const val EXTRA_MOCK_STREAM_TEXT_LENGTH = "mock_stream_text_length"
+        const val EXTRA_MOCK_STREAM_INTERVAL_MS = "mock_stream_interval_ms"
+        const val EXTRA_MOCK_STREAM_LINE_WIDTH = "mock_stream_line_width"
+        const val EXTRA_MOCK_STREAM_DETACH_AT_CHARS = "mock_stream_detach_at_chars"
+        const val EXTRA_MOCK_STREAM_PAUSE_ON_DETACH = "mock_stream_pause_on_detach"
+        private const val DEFAULT_MOCK_STREAM_TEXT_LENGTH = 2000
+        private const val DEFAULT_MOCK_STREAM_INTERVAL_MS = 30L
+        private const val DEFAULT_MOCK_STREAM_LINE_WIDTH = 24
+        private const val DEFAULT_MOCK_STREAM_DETACH_AT_CHARS = -1
         private var _chatPresenter: ChatPresenter? = null
         fun getChatPresenter(): ChatPresenter? {
             return this._chatPresenter

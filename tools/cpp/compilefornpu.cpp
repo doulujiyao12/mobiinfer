@@ -64,6 +64,7 @@ struct SubModuleIO {
     std::vector<MNN::Express::VARP> inputs;
     std::vector<MNN::Express::VARP> outputs;
     std::vector<std::vector<int>> kvcache;
+    int seqLen = 0;
 };
 static void _computeTensorMask(SubModuleInfo& m, const Net* net) {
     /**Compute All SubModule's inputs and outputs*/
@@ -412,6 +413,7 @@ static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const
     }
     auto attentionNames = _getAttentionName(buffer, bufferSize);
     MNN::ScheduleConfig config;
+    config.numThread = 1;
     std::shared_ptr<MNN::Express::Executor::RuntimeManager> rtmgr(MNN::Express::Executor::RuntimeManager::createRuntimeManager(config));
     rtmgr->setExternalFile((srcpath + ".weight").c_str());
     rtmgr->setMode(MNN::Interpreter::Session_Debug);
@@ -431,6 +433,7 @@ static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const
             auto kvNumHead = key->length(2);
             std::vector<int> kvDims = {kvNumHead, 1, 1, headDim};
             io.kvcache.emplace_back(kvDims);
+            io.seqLen = seq_len;
         }
         return true;
     };
@@ -558,6 +561,12 @@ static std::unique_ptr<MNN::OpT> _compileSubModule(const SubModuleIO& io, SubMod
     attr->list->s = {graphicName};
     extra->attr.emplace_back(std::move(attr));
     if (io.kvcache.size() > 0) {
+        attr.reset(new MNN::AttributeT);
+        attr->key = "seq_len";
+        attr->list.reset(new ListValueT);
+        attr->list->i = {io.seqLen};
+        extra->attr.emplace_back(std::move(attr));
+
         attr.reset(new MNN::AttributeT);
         attr->key = "state";
         attr->tensor.reset(new BlobT);
@@ -900,12 +909,20 @@ int main(int argc, const char* argv[]) {
             for (auto iter = testdir.Begin(); iter != testdir.End(); iter++) {
                 std::string dirname = iter->GetString();
                 auto subinputs = MNN::Express::Variable::load((dirname + "/input.mnn").c_str());
+                if (subinputs.empty()) {
+                    MNN_ERROR("Failed to load test inputs from %s/input.mnn\n", dirname.c_str());
+                    return 1;
+                }
                 inputs.emplace_back(subinputs);
                 inputNames.clear();
                 for (int i=0; i<subinputs.size(); ++i) {
                     inputNames.emplace_back(subinputs[i]->name());
                 }
                 auto outputs = MNN::Express::Variable::load((dirname + "/output.mnn").c_str());
+                if (outputs.empty()) {
+                    MNN_ERROR("Failed to load test outputs from %s/output.mnn\n", dirname.c_str());
+                    return 1;
+                }
                 outputNames.clear();
                 for (int i=0; i<outputs.size(); ++i) {
                     outputNames.emplace_back(outputs[i]->name());
@@ -915,6 +932,10 @@ int main(int argc, const char* argv[]) {
     }
     if (outputNames.empty()) {
         std::shared_ptr<MNN::Express::Module> m(MNN::Express::Module::load(inputNames, outputNames, srcMNN), MNN::Express::Module::destroy);
+        if (nullptr == m.get()) {
+            MNN_ERROR("Failed to load source module from %s\n", srcMNN);
+            return 1;
+        }
         auto minfo = m->getInfo();
         outputNames = minfo->outputNames;
         inputNames = minfo->inputNames;

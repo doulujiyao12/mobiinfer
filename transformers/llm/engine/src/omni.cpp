@@ -21,7 +21,7 @@
 #include "omni.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
-#include "tokenizer.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #ifdef LLM_SUPPORT_HTTP_RESOURCE
@@ -162,7 +162,9 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+    }
 }
 
 bool Omni::load() {
@@ -172,7 +174,7 @@ bool Omni::load() {
         return false;
     }
     ScheduleConfig config;
-    if (mConfig->mllm_config_.empty()) {
+    if (mConfig->mllm_config_.is_null()) {
         mProcessorRuntimeManager = mRuntimeManager;
     } else {
         BackendConfig cpuBackendConfig;
@@ -231,6 +233,7 @@ bool Omni::load() {
             return false;
         }
     }
+    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
 }
 
@@ -489,15 +492,23 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
 
 std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     MNN::Express::ExecutorScope s(mExecutor);
-    // SmolVLM
+    // SmolVLM / LFM2-VL: compute visionLen from global image forward
     const bool dumpLog = shouldDumpX86Log(mConfig);
-    constexpr int visionLen = 64;
+
     bool splitImage = mVisionHeight > mVisionSizeUnit || mVisionWidth > mVisionSizeUnit;
     auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0,
                                        MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                                        mVisionMean, mVisionNorm);
     globalImage = Express::_Unsqueeze(globalImage, {0});
     globalImage = Express::_Convert(globalImage, NCHW);
+    // Forward global image first to determine visionLen dynamically
+    auto globalEmbedding = mVisionModule->forward(globalImage);
+    auto globalDims = globalEmbedding->getInfo()->dim;
+    // globalEmbedding shape: (1, visionLen, 1, hidden) or (visionLen, 1, hidden)
+    int visionLen = (globalDims.size() >= 3) ? globalDims[globalDims.size() - 3] : globalDims[0];
+    if (globalDims.size() >= 4) {
+        visionLen = globalDims[1];
+    }
     std::vector<int> imgIds;
     if (splitImage) {
         mVisionHeight = round(mVisionHeight / (float)mVisionSizeUnit) * mVisionSizeUnit;
@@ -533,7 +544,6 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
             mVisionSizeUnit,
             mVisionSizeUnit
         });
-        patches = _Concat({patches, globalImage}, 0);
         if (dumpLog) {
             std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
             if (ofs) {
@@ -554,6 +564,8 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
             auto embedding = _Squeeze(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {0});
             mVisionEmbeddings.push_back(embedding);
         }
+        // Add global image embedding (already computed)
+        mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
         int endRow = tokenizer_encode("\n")[0];
         for (int h = 0; h < grid_h; h++) {
             for (int w = 0; w < grid_w; w++) {
@@ -576,7 +588,6 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
                 dumpVarpToLog(ofs, "pixel_values", globalImage);
             }
         }
-        auto imageEmbedding = mVisionModule->forward(globalImage);
         if (dumpLog) {
             std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
             if (ofs) {
@@ -584,7 +595,7 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
                 dumpVarpToLog(ofs, "vision_output", imageEmbedding);
             }
         }
-        mVisionEmbeddings.push_back(_Squeeze(imageEmbedding, {0}));
+        mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
     }
     // global image ids
     imgIds.push_back(mVisionStart);
@@ -873,7 +884,17 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
 
     Timer _t;
-    auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
+    VARP input_features;
+    auto audio_type = mConfig->audio_type();
+    if (audio_type == "conformer") {
+        input_features = MNN::AUDIO::conformer_fbank(waveform);
+    } else {
+        input_features = MNN::AUDIO::whisper_fbank(waveform);
+    }
+    if (input_features == nullptr || input_features->getInfo() == nullptr) {
+        MNN_PRINT("Omni audio fbank failed\n");
+        return std::vector<int>(0);
+    }
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
         int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
@@ -903,8 +924,8 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         }
         audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
     } else {
-        // Qwen2-Audio just support audio time <= 30s
-        if (input_features->getInfo()->dim[2] > 3000) {
+        if (audio_type != "conformer" && input_features->getInfo()->dim[2] > 3000) {
+            // Qwen2-Audio just support audio time <= 30s
             input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
         }
         audio_embedding = mAudioModule->forward(input_features);
@@ -1126,6 +1147,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mAudioPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if(txt_embedding == nullptr) {
+                return nullptr;
+            }
             if (shouldDumpX86Log(mConfig)) {
                 std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
                 if (ofs) {
@@ -1149,6 +1173,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mVisionPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if(txt_embedding == nullptr) {
+                return nullptr;
+            }
             if (shouldDumpX86Log(mConfig)) {
                 std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
                 if (ofs) {
@@ -1174,6 +1201,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     mDeepStackEmbeddings.clear();
     if (!cur_txt_ids.empty()) {
         auto txt_embedding = Llm::embedding(cur_txt_ids);
+        if(txt_embedding == nullptr) {
+            return nullptr;
+        }
         if (shouldDumpX86Log(mConfig)) {
             std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
             if (ofs) {
@@ -1261,6 +1291,7 @@ void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const c
     if (mTalker) {
         mTalker->generate_init();
     }
+    CHECK_LLM_RUNNING(mContext);
     generate(input_ids, max_new_tokens);
 }
 
@@ -1347,7 +1378,20 @@ bool Talker::load() {
     if (mBigvgan.get() == nullptr || mPreDit.get() == nullptr || mDit.get() == nullptr) {
         return false;
     }
+    mAsyncToken2Wav = (module_runtime.get() != mRuntimeManager.get());
+    
+    if (mAsyncToken2Wav && doGenerate()) {
+        startAsyncWorker();
+    }
+    
+    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
+}
+
+Talker::~Talker() {
+    if (mWavWorkerRunning) {
+        stopAsyncWorker();
+    }
 }
 
 void Talker::generate_init(std::ostream* os, const char* end_with) {
@@ -1369,6 +1413,15 @@ void Talker::generate_init(std::ostream* os, const char* end_with) {
     dit_start_index = 0;
     dit_left_padding = 0;
     vocoder_left_pad = 0;
+    mWavLastDone.store(false);
+    {
+        std::lock_guard<std::mutex> lock(mWavQueueMutex);
+        std::queue<WavChunk>().swap(mWavQueue);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mMelQueueMutex);
+        std::queue<WavChunk>().swap(mMelQueue);
+    }
 }
 
 Express::VARP Talker::embedding(const std::vector<int>& input_ids) {
@@ -1512,21 +1565,279 @@ VARP Talker::token2wav(const std::vector<int>& codec_tokens) {
     return waveform;
 }
 
+void Talker::startAsyncWorker() {
+    if (mWavWorkerRunning.exchange(true)) return; // already running
+    mDitWorkerThread = std::thread(&Talker::ditWorkerLoop, this);
+    mVocoderWorkerThread = std::thread(&Talker::vocoderWorkerLoop, this);
+}
+
+void Talker::stopAsyncWorker() {
+    mWavWorkerRunning.store(false);
+    mWavQueueCond.notify_all();
+    mMelQueueCond.notify_all();
+    if (mDitWorkerThread.joinable()) {
+        mDitWorkerThread.join();
+    }
+    if (mVocoderWorkerThread.joinable()) {
+        mVocoderWorkerThread.join();
+    }
+}
+
+void Talker::ditWorkerLoop() {
+    BackendConfig backendConfig;
+    auto forwardType = backend_type_convert(mConfig->backend_type(true));
+    int numThread = mConfig->thread_num(true);
+    auto executor = Express::Executor::newExecutor(forwardType, backendConfig, numThread);
+    Express::ExecutorScope scope(executor);
+    mPreDit_async.reset(Module::clone(mPreDit.get()));
+    mDit_async.reset(Module::clone(mDit.get()));
+    mSpk_async = _Clone(mSpk, true);
+    mCond_async = _Clone(mCond, true);
+
+    while (true) {
+        WavChunk chunk;
+        {
+            std::unique_lock<std::mutex> lock(mWavQueueMutex);
+            mWavQueueCond.wait(lock, [this] {
+                return !mWavQueue.empty() || !mWavWorkerRunning;
+            });
+            
+            if (!mWavWorkerRunning && mWavQueue.empty()) {
+                break;
+            }
+            
+            if (mWavQueue.empty()) {
+                continue;
+            }
+            
+            chunk = std::move(mWavQueue.front());
+            mWavQueue.pop();
+        }
+
+        if (!chunk.codec_tokens.empty()) {
+            auto generated_mel = ditForwardAsync((int)chunk.codec_tokens.size(),
+                chunk.codec_tokens.data(), chunk.noise.data());
+            generated_mel = _Slice(generated_mel,
+                _var<int>({0, 0, chunk.mel_slice_start}, {3}),
+                _var<int>({-1, -1, chunk.mel_slice_size}, {3}));
+            auto mel_info = generated_mel->getInfo();
+            chunk.mel_dims = mel_info->dim;
+            chunk.mel.assign(generated_mel->readMap<float>(),
+                             generated_mel->readMap<float>() + mel_info->size);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mMelQueueMutex);
+            mMelQueue.push(std::move(chunk));
+        }
+        mMelQueueCond.notify_one();
+    }
+
+    {
+        WavChunk sentinel;
+        sentinel.is_last = true;
+        std::lock_guard<std::mutex> lock(mMelQueueMutex);
+        mMelQueue.push(std::move(sentinel));
+    }
+    mMelQueueCond.notify_one();
+
+    mPreDit_async.reset();
+    mDit_async.reset();
+    mSpk_async = nullptr;
+    mCond_async = nullptr;
+}
+
+void Talker::vocoderWorkerLoop() {
+    BackendConfig backendConfig;
+    auto forwardType = backend_type_convert(mConfig->backend_type(true));
+    int numThread = mConfig->thread_num(true);
+    auto executor = Express::Executor::newExecutor(forwardType, backendConfig, numThread);
+    Express::ExecutorScope scope(executor);
+    mBigvgan_async.reset(Module::clone(mBigvgan.get()));
+
+    while (true) {
+        WavChunk chunk;
+        {
+            std::unique_lock<std::mutex> lock(mMelQueueMutex);
+            mMelQueueCond.wait(lock, [this] {
+                return !mMelQueue.empty() || !mWavWorkerRunning;
+            });
+            if (!mWavWorkerRunning && mMelQueue.empty()) {
+                break;
+            }
+            if (mMelQueue.empty()) {
+                continue;
+            }
+            chunk = std::move(mMelQueue.front());
+            mMelQueue.pop();
+        }
+
+        processWavChunk(chunk);
+
+        if (chunk.is_last) {
+            mWavLastDone.store(true);
+            mWavQueueCond.notify_all();
+        }
+    }
+
+    mBigvgan_async.reset();
+}
+
+VARP Talker::ditForwardAsync(const int codec_size, const int* codec_tokens, const float* initial_noise) {
+    auto code = _Const(codec_tokens, {1, codec_size}, NCHW, halide_type_of<int>());
+    const int max_duration = codec_size * 2;
+    auto outputs = mPreDit_async->onForward({mCond_async, mSpk_async, code});
+    auto code_embeds = outputs[0];
+    auto rope = outputs[1];
+    auto mask = outputs[2];
+    const int steps = mConfig->dit_steps();
+    const int solver = mConfig->dit_solver();
+    const float step_ratio = 1.0 / (steps - 1);
+    auto forward_dit = [&](float t, Express::VARP x) {
+        return mDit_async->onForward({x, code_embeds, rope, mask, _Const(t, {1}, NCHW)})[0];
+    };
+    auto y0 = _Input({1, max_duration, 80}, NCHW, halide_type_of<float>());
+    if (initial_noise) {
+        for (int i = 0; i < max_duration * 80; ++i) {
+            y0->writeMap<float>()[i] = initial_noise[i];
+        }
+    } else {
+        std::random_device rd;
+        std::mt19937 generator(rd());
+        std::normal_distribution<double> distribution(0.0, 1.0);
+        for (int i = 0; i < max_duration * 80; ++i) {
+            y0->writeMap<float>()[i] = distribution(generator);
+        }
+    }
+    for (int i = 0; i < steps - 1; i++) {
+        float t0 = 1 - std::cos(M_PI / 2 * i * step_ratio);
+        float t1 = 1 - std::cos(M_PI / 2 * (i + 1) * step_ratio);
+        float dt = t1 - t0;
+        auto k1 = mDit_async->onForward({y0, code_embeds, rope, mask, _Const(t0, {1}, NCHW)})[0];
+        if (solver == 1) {
+            y0 = y0 + k1 * _Scalar<float>(dt);
+        } else {
+            constexpr float one_third = 1.0 / 3.0;
+            constexpr float two_third = 2.0 / 3.0;
+            auto kk1 = _Clone(k1, true);
+            auto k2 = forward_dit(t0 + dt * one_third, y0 + k1 * _Scalar<float>(dt * one_third));
+            auto kk2 = _Clone(k2, true);
+            auto k3 = forward_dit(t0 + dt * two_third, y0 + _Scalar<float>(dt) * (k2 - k1 * _Scalar<float>(two_third)));
+            auto kk3 = _Clone(k3, true);
+            auto k4 = forward_dit(t1, y0 + _Scalar<float>(dt) * (k1 - k2 + k3));
+            auto kk4 = _Clone(k4, true);
+            auto dy = (kk1 + _Scalar<float>(3.0) * (kk2 + kk3) + kk4) * _Scalar<float>(dt * 0.125);
+            y0 = y0 + dy;
+        }
+    }
+    return _Permute(y0, {0, 2, 1});
+}
+
+VARP Talker::bigvganForwardAsync(VARP mel) {
+    return mBigvgan_async->forward(mel);
+}
+
+void Talker::processWavChunk(WavChunk& chunk) {
+    if (chunk.mel.empty() || chunk.mel_dims.empty()) {
+        if (chunk.is_last && mWavformCallback) {
+            mWavformCallback(nullptr, 0, true);
+        }
+        return;
+    }
+    MNN::Timer _t;
+    auto generated_mel = _Const(chunk.mel.data(), chunk.mel_dims, NCHW, halide_type_of<float>());
+    mMelBuffer = (mMelBuffer == nullptr) ?
+        generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
+
+    auto generated_waveform = bigvganForwardAsync(mMelBuffer);
+
+    auto ptr = generated_waveform->readMap<float>()
+        + vocoder_left_pad * vocoder_upsample_rate;
+    auto size = generated_waveform->getInfo()->size
+        - (vocoder_left_pad + vocoder_right_pad) * vocoder_upsample_rate;
+    mWaveformBuffer.insert(mWaveformBuffer.end(), ptr, ptr + size);
+    vocoder_left_pad = vocoder_left_context;
+    mMelBuffer = _Slice(mMelBuffer,
+        _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}),
+        _var<int>({-1, -1, -1}, {3}));
+    mContext->audio_us += _t.durationInUs();
+    if (mWavformCallback) {
+        mWavformCallback(ptr, size, chunk.is_last);
+    }
+}
+
+void Talker::trySubmitChunkAsync(bool talker_done) {
+    while (true) {
+        int codec_size = mContext->gen_seq_len - dit_start_index;
+        int chunk_size = dit_left_padding + dit_chunk_size + dit_right_padding;
+        bool last_chunk = talker_done && (codec_size <= chunk_size);
+
+        if (!last_chunk && codec_size < chunk_size) {
+            return;
+        }
+        if (codec_size <= 0) {
+            if (talker_done) {
+                WavChunk wav_chunk;
+                wav_chunk.is_last = true;
+                {
+                    std::lock_guard<std::mutex> lock(mWavQueueMutex);
+                    mWavQueue.push(std::move(wav_chunk));
+                }
+                mWavQueueCond.notify_one();
+            }
+            return;
+        }
+
+        int real_size = last_chunk ? codec_size : chunk_size;
+
+        WavChunk wav_chunk;
+        wav_chunk.codec_tokens.assign(
+            mContext->output_tokens.begin() + dit_start_index,
+            mContext->output_tokens.begin() + dit_start_index + real_size);
+        int noise_start = dit_start_index * 160;
+        wav_chunk.noise.assign(
+            mInitialNoise.begin() + noise_start,
+            mInitialNoise.begin() + noise_start + real_size * 160);
+        wav_chunk.mel_slice_start = dit_left_padding * 2;
+        wav_chunk.mel_slice_size = last_chunk ? -1 : dit_chunk_size * 2;
+        wav_chunk.is_last = last_chunk;
+
+        dit_left_padding = dit_left_context;
+        dit_start_index += (chunk_size - dit_left_padding - dit_right_padding);
+
+        {
+            std::lock_guard<std::mutex> lock(mWavQueueMutex);
+            mWavQueue.push(std::move(wav_chunk));
+        }
+        mWavQueueCond.notify_one();
+
+        if (last_chunk) {
+            return;
+        }
+    }
+}
+
 int Talker::sample(Express::VARP logits, int offset, int size) {
     MNN::Express::ExecutorScope s(mExecutor);
     int token = Llm::sample(logits, offset, size);
-    if (mStreamWithDecode) {
+    if (mAsyncToken2Wav) {
+        if (!mWavWorkerRunning) {
+            startAsyncWorker();
+        }
+        trySubmitChunkAsync(false);
+    } else if (mStreamWithDecode) {
         token2wav();
     }
     return token;
 }
 
 void Talker::generate() {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     if (!doGenerate()) { return; }
+
     mTalkerEmbeds.push_back(mTextEos);
     auto input_embeds = _Concat({mTalkerEmbeds[0], mTextBos + mCodecPad, mTalkerEmbeds[1] + mCodecBos}, 1);
-    // push 2 token ids
     mPositionIds.push_back();
     mPositionIds.push_back();
     mContext->prompt_len = input_embeds->getInfo()->dim[1];
@@ -1537,6 +1848,11 @@ void Talker::generate() {
     mContext->output_tokens.push_back(mContext->current_token);
     mContext->prefill_us += _t.durationInUs();
     _t.reset();
+    
+    if (mAsyncToken2Wav && !mWavWorkerRunning) {
+        startAsyncWorker();
+    }
+    
     for (int i = 1; i < mMaxNewTokens; i++) {
         input_embeds = embedding({mContext->current_token});
         if (i + 1 < mTalkerEmbeds.size()) {
@@ -1546,16 +1862,34 @@ void Talker::generate() {
             input_embeds = input_embeds + mTextPad;
         }
         auto logits = forward(input_embeds);
-        mContext->current_token = sample(logits);
-        mContext->history_tokens.push_back(mContext->current_token);
-        mContext->output_tokens.push_back(mContext->current_token);
+        int token = sample(logits);
+        mContext->current_token = token;
+        mContext->history_tokens.push_back(token);
+        mContext->output_tokens.push_back(token);
 
-        if (mContext->current_token == 8292 || mContext->current_token == 8294) {
+        if (mAsyncToken2Wav) {
+            trySubmitChunkAsync(false);
+        }
+
+        if (token == 8292 || token == 8294) {
             break;
         }
     }
+
     mContext->decode_us += _t.durationInUs();
-    token2wav(true);
+    if (mAsyncToken2Wav) {
+        trySubmitChunkAsync(true);
+        std::unique_lock<std::mutex> lock(mWavQueueMutex);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!mWavLastDone.load()) {
+            if (!mWavQueueCond.wait_until(lock, deadline, [this] { return mWavLastDone.load(); })) {
+                MNN_ERROR("Talker async worker timeout; audio may be incomplete\n");
+                break;
+            }
+        }
+    } else {
+        token2wav(true);
+    }
 }
 
 void Talker::setPostionIds(const MropeInfo& positionIds) {

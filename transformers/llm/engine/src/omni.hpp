@@ -9,6 +9,12 @@
 #define OMNI_hpp
 
 #include "llm/llm.hpp"
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 namespace MNN {
 using namespace Express;
@@ -54,11 +60,21 @@ public:
     std::vector<int> mT, mH, mW;
 };
 
+struct WavChunk {
+    std::vector<int> codec_tokens;
+    std::vector<float> noise;
+    int mel_slice_start = 0;
+    int mel_slice_size = -1;
+    bool is_last = false;
+    std::vector<float> mel;
+    std::vector<int> mel_dims;
+};
+
 class Talker : public Llm {
 public:
     Talker(std::shared_ptr<LlmConfig> config) : Llm(config), mThinker(nullptr) {}
     Talker(std::shared_ptr<LlmConfig> config, Llm* thinker) : Llm(config), mThinker(thinker) {}
-    ~Talker() {}
+    ~Talker();
     virtual bool load() override;
     void setProcessorRuntimeManager(std::shared_ptr<Executor::RuntimeManager> processorRuntimeManager);
     virtual void generate_init(std::ostream* os = nullptr, const char* end_with = nullptr) override;
@@ -95,6 +111,29 @@ private:
         vocoder_right_pad = vocoder_right_context, vocoder_upsample_rate = 240;
     int dit_left_padding = 0, dit_start_index = 0, vocoder_left_pad = 0;
     std::function<bool(const float*, size_t, bool)> mWavformCallback = nullptr;
+    // async token2wav pipeline (true parallelism via cloned modules)
+    void startAsyncWorker();
+    void stopAsyncWorker();
+    void ditWorkerLoop();
+    void vocoderWorkerLoop();
+    void processWavChunk(WavChunk& chunk);
+    void trySubmitChunkAsync(bool talker_done);
+    VARP ditForwardAsync(const int codec_size, const int* codec_tokens, const float* initial_noise);
+    VARP bigvganForwardAsync(VARP mel);
+    std::thread mDitWorkerThread;
+    std::thread mVocoderWorkerThread;
+    std::mutex mWavQueueMutex;
+    std::condition_variable mWavQueueCond;
+    std::queue<WavChunk> mWavQueue;
+    std::mutex mMelQueueMutex;
+    std::condition_variable mMelQueueCond;
+    std::queue<WavChunk> mMelQueue;
+    std::atomic<bool> mWavWorkerRunning{false};
+    std::atomic<bool> mWavLastDone{false};
+    bool mAsyncToken2Wav = false;
+    // cloned modules for worker thread — independent Session/Runtime, shared weights
+    std::shared_ptr<Module> mPreDit_async, mDit_async, mBigvgan_async;
+    VARP mSpk_async, mCond_async;
 };
 
 class Omni : public Llm {

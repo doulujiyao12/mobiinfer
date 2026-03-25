@@ -13,12 +13,12 @@
 #include <unordered_set>
 
 #include <MNN/AutoTime.hpp>
+#include "core/TensorUtils.hpp"
 #include "cpp/ExprDebug.hpp"
 #include "llm/llm.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
-#include "prompt.hpp"
-#include "tokenizer.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #include "omni.hpp"
@@ -86,29 +86,34 @@ std::string Llm::dump_config() {
     return mConfig->config_.dump();
 }
 
+void Llm::setChatTemplate() {
+    if (!mTokenizer || !mConfig->config_.contains("jinja")) return;
+    auto jinja = mConfig->config_["jinja"];
+    if (jinja.contains("chat_template")) {
+        std::string context;
+        if (jinja.contains("context")) {
+            context = jinja["context"].dump();
+        }
+        mTokenizer->set_chat_template(jinja["chat_template"].get<std::string>(), jinja.value("eos", ""), context);
+    }
+}
+
 bool Llm::set_config(const std::string& content) {
-    auto res = mConfig->config_.merge(content.c_str());
-    // update prompt
-    if(mPrompt != nullptr) {
-        mPrompt->setParams(mConfig);
-    } else {
-        mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
-    }
-    mAsync = mConfig->config_.document.HasMember("async") ? mConfig->config_.document["async"].GetBool() : true;
+    mConfig->config_.merge(ujson::json::parse(content));
+    setChatTemplate();
+    mAsync = mConfig->config_.value("async", true);
+    mGenerateParam->timeout_ms = mConfig->timeout_ms();
     mValidBlockSize.clear();
-    mBlockSize = 0;
-    if (mConfig->config_.document.HasMember("chunk")) {
-        mBlockSize = mConfig->config_.document["chunk"].GetInt();
-    }
-    if (mConfig->config_.document.HasMember("chunk_limits")) {
-        auto& size_limit = mConfig->config_.document["chunk_limits"];
+    mBlockSize = mConfig->config_.value("chunk", 0);
+    if (mConfig->config_.contains("chunk_limits")) {
+        auto size_limit = mConfig->config_["chunk_limits"];
         do {
-            if (!size_limit.IsArray()) {
+            if (!size_limit.is_array()) {
                 MNN_ERROR("size_limit must be array, eg: [128, 1]\n");
                 break;
             }
-            for (auto iter = size_limit.GetArray().begin(); iter != size_limit.GetArray().end(); iter++) {
-                mValidBlockSize.emplace_back(iter->GetInt());
+            for (size_t i = 0; i < size_limit.size(); i++) {
+                mValidBlockSize.emplace_back(size_limit[i].get<int>());
             }
             if (mValidBlockSize.size() < 2) {
                 MNN_ERROR("size_limit must be array larger than 1, eg: [128, 1]\n");
@@ -119,7 +124,11 @@ bool Llm::set_config(const std::string& content) {
             mBlockSize = mValidBlockSize[mValidBlockSize.size()-1];
         } while (false);
     }
-    return res;
+    return true;
+}
+
+void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after) {
+    mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
 void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg) {
@@ -234,13 +243,39 @@ void Llm::setSpeculativeConfig() {
     }
 }
 
+static bool checkFile(const std::string& path, const char* name) {
+    if (!MNNFileExist(path.c_str())) {
+        MNN_ERROR("[Error]: %s not found: %s\n", name, path.c_str());
+        return false;
+    }
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        MNN_ERROR("[Error]: Failed to open %s (permission denied?): %s\n", name, path.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool Llm::load() {
+    // check required files before loading
+    std::string tokenizer_path = mConfig->tokenizer_file();
+    std::string model_path = mConfig->llm_model();
+    std::string weight_path = mConfig->llm_weight();
+    if (!checkFile(tokenizer_path, "tokenizer file") ||
+        !checkFile(model_path, "LLM model file") ||
+        !checkFile(weight_path, "LLM weight file")) {
+        return false;
+    }
     MNN::Express::ExecutorScope s(mExecutor);
     Timer _t;
     initRuntime();
     // init module status
     // 1. load vocab
-    mTokenizer.reset(Tokenizer::createTokenizer(mConfig->tokenizer_file()));
+    mTokenizer.reset(Tokenizer::createTokenizer(tokenizer_path));
+    if (mTokenizer == nullptr) {
+        MNN_ERROR("[Error]: Failed to load tokenizer from: %s\n", tokenizer_path.c_str());
+        return false;
+    }
     // 2. load context
     {
         std::ifstream contextFile(mConfig->context_file());
@@ -249,21 +284,19 @@ bool Llm::load() {
             contextStream << contextFile.rdbuf();
             auto contextStr = contextStream.str();
             // check valid json
-            rapidjson::Document contextDoc;
-            contextDoc.Parse(contextStr.c_str());
-            if (!contextDoc.HasParseError()) {
+            auto contextJson = ujson::json::parse(contextStr);
+            if (!contextJson.is_null()) {
                 std::string config_json = R"({
                     "jinja": {
                         "context": )" + contextStr + R"(
                     }
                 })";
-                mConfig->config_.merge(config_json.c_str());
+                mConfig->config_.merge(ujson::json::parse(config_json));
             }
         }
     }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
-    mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
-    printf("%s\n", mPrompt->dump().c_str());
+    setChatTemplate();
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     // 3. load model
     Module::Config module_config;
@@ -278,17 +311,12 @@ bool Llm::load() {
         module_config.base = mBaseModule;
     }
     // load single model
-    std::string model_path = mConfig->llm_model();
-
     std::vector<std::string> inputNames {"input_ids", "attention_mask", "position_ids", "logits_index"};
     std::vector<std::string> outputNames {"logits"};
     if (mConfig->has_talker()) {
         outputNames.emplace_back("talker_embeds");
     }
-    bool needHiddenState = false;
-    if (mConfig->config_.document.HasMember("hidden_states")) {
-        needHiddenState = mConfig->config_.document["hidden_states"].GetBool();
-    }
+    bool needHiddenState = mConfig->config_.value("hidden_states", false);
     if(mConfig->speculative_type() == "mtp") {
         needHiddenState = true;
     }
@@ -296,7 +324,7 @@ bool Llm::load() {
         outputNames.emplace_back("hidden_states");
     }
 
-    mRuntimeManager->setExternalFile(mConfig->llm_weight());
+    mRuntimeManager->setExternalFile(weight_path);
     if (mConfig->has_deepstack()) {
         inputNames.emplace_back("deepstack_embeds");
     }
@@ -343,11 +371,11 @@ bool Llm::load() {
         // attentiion mask var
         {
             // Mask: lower triangular
-            if (mConfig->backend_type() == "cpu") {
-                mAttentionMaskVarVec[i] = _Input({}, NCHW, halide_type_of<float>());
-                auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
-                ptr[0] = 0;
-            } else {
+           if (mConfig->backend_type() == "cpu" && mValidBlockSize.empty()) {
+               mAttentionMaskVarVec[i] = _Input({}, NCHW, halide_type_of<float>());
+               auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
+               ptr[0] = 0;
+           } else {
                 mAttentionMaskVarVec[i] = _Input({1, 1, index, index}, NCHW, halide_type_of<float>());
                 auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
                 for (int i = 0; i < index; i++) {
@@ -355,19 +383,20 @@ bool Llm::load() {
                         ptr[index * i + j] = (j > i) * std::numeric_limits<float>::lowest();
                     }
                 }
-            }
+           }
         }
 
         if (mConfig->is_mrope()) {
             mPositionIdsVarVec[i] = _Input({3, index}, NCHW, halide_type_of<int>());
         } else {
-            mPositionIdsVarVec[i] = _Input({index}, NCHW, halide_type_of<int>());
+            mPositionIdsVarVec[i] = _Input({1, index}, NCHW, halide_type_of<int>());
         }
     }
 
     // MTP model load
     mGenerationStrategy->load(module_config);
     mContext->load_us += _t.durationInUs();
+    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
 }
 
@@ -385,6 +414,7 @@ Llm* Llm::create_lora(const std::string& lora_path) {
 }
 
 void Llm::tuning(TuneType type, std::vector<int> candidates) {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     if (type != OP_ENCODER_NUMBER) {
         MNN_ERROR("tuning type not supported\n");
@@ -401,6 +431,9 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
         // start autoregressive decoding
         std::vector<int> input_ids = {0};
         auto logits = forwardVec(input_ids);
+        if(logits.empty()) {
+            return;
+        }
         int verify_length = mDraftLength + 1;
         decode_seq = verify_length;
     }
@@ -452,7 +485,9 @@ void Llm::setKVCacheInfo(size_t add, size_t remove, int* reserve, int n_reserve)
 }
 
 std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
+    CHECK_LLM_RUNNING_RET(mContext, std::vector<Express::VARP>());
     MNN::Express::ExecutorScope s(mExecutor);
+    
     Express::VARP logitsIndex;
     bool inDecode = mContext->gen_seq_len > 0;
     bool isAllLogists = mConfig->all_logits() ? true : (inDecode ? mInSpec : false);
@@ -491,6 +526,13 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     if (outputs.empty()) {
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return outputs;
+    }
+    // Validate output VARP and readMap
+    for (auto o : outputs) {
+        if(nullptr == o || nullptr == o->readMap<float>()) {
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return outputs;
+        }
     }
     if (!mAsync) {
         ((MNN::Tensor*)(outputs[0]->getTensor()))->wait(Tensor::MAP_TENSOR_READ, true);
@@ -558,6 +600,9 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
 VARP Llm::forward(const std::vector<int>& input_ids, bool is_prefill) {
     MNN::Express::ExecutorScope s(mExecutor);
     auto hidden_states = embedding(input_ids);
+    if(hidden_states == nullptr) {
+        return nullptr;
+    }
     return forward(hidden_states);
 }
 VARP Llm::forward(MNN::Express::VARP input_embeds) {
@@ -580,7 +625,9 @@ std::vector<VARP> Llm::forwardVec(const std::vector<int>& input_ids) {
 }
 
 std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
+    CHECK_LLM_RUNNING_RET(mContext, std::vector<VARP>());
     MNN::Express::ExecutorScope s(mExecutor);
+    
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
     if (0 == mBlockSize) {
         mMeta->add = seq_len;
@@ -710,13 +757,15 @@ void Llm::generate_init(std::ostream* os, const char* end_with) {
     mContext->decode_us   = 0;
     mContext->current_token = -1;
     mContext->sample_us = 0;
-    mContext->status = LlmStatus::RUNNING;
     if (!mConfig->reuse_kv()) {
         mContext->all_seq_len = 0;
         mContext->history_tokens.clear();
         mMeta->remove = mMeta->previous;
     }
     mContext->output_tokens.clear();
+    if(mContext->status != LlmStatus::NOT_LOADED) {
+        mContext->status = LlmStatus::RUNNING;
+    }
 }
 
 size_t Llm::getCurrentHistory() const {
@@ -755,6 +804,7 @@ bool Llm::stoped() {
 }
 
 void Llm::generate(int max_token) {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     if (is_stop(mContext->current_token)) {
         return;
@@ -764,6 +814,7 @@ void Llm::generate(int max_token) {
 }
 
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
+    CHECK_LLM_RUNNING_RET(mContext, std::vector<int>());
     MNN::Express::ExecutorScope s(mExecutor);
     if (max_tokens < 0) {
         max_tokens = mConfig->max_new_tokens();
@@ -801,6 +852,9 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
     if(!passExecute) {
         if (0 == mBlockSize || input_ids.size() <= mBlockSize) {
             auto hidden_states = embedding(input_ids);
+            if(hidden_states == nullptr) {
+                return {};
+            }
             return generate(hidden_states, max_tokens);
         }
         int total_size = (int)input_ids.size();
@@ -813,6 +867,9 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             }
             std::vector<int> chunk_ids(input_ids.begin() + start, input_ids.begin() + end);
             auto input_embeds = embedding(chunk_ids);
+            if(input_embeds == nullptr) {
+                return {};
+            }
             generate(input_embeds, 0);
         }
     } else {
@@ -826,11 +883,11 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
 }
 
 std::string Llm::apply_chat_template(const std::string& user_content) const {
-    return mPrompt->applyTemplate(user_content, true);
+    return mTokenizer->apply_chat_template(user_content, mConfig->system_prompt());
 }
 
 std::string Llm::apply_chat_template(const ChatMessages& chat_prompts) const {
-    return mPrompt->applyTemplate(chat_prompts, true);
+    return mTokenizer->apply_chat_template(chat_prompts, true);
 }
 
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content) {
@@ -843,17 +900,20 @@ std::vector<int> Llm::tokenizer_encode(const MultimodalPrompt& multimodal_input)
 
 void Llm::response(const MultimodalPrompt& multimodal_input,
                    std::ostream* os, const char* end_with, int max_new_tokens) {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     auto multimodal_input_copy = multimodal_input;
     if (mConfig->use_template()) {
-        multimodal_input_copy.prompt_template = mPrompt->applyTemplate(multimodal_input_copy.prompt_template, true);
+        multimodal_input_copy.prompt_template = apply_chat_template(multimodal_input_copy.prompt_template);
     }
     std::vector<int> input_ids = tokenizer_encode(multimodal_input_copy);
     response(input_ids, os, end_with, max_new_tokens);
 }
 
 std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) {
+    CHECK_LLM_RUNNING_RET(mContext, std::vector<int>());
     MNN::Express::ExecutorScope s(mExecutor);
+    
     if (max_tokens < 0) {
         max_tokens = mConfig->max_new_tokens();
     }
@@ -861,7 +921,7 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
     mContext->prompt_len = seqLen;
 
     Timer _t;
-    forwardVec(input_embeds);
+    auto outputs = forwardVec(input_embeds);
     if(mGenerateParam->outputs.size() < 1) {
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return {};
@@ -905,6 +965,11 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
     }
 #endif
 
+    // check timeout after prefill
+    if (mGenerateParam->timeout_ms > 0 && mContext->prefill_us / 1000 >= mGenerateParam->timeout_ms) {
+        mContext->status = LlmStatus::TIMEOUT;
+        return mContext->output_tokens;
+    }
     // call generation function
     if (0 < max_tokens) {
         mGenerateParam->max_new_tokens = max_tokens;
@@ -917,6 +982,7 @@ void Llm::response(const std::vector<int>& input_ids, std::ostream* os, const ch
     MNN::Express::ExecutorScope s(mExecutor);
     if (!end_with) { end_with = "\n"; }
     generate_init(os, end_with);
+    CHECK_LLM_RUNNING(mContext);
     generate(input_ids, max_new_tokens);
 }
 
@@ -924,28 +990,32 @@ void Llm::response(MNN::Express::VARP input_embeds, std::ostream* os, const char
     MNN::Express::ExecutorScope s(mExecutor);
     if (!end_with) { end_with = "\n"; }
     generate_init(os, end_with);
+    CHECK_LLM_RUNNING(mContext);
     generate(input_embeds, max_new_tokens);
 }
 
 void Llm::response(const std::string& user_content, std::ostream* os, const char* end_with, int max_new_tokens) {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     auto prompt = user_content;
     if (mConfig->use_template()) {
-        prompt = mPrompt->applyTemplate(user_content, true);
+        prompt = apply_chat_template(user_content);
         if (prompt.empty()) {
             prompt = user_content;
         }
     }
+    std::cout << "prompt: " << prompt << std::endl;
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
 
 void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const char* end_with, int max_new_tokens) {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     if (chat_prompts.empty()) {
         return;
     }
-    auto prompt = mPrompt->applyTemplate(chat_prompts);
+    auto prompt = apply_chat_template(chat_prompts);
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
@@ -957,6 +1027,7 @@ Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
     mMeta.reset(new KVMeta);
     mMeta->layer_nums = mConfig->layer_nums();
     mGenerateParam.reset(new GenerationParams);
+    mGenerateParam->timeout_ms = mConfig->timeout_ms();
 }
 
 Llm::~Llm() {
@@ -1097,11 +1168,11 @@ VARP Llm::gen_attention_mask(int seq_len) {
         }
 
         // Mask: lower triangular
-        if (mConfig->backend_type() == "cpu") { // Now only cpu supports using lower triangular to opt the attention performance
-            attentionMask = _Input({}, NCHW, halide_type_of<float>());
-            auto ptr = attentionMask->writeMap<float>();
-            ptr[0] = 0;
-        } else {
+       if (mConfig->backend_type() == "cpu" && mValidBlockSize.empty()) { // Now only cpu supports using lower triangular to opt the attention performance
+           attentionMask = _Input({}, NCHW, halide_type_of<float>());
+           auto ptr = attentionMask->writeMap<float>();
+           ptr[0] = 0;
+       } else {
             attentionMask = _Input({1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<float>());
             auto ptr = attentionMask->writeMap<float>();
             for (int i = 0; i < seq_len; i++) {
@@ -1109,7 +1180,7 @@ VARP Llm::gen_attention_mask(int seq_len) {
                     ptr[kv_seq_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
                 }
             }
-        }
+       }
         return attentionMask;
     } else {
         if (needNewVar(attentionMask, 2, seq_len, kv_seq_len)) {
@@ -1205,9 +1276,7 @@ VARP Llm::gen_position_ids(int seq_len) {
 }
 
 bool Llm::is_stop(int token_id) {
-    if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
-        return true;
-    }
+    CHECK_LLM_RUNNING_RET(mContext, true);
     bool stop = mTokenizer->is_stop(token_id);
     if (stop) {
         mContext->status = LlmStatus::NORMAL_FINISHED;

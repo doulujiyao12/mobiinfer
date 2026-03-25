@@ -8,8 +8,12 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.widget.FrameLayout
+import androidx.lifecycle.lifecycleScope
 import com.alibaba.mnnllm.android.utils.BaseBottomSheetDialogFragment
 import com.google.android.material.bottomsheet.BottomSheetBehavior
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Base class for model settings bottom sheet fragments.
@@ -56,9 +60,13 @@ abstract class BaseSettingsBottomSheetFragment : BaseBottomSheetDialogFragment()
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        loadSettings()
-        setupUI()
-        setupActionButtons()
+        // Load config off main thread to avoid ANR (file I/O)
+        lifecycleScope.launch {
+            loadSettingsAsync()
+            setupUI()
+            refreshUIFromConfig()
+            setupActionButtons()
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -68,7 +76,27 @@ abstract class BaseSettingsBottomSheetFragment : BaseBottomSheetDialogFragment()
     }
 
     /**
-     * Load settings from config files
+     * Load settings from config files (runs on IO dispatcher, then updates on Main)
+     */
+    private suspend fun loadSettingsAsync() {
+        val config = withContext(Dispatchers.IO) {
+            val defaultConfigFile = resolveConfigFilePath(_modelId, _configPath, ModelConfig::getDefaultConfigFile)
+            if (defaultConfigFile.isNullOrBlank()) {
+                Log.w(TAG, "Missing config path for modelId=$_modelId, fallback to default config")
+                ModelConfig.defaultConfig.deepCopy()
+            } else {
+                ModelConfig.loadMergedConfig(
+                    defaultConfigFile,
+                    ModelConfig.getExtraConfigFile(_modelId)
+                ) ?: ModelConfig.defaultConfig.deepCopy()
+            }
+        }
+        loadedConfig = config
+        currentConfig = loadedConfig.deepCopy()
+    }
+
+    /**
+     * Load settings from config files (synchronous, for internal use from coroutine)
      */
     protected open fun loadSettings() {
         val defaultConfigFile = resolveConfigFilePath(_modelId, _configPath, ModelConfig::getDefaultConfigFile)
@@ -90,6 +118,12 @@ abstract class BaseSettingsBottomSheetFragment : BaseBottomSheetDialogFragment()
     protected abstract fun setupUI()
 
     /**
+     * Refresh UI from currentConfig after load. Override to populate EditTexts etc.
+     * Called after loadSettingsAsync and setupUI so saved values (e.g. system prompt) are displayed.
+     */
+    protected open fun refreshUIFromConfig() {}
+
+    /**
      * Setup action buttons (Cancel, Save, Reset)
      */
     protected abstract fun setupActionButtons()
@@ -100,11 +134,23 @@ abstract class BaseSettingsBottomSheetFragment : BaseBottomSheetDialogFragment()
     protected abstract fun saveSettings()
 
     /**
-     * Reset settings to defaults
+     * Reset settings to defaults. Deletes custom_config.json so base config.json is used,
+     * then reloads. Ensures default system prompt and other defaults are restored.
      */
     protected open fun resetSettingsToDefaults() {
-        loadSettings()
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                ModelConfig.deleteExtraConfig(_modelId)
+            }
+            loadSettingsAsync()
+            onAfterSettingsReset()
+        }
     }
+
+    /**
+     * Called after settings are reset. Override in subclasses to update UI.
+     */
+    protected open fun onAfterSettingsReset() {}
 
     fun setModelId(modelId: String) {
         this._modelId = modelId

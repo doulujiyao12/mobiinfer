@@ -10,7 +10,11 @@ import shutil
 def makeIO(args):
     exe = os.path.join(os.getcwd(), args.mnn_path, "generateLlmIO")
     output = os.path.join(args.cache_path, 'testdir')
-    print(os.popen(exe + " " + args.model + " " + output + ' %d' %args.chunk_size).read())
+    process = subprocess.Popen(exe + " " + args.model + " " + output + ' %d' %args.chunk_size, bufsize=1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=True)
+    for line in process.stdout:
+        print(line, end='')
+    process.wait()
+    return process.returncode
 
 def seperate(args):
     exe = os.path.join(os.getcwd(), args.mnn_path, "compilefornpu")
@@ -22,6 +26,7 @@ def seperate(args):
         ],
         "testdir":[
         ],
+        "KVCACHE_SIZE_LIMIT":args.max_history_token,
         "cache":"qnn"
     }
     config['testdir'].append(os.path.join("testdir", '1'))
@@ -35,6 +40,7 @@ def seperate(args):
         print(line, end='')
 
     process.wait()
+    return process.returncode
 
 def compile_qnn(args):
     exe = os.path.join(os.getcwd(), args.mnn_path, "..", "source", "backend", "qnn", "npu_convert.py")
@@ -43,6 +49,7 @@ def compile_qnn(args):
     for line in process.stdout:
         print(line, end='')
     process.wait()
+    return process.returncode
 
 def output_qnn(args):
     if os.path.exists(os.path.join(args.model, 'qnn')):
@@ -69,19 +76,25 @@ def convert(args):
     os.makedirs(cache, exist_ok=True)
     sta = time.time()
     print("Step1: Make IO")
-    makeIO(args)
+    code = makeIO(args)
     end = time.time()
     print("Cost: ", end - sta, ' s')
+    if code != 0:
+        raise RuntimeError(f"Step1 failed with exit code {code}")
     sta = end
     print("Step2: Seperate Model")
-    seperate(args)
+    code = seperate(args)
     end = time.time()
     print("Cost: ", end - sta, ' s')
+    if code != 0:
+        raise RuntimeError(f"Step2 failed with exit code {code}")
     sta = end
     print("Step3: Compile to QNN")
-    compile_qnn(args)
+    code = compile_qnn(args)
     end = time.time()
     print("Cost: ", end - sta, ' s')
+    if code != 0:
+        raise RuntimeError(f"Step3 failed with exit code {code}")
     print("Step4: Move result file to ", args.model)
     output_qnn(args)
 
@@ -107,6 +120,9 @@ def main():
                         )
     parser.add_argument('--chunk_size', type=int, default=128,
                         help='chunk_size for npu'
+                        )
+    parser.add_argument('--max_history_token', type=int, default=0,
+                        help='max history token, default is 0, which mean no limit for history token number'
                         )
     args = parser.parse_args()
     convert(args)

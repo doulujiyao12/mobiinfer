@@ -38,8 +38,8 @@ static PyObject* PyMNNLLM_str(PyObject *self) {
 }
 
 static PyObject* PyMNNLLM_load(LLM *self, PyObject *args) {
-    self->llm->load();
-    Py_RETURN_NONE;
+    bool res = self->llm->load();
+    return toPyObj(res);
 }
 
 static PyObject* PyMNNLLM_forward(LLM *self, PyObject *args) {
@@ -155,10 +155,7 @@ MNN::Transformer::ChatMessages parse_chat_messages(PyObject* messages_obj) {
                 PyObject* role_obj = PyDict_GetItemString(message_obj, "role");
                 PyObject* content_obj = PyDict_GetItemString(message_obj, "content");
                 if (role_obj && content_obj) {
-                    MNN::Transformer::ChatMessage chat_message;
-                    chat_message.first = object2String(role_obj);
-                    chat_message.second = object2String(content_obj);
-                    chat_messages.push_back(chat_message);
+                    chat_messages.push_back({object2String(role_obj), object2String(content_obj)});
                 }
             }
         }

@@ -35,6 +35,10 @@
 
 
 # 开发 
++ 准备环境：
+  + Android Studio
+  + NDK（与 `app/build.gradle` 保持一致，当前为 `27.2.12479018`）
+  + `export ANDROID_NDK=${YOUR_NDK_ROOT}`
 + 克隆代码库：
   ```shell
     git clone https://github.com/alibaba/MNN.git
@@ -43,6 +47,7 @@
   ```shell
   cd project/android
   mkdir build_64
+  cd build_64
   ../build_64.sh "-DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_ARM82=true -DMNN_USE_LOGCAT=true -DMNN_OPENCL=true -DLLM_SUPPORT_VISION=true -DMNN_BUILD_OPENCV=true -DMNN_IMGCODECS=true -DLLM_SUPPORT_AUDIO=true -DMNN_BUILD_AUDIO=true -DMNN_BUILD_DIFFUSION=ON -DMNN_SEP_BUILD=OFF -DCMAKE_INSTALL_PREFIX=."
   make install
   ```
@@ -52,6 +57,26 @@
   ./installDebug.sh
   ```
 # Releases
+
+## Version 0.8.2.1
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/apks/mnn_chat_0_8_2_1.apk)
++ 问题修复：
+  + 修复 Android 聊天在预编译 runtime 下可能只输出单个 token，或第二轮无法继续生成的问题。
+  + 加强 dumpapp 与 smoke 对终止回调、单 token 回归和思考模式差异判定的覆盖。
+
+## Version 0.8.2
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/apks/mnn_chat_0_8_2.apk)
++ 更新亮点：
+  + 支持在语音聊天中实时使用视觉输入。
+  + 恢复聊天页面返回后的自动滚动。
++ 问题修复：
+  + 修复模型设置的配置路径与重置行为。
+  + 提升 LaTeX 与 Markdown 表格流式渲染的回归覆盖。
+
+## Version 0.8.1.3
++ 点击这里 [下载](https://meta.alicdn.com/data/mnn/apks/mnn_chat_0_8_1_3.apk)
++ 问题修复：
+  + 提升 Google Play 发版的整体稳定性。
 
 ## Version 0.8.1.2
 + 点击这里 [下载](https://meta.alicdn.com/data/mnn/apks/mnn_chat_0_8_1_2.apk)
