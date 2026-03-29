@@ -588,13 +588,13 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
                 dumpVarpToLog(ofs, "pixel_values", globalImage);
             }
         }
-        if (dumpLog) {
-            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
-            if (ofs) {
-                ofs << "\n[vision] smolvlmVisionProcess output(global)\n";
-                dumpVarpToLog(ofs, "vision_output", imageEmbedding);
-            }
-        }
+        // if (dumpLog) {
+        //     std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        //     if (ofs) {
+        //         ofs << "\n[vision] smolvlmVisionProcess output(global)\n";
+        //         dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        //     }
+        // }
         mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
     }
     // global image ids

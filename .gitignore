@@ -417,6 +417,7 @@ transformers/llm/export/logits_comparison.png
 transformers/llm/export/model-2B
 
 transformers/llm/export/model_npu
+session-ses_2dba.md
 
 # iOS
 apps/iOS/MNNLLMChat/Chat/
