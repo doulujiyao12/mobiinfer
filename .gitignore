@@ -417,8 +417,10 @@ transformers/llm/export/logits_comparison.png
 transformers/llm/export/model-2B
 
 transformers/llm/export/model_npu
-session-ses_2dba.md
-
+pipelinemodule.md
+dequant_gemm.md
+w4a8_degemm.md
+yuque
 # iOS
 apps/iOS/MNNLLMChat/Chat/
 apps/iOS/MNNLLMChat/swift-transformers/
