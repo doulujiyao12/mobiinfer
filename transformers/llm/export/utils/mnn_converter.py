@@ -224,6 +224,39 @@ class MNNConverter:
         GPTQ(self.args.gptq_path).apply(mnn_json, self.mnn_weight_path)
         return self.mnn_weight_path
 
+    @spinner_run(f'apply visual gptq to ')
+    def apply_visual_gptq(self, mnn_json, visual_gptq_path, quant_block=128):
+        from .gptq import VisualGPTQ
+        VisualGPTQ(visual_gptq_path).apply(mnn_json, self.mnn_weight_path, quant_block)
+        return self.mnn_weight_path
+
+    def export_visual_with_gptq(self, onnx_path, visual_gptq_path,
+                                 quant_block=128,
+                                 transformer_fuse=True, group_conv_native=False,
+                                 weight_sym=None):
+        """Visual model GPTQ export: onnx2mnn(fp16) -> mnn2json -> apply visual gptq -> json2mnn
+
+        Uses fp16 for initial export so merger/deepstack keep float weights.
+        Then VisualGPTQ.apply rewrites blocks Convolution to int8 with GPTQ weights,
+        rebuilding the weight file and updating JSON external offsets + quanParameter.
+        """
+        self.onnx_model_path = onnx_path
+        self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
+        self.mnn_model_path = os.path.join(self.args.dst_path, self.mnn_name)
+        self.mnn_weight_path = f'{self.mnn_model_path}.weight'
+        if weight_sym is None:
+            weight_sym = self.args.sym
+        # Step 1: always export as fp16 first (preserves merger/deepstack as float)
+        self.onnx2mnn(self.onnx_model_path, self.mnn_model_path,
+                      ['--fp16'], transformer_fuse=transformer_fuse,
+                      group_conv_native=group_conv_native,
+                      weight_sym=weight_sym)
+        # Step 2: mnn2json -> apply GPTQ (rewrites blocks to int8, keeps rest fp16) -> json2mnn
+        mnn_json = f'{self.mnn_model_path}.json'
+        self.mnn2json(self.mnn_model_path, mnn_json)
+        self.apply_visual_gptq(mnn_json, visual_gptq_path, quant_block)
+        self.json2mnn(mnn_json, self.mnn_model_path)
+
     @spinner_run(f'export split lora to ')
     def export_lora(self, mnn_json):
         lora_model = os.path.join(self.args.dst_path, 'lora.mnn')

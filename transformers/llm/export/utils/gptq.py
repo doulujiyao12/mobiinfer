@@ -1,5 +1,6 @@
 import glob
 import json
+import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -169,3 +170,342 @@ class GPTQ:
             external_weight.write(scale_bytes)
             # print('Done!')
         external_weight.close()
+
+
+class VisualMNNWeight:
+    """Represents a visual model Convolution op in the MNN graph with a known semantic role."""
+    def __init__(self, name, external, weight_elements, layer_id, op_type):
+        self.name = name
+        self.external = external
+        # Determine quant bits from weight size ratio
+        self.quant_bits = 4
+        if external[1] > 0 and round(weight_elements / external[1]) == 2:
+            self.quant_bits = 4
+            self.a_min = -8
+        else:
+            self.quant_bits = 8
+            self.a_min = -128
+        self.layer_id = str(layer_id)
+        self.op_type = op_type  # e.g. "attn.q", "attn.k", "attn.v", "attn.proj", "mlp.fc1", "mlp.fc2"
+
+    def __repr__(self) -> str:
+        return f'VisualMNNWeight({self.layer_id}.{self.op_type}, {self.name})'
+
+    def key(self):
+        return f'{self.layer_id}.{self.op_type}'
+
+    def offset(self): return self.external[0]
+    def weight_size(self): return self.external[1]
+    def scale_size(self): return self.external[2]
+
+
+class VisualGPTQ(GPTQ):
+    """Handles GPTQ weight replacement for visual (ViT) models.
+
+    Visual model MNN Convolution op names (from onnx2mnn with transformerFuse):
+      - q/k/v:  /Add_{N}_output_0__matmul_converted  (3 per block, in order)
+      - o_proj:  /proj_{idx}/Add_output_0__matmul_converted  (idx omitted for block 0)
+      - fc1:     /mlp/linear_fc1_{idx}/Add_output_0__matmul_converted
+      - fc2:     /mlp/linear_fc2_{idx}/Add_output_0__matmul_converted
+      - merger, deepstack_merger, patch_embed: non-block ops
+
+    GPTQ safetensor keys (typical Qwen3VL visual):
+      - visual.blocks.{i}.attn.qkv.qweight/scales   (fused qkv)
+      - visual.blocks.{i}.attn.proj.qweight/scales
+      - visual.blocks.{i}.mlp.fc1.qweight/scales
+      - visual.blocks.{i}.mlp.fc2.qweight/scales
+    """
+
+    def prefix(self, name):
+        """Parse visual GPTQ safetensor key into (dict_key, suffix).
+
+        Examples:
+          visual.blocks.0.attn.qkv.qweight  -> "0.attn.qkv", "qweight"
+          model.visual.blocks.0.mlp.fc1.scales -> "0.mlp.fc1", "scales"
+        """
+        splits = name.split('.')
+        suffix = splits[-1]
+        if suffix not in ['qweight', 'scales']:
+            return None, None
+        try:
+            blocks_idx = None
+            for i, part in enumerate(splits):
+                if part == 'blocks':
+                    blocks_idx = i
+                    break
+            if blocks_idx is None or blocks_idx + 2 >= len(splits):
+                return None, None
+            layer_idx = splits[blocks_idx + 1]
+            module_parts = splits[blocks_idx + 2:-1]  # e.g. ["attn", "qkv"]
+            prefix = f"{layer_idx}.{'.'.join(module_parts)}"
+            return prefix, suffix
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def classify_visual_conv_ops(mnn_graph):
+        """Classify visual Convolution ops into semantic roles by analyzing naming patterns.
+
+        Returns a list of VisualMNNWeight with correct layer_id and op_type.
+        Uses the naming convention from mnnconvert's transformerFuse output:
+          - /proj/ or /proj_{n}/  -> o_proj for block n (0-indexed, block 0 has no suffix)
+          - /mlp/linear_fc1/ or /mlp/linear_fc1_{n}/  -> fc1 for block n
+          - /mlp/linear_fc2/ or /mlp/linear_fc2_{n}/  -> fc2 for block n
+          - /Add_{N}_output_0__matmul_converted -> q/k/v (3 consecutive per block)
+          - /patch_embed/, /merger/, /deepstack_merger_list -> skipped
+        """
+        import re
+        results = []
+        # Collect all Add_N matmul ops in order of N
+        add_ops = []  # list of (N, op)
+        # Collect proj/fc ops
+        proj_ops = {}  # block_idx -> op
+        fc1_ops = {}   # block_idx -> op
+        fc2_ops = {}   # block_idx -> op
+
+        for op in mnn_graph['oplists']:
+            if op['type'] != 'Convolution':
+                continue
+            name = op['name']
+            # Skip non-block ops
+            if '/patch_embed/' in name or '/merger/' in name or '/deepstack_merger' in name:
+                continue
+
+            # Match /proj/ or /proj_{n}/
+            m = re.match(r'^/proj(?:_(\d+))?/', name)
+            if m:
+                idx = int(m.group(1)) if m.group(1) else 0
+                proj_ops[idx] = op
+                continue
+
+            # Match /mlp/linear_fc1/ or /mlp/linear_fc1_{n}/
+            m = re.match(r'^/mlp/linear_fc1(?:_(\d+))?/', name)
+            if m:
+                idx = int(m.group(1)) if m.group(1) else 0
+                fc1_ops[idx] = op
+                continue
+
+            # Match /mlp/linear_fc2/ or /mlp/linear_fc2_{n}/
+            m = re.match(r'^/mlp/linear_fc2(?:_(\d+))?/', name)
+            if m:
+                idx = int(m.group(1)) if m.group(1) else 0
+                fc2_ops[idx] = op
+                continue
+
+            # Match /Add_{N}_output_0__matmul_converted
+            m = re.match(r'^/Add_(\d+)_output_0__matmul_converted$', name)
+            if m:
+                add_n = int(m.group(1))
+                add_ops.append((add_n, op))
+                continue
+
+        # Sort Add ops by N value
+        add_ops.sort(key=lambda x: x[0])
+
+        # Group Add ops into blocks of 3 (q, k, v)
+        # Each block has exactly 3 Add matmul ops for q, k, v
+        for group_idx in range(len(add_ops) // 3):
+            block_idx = group_idx
+            for qkv_offset, qkv_name in enumerate(['attn.q', 'attn.k', 'attn.v']):
+                _, op = add_ops[group_idx * 3 + qkv_offset]
+                external = op['main']['external']
+                ic = op['main']['common']['inputCount']
+                oc = op['main']['common']['outputCount']
+                results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, qkv_name))
+
+        # Add proj ops
+        for block_idx, op in sorted(proj_ops.items()):
+            external = op['main']['external']
+            ic = op['main']['common']['inputCount']
+            oc = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'attn.proj'))
+
+        # Add fc1 ops (key must match GPTQ safetensor: mlp.linear_fc1)
+        for block_idx, op in sorted(fc1_ops.items()):
+            external = op['main']['external']
+            ic = op['main']['common']['inputCount']
+            oc = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'mlp.linear_fc1'))
+
+        # Add fc2 ops (key must match GPTQ safetensor: mlp.linear_fc2)
+        for block_idx, op in sorted(fc2_ops.items()):
+            external = op['main']['external']
+            ic = op['main']['common']['inputCount']
+            oc = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'mlp.linear_fc2'))
+
+        return results
+
+    @staticmethod
+    def _build_int8_weight_data(gptq_weight, quant_bits=8):
+        """Build int8 weight bytes + scale bytes from a GPTQWeight.
+
+        Returns (weight_bytes, scale_bytes, header_bytes) ready to write.
+        Also returns (oc, ic) dimensions for quanParameter.
+        """
+        weight = gptq_weight.qweight
+        scale = gptq_weight.scales.float().transpose(1, 0)  # (oc, num_groups)
+        weight = GPTQ.weight_reorder(weight, quant_bits)     # (oc, ic) uint8
+        oc, ic = weight.shape
+
+        # Build header (same as MNNConverter.write_header)
+        shape_dtype = np.int16
+        if oc > 65535 or ic > 65535:
+            shape_dtype = np.int32
+        dim_bytes = b'\x02'
+        shape_bytes = np.array([oc, ic]).astype(shape_dtype).tobytes()
+        offset = 1 << (quant_bits - 1)  # 128 for 8-bit
+        weight_map = [i for i in range(-offset, offset)]
+        if len(weight_map) == 256:
+            weight_map.insert(0, 0)
+        else:
+            weight_map.insert(0, len(weight_map))
+        map_bytes = np.array(weight_map, dtype=np.int8).tobytes()
+        header_bytes = dim_bytes + shape_bytes + map_bytes
+
+        weight_bytes = weight.numpy().tobytes()
+        # asymmetric: prepend zeros to scale -> (oc, num_groups, 2)
+        zeros = torch.zeros_like(scale)
+        scale_with_zeros = torch.stack([zeros, scale], dim=-1)
+        scale_bytes = scale_with_zeros.numpy().tobytes()
+
+        return header_bytes, weight_bytes, scale_bytes, oc, ic, shape_dtype == np.int32
+
+    def apply(self, graph_path, weight_path, quant_block=128):
+        """Replace visual model block weights with GPTQ int8, keep merger/deepstack as fp16.
+
+        Rebuilds the entire weight file: reads all ops' external data from the original
+        fp16 weight file, then writes a new weight file where block Convolutions are
+        converted to int8+scale format and non-block ops are copied as-is.
+        Also updates the JSON graph's quanParameter and external fields.
+        """
+        mnn_graph = json.load(open(graph_path, 'rt'))
+        block_weights = self.classify_visual_conv_ops(mnn_graph)
+
+        # Build a lookup: op_name -> (VisualMNNWeight, gptq_data)
+        block_gptq_map = {}
+        for vw in block_weights:
+            gptq_w = self.get(vw.key())
+            if gptq_w is not None:
+                block_gptq_map[vw.name] = (vw, gptq_w)
+                continue
+            # Try fused qkv
+            if vw.op_type in ('attn.q', 'attn.k', 'attn.v'):
+                qkv_key = f'{vw.layer_id}.attn.qkv'
+                gptq_qkv = self.get(qkv_key)
+                if gptq_qkv is not None:
+                    qkv_map = {'attn.q': 0, 'attn.k': 1, 'attn.v': 2}
+                    part_idx = qkv_map[vw.op_type]
+                    oc_total = gptq_qkv.qweight.shape[-1]
+                    oc_part = oc_total // 3
+                    part_gptq = GPTQWeight(vw.key())
+                    part_gptq.qweight = gptq_qkv.qweight[:, part_idx * oc_part : (part_idx + 1) * oc_part].contiguous()
+                    part_gptq.scales = gptq_qkv.scales[:, part_idx * oc_part : (part_idx + 1) * oc_part].contiguous()
+                    block_gptq_map[vw.name] = (vw, part_gptq)
+
+        # Read original fp16 weight file
+        with open(weight_path, 'rb') as f:
+            orig_weight_data = f.read()
+
+        # Rebuild weight file + update JSON
+        new_weight_offset = 0
+        new_weight_file = open(weight_path, 'wb')
+        replaced_count = 0
+
+        for op in mnn_graph['oplists']:
+            if op['type'] != 'Convolution':
+                continue
+            if 'external' not in op['main']:
+                continue
+
+            name = op['name']
+            external = op['main']['external']
+            old_offset = external[0]
+            old_weight_size = external[1]
+            old_scale_size = external[2]
+            old_bias_size = external[3]
+
+            ic = op['main']['common']['inputCount']
+            oc = op['main']['common']['outputCount']
+
+            if name in block_gptq_map:
+                # This is a block Convolution -> write int8 GPTQ weight
+                vw, gptq_w = block_gptq_map[name]
+                header_bytes, weight_bytes, scale_bytes, _, _, shape_int32 = \
+                    self._build_int8_weight_data(gptq_w, quant_bits=8)
+
+                new_weight_len = len(header_bytes) + len(weight_bytes)
+                new_scale_len = len(scale_bytes)
+
+                # Write header + weight + scale
+                new_weight_file.write(header_bytes)
+                new_weight_file.write(weight_bytes)
+                new_weight_file.write(scale_bytes)
+
+                # Write bias (copy from original)
+                if old_bias_size > 0:
+                    bias_offset = old_offset + old_weight_size + old_scale_size
+                    new_weight_file.write(orig_weight_data[bias_offset : bias_offset + old_bias_size])
+
+                # Update external
+                external[0] = new_weight_offset
+                external[1] = new_weight_len
+                external[2] = new_scale_len
+                # external[3] (bias_size) unchanged
+
+                # Update quanParameter: fp16(type=3) -> int8 quantized(type=1)
+                block_size = quant_block if quant_block > 0 else ic
+                num_groups = ic // block_size
+                op['main']['quanParameter'] = {
+                    'quantScale': 1.0, 'scaleIn': 0.0, 'scaleOut': 0.0,
+                    'useInt32': False, 'has_scaleInt': False, 'shapeInt32': shape_int32,
+                    'type': 1, 'aMaxOrBits': 8, 'aMin': 1,
+                    'readType': oc * num_groups, 'weightSize': 0
+                }
+
+                new_weight_offset += new_weight_len + new_scale_len + old_bias_size
+                replaced_count += 1
+            else:
+                # Non-block Convolution (merger/deepstack/patch_embed) -> copy fp16 as-is
+                total_old_size = old_weight_size + old_scale_size + old_bias_size
+                new_weight_file.write(orig_weight_data[old_offset : old_offset + total_old_size])
+
+                # Update external offset only
+                external[0] = new_weight_offset
+                # weight_size, scale_size, bias_size unchanged
+
+                new_weight_offset += total_old_size
+
+        new_weight_file.close()
+
+        # Also copy external data for non-Convolution ops (LayerNorm, Const, etc.)
+        # These need a second pass because they also have external data
+        # First collect all non-Conv ops with external data
+        non_conv_externals = []
+        for op in mnn_graph['oplists']:
+            if op['type'] == 'Convolution':
+                continue
+            if op['type'] == 'LayerNorm' and 'external' in op['main']:
+                non_conv_externals.append(('LayerNorm', op))
+            elif op['type'] == 'Const' and 'external' in op['main']:
+                non_conv_externals.append(('Const', op))
+
+        if non_conv_externals:
+            with open(weight_path, 'ab') as f:
+                for op_type, op in non_conv_externals:
+                    ext = op['main']['external']
+                    old_off = ext[0]
+                    if op_type == 'LayerNorm':
+                        total = ext[1] + ext[2]
+                    else:
+                        total = ext[1]
+                    f.write(orig_weight_data[old_off : old_off + total])
+                    ext[0] = new_weight_offset
+                    new_weight_offset += total
+
+        # Save updated JSON
+        with open(graph_path, 'w', encoding='utf-8') as f:
+            json.dump(mnn_graph, f, ensure_ascii=False, indent=4)
+
+        print(f'  Visual GPTQ: replaced {replaced_count}/{len(block_weights)} block weights, '
+              f'kept merger/deepstack/patch_embed as fp16')

@@ -426,6 +426,11 @@ transformers/llm/export/model_half/
 transformers/llm/export/model2B_w8a8/
 transformers/llm/export/model_2ep_n128_s1024/
 transformers/llm/export/model_2ep_n256_s1024/
+check_gptq.py
+check_gptq_visuasl.txt
+transformers/llm/export/model_rl_n128_s1024/
+transformers/llm/export/model_visual8_test/
+
 # iOS
 apps/iOS/MNNLLMChat/Chat/
 apps/iOS/MNNLLMChat/swift-transformers/

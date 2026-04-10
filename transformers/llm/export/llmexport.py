@@ -511,11 +511,23 @@ class LlmExporter(torch.nn.Module):
                 quant_bit_visual = self.args.visual_quant_bit
             if self.args.visual_quant_block is not None:
                 quant_block_visual = self.args.visual_quant_block
-            self.mnn_converter.export(vision_onnx, quant_bit_visual,
-                                      quant_block_visual,
-                                      transformer_fuse=fuse_transformer,
-                                      group_conv_native=native_group_conv,
-                                      weight_sym=self.args.visual_sym)
+            if self.args.visual_gptq_path is not None:
+                # GPTQ path: onnx2mnn(fp16) -> mnn2json -> apply visual gptq(blocks->int8) -> json2mnn
+                # merger/deepstack/patch_embed keep fp16, only blocks are replaced with GPTQ int8
+                self.mnn_converter.export_visual_with_gptq(
+                    vision_onnx,
+                    self.args.visual_gptq_path,
+                    quant_block=quant_block_visual if quant_block_visual else 128,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym
+                )
+            else:
+                self.mnn_converter.export(vision_onnx, quant_bit_visual,
+                                          quant_block_visual,
+                                          transformer_fuse=fuse_transformer,
+                                          group_conv_native=native_group_conv,
+                                          weight_sym=self.args.visual_sym)
 
     def export_audio(self):
         if self.audio is None:
@@ -716,6 +728,7 @@ def build_args(parser):
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
+    parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
