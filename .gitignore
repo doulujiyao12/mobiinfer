@@ -18,6 +18,7 @@
 model/
 transformers/llm/export/model/
 transformers/llm/export/log.txt
+op_info.txt
 
 # Generated files
 bin/
@@ -421,6 +422,10 @@ pipelinemodule.md
 dequant_gemm.md
 w4a8_degemm.md
 yuque
+transformers/llm/export/model_half/
+transformers/llm/export/model2B_w8a8/
+transformers/llm/export/model_2ep_n128_s1024/
+transformers/llm/export/model_2ep_n256_s1024/
 # iOS
 apps/iOS/MNNLLMChat/Chat/
 apps/iOS/MNNLLMChat/swift-transformers/
