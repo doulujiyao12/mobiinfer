@@ -140,11 +140,22 @@ class LlmExporter(torch.nn.Module):
         seq_len = input_ids.numel()
         new_tokens = 0
 
+        first_print = True
+        
         while new_tokens < self.max_new_tokens:
             attention_mask = self.model.get_attention_mask(seq_len, new_tokens)
             position_ids = self.model.get_position_ids(seq_len, new_tokens, input_ids)
-            input_embeds = self.model.embedding(input_ids).bfloat16()
+            input_embeds = self.model.embedding(input_ids)
             deepstack_embeds = self.model.visual.deepstacks() if self.model.visual is not None else None
+            
+            if first_print == True:
+                first_print = False
+                print(f'seq_len: {seq_len}, new_tokens: {new_tokens}')
+                print(f'position_ids')
+                print(position_ids.size())
+                print(f'input_embeds')
+                print(input_embeds.size())
+                
             # print(f'seq_len: {seq_len}, new_tokens: {new_tokens}')
             # print(f'position_ids')
             # print(position_ids.size())
@@ -175,6 +186,7 @@ class LlmExporter(torch.nn.Module):
             word = self.tokenizer.id_to_str(token_id)
             print(word, end="", flush=True)
             input_ids = token_id
+        print("seq_len: ", seq_len)
 
         if hasattr(self.model, 'talker') and self.model.talker is not None:
             self.model.talker.generate()

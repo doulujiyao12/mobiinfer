@@ -15,3 +15,4 @@ hdc file send ./testModelWithDescribe.out /data/local/tmp/$DIR/testModelWithDesc
 hdc file send ./backendTest.out /data/local/tmp/$DIR/backendTest.out
 hdc file send ./timeProfile.out /data/local/tmp/$DIR/timeProfile.out
 hdc file send ./run_test.out /data/local/tmp/$DIR/run_test.out
+hdc file send ./llm_demo /data/local/tmp/$DIR/llm_demo

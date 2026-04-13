@@ -930,7 +930,10 @@ class Qwen3Vision(Qwen2Vision):
             input_embeds[image_mask] = torch.concat(self.image_embeds, dim=0).to(input_embeds.dtype)
             # deepsatck_embeds
             self.deepstack_embeds = torch.zeros_like(input_embeds).transpose(0, 1).repeat(3, 1, 1)
+            # DAHU 下面是原版 bfloat16 BF16 Index put requires the source and destination dtypes match, got BFloat16 for the destination and Float for the source
             self.deepstack_embeds[:, image_mask, :] = torch.concat(self.deepstack_feature_list, dim=1)
+
+            # self.deepstack_embeds[:, image_mask, :] = torch.concat(self.deepstack_feature_list, dim=1).to(input_embeds.dtype)
         return input_embeds
 
     def deepstacks(self):
