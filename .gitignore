@@ -439,3 +439,14 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-0.6B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 prompts/
 harmony_agent.py
+
+mobiinfra-oh/
+
+
+harmony_agent_old.py
+harmony_agent_oldtime.py
+hdc_server.py
+screen.jpeg
+source/backend/hiai/3rdParty/
+transformers/llm/engine/demo/prefix.txt
+transformers/llm/export/model_duiqi_visualw8_s64/

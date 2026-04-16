@@ -337,16 +337,18 @@ class VisualGPTQ(GPTQ):
         return results
 
     @staticmethod
-    def _build_int8_weight_data(gptq_weight, quant_bits=8):
-        """Build int8 weight bytes + scale bytes from a GPTQWeight.
+    def _build_gptq_weight_data(gptq_weight, quant_bits=8):
+        """Build quantized weight bytes + scale bytes from a GPTQWeight.
 
-        Returns (weight_bytes, scale_bytes, header_bytes) ready to write.
-        Also returns (oc, ic) dimensions for quanParameter.
+        Supports both int8 (quant_bits=8) and int4 (quant_bits=4).
+        Returns (header_bytes, weight_bytes, scale_bytes, oc, ic, shape_int32).
         """
         weight = gptq_weight.qweight
         scale = gptq_weight.scales.float().transpose(1, 0)  # (oc, num_groups)
-        weight = GPTQ.weight_reorder(weight, quant_bits)     # (oc, ic) uint8
-        oc, ic = weight.shape
+        # Compute oc, ic from raw qweight before reorder (reorder may return 1D for int4)
+        packed_ic, oc = weight.shape[0], weight.shape[-1]
+        ic = packed_ic * 32 // quant_bits
+        weight = GPTQ.weight_reorder(weight, quant_bits)     # int8: (oc, ic), int4: (oc*ic/2,)
 
         # Build header (same as MNNConverter.write_header)
         shape_dtype = np.int16
@@ -372,11 +374,12 @@ class VisualGPTQ(GPTQ):
         return header_bytes, weight_bytes, scale_bytes, oc, ic, shape_dtype == np.int32
 
     def apply(self, graph_path, weight_path, quant_block=128):
-        """Replace visual model block weights with GPTQ int8, keep merger/deepstack as fp16.
+        """Replace visual model block weights with GPTQ quantized weights, keep merger/deepstack as fp16.
 
+        Supports both int4 and int8 GPTQ weights (auto-detected from qweight shape).
         Rebuilds the entire weight file: reads all ops' external data from the original
         fp16 weight file, then writes a new weight file where block Convolutions are
-        converted to int8+scale format and non-block ops are copied as-is.
+        converted to quantized+scale format and non-block ops are copied as-is.
         Also updates the JSON graph's quanParameter and external fields.
         """
         mnn_graph = json.load(open(graph_path, 'rt'))
@@ -429,10 +432,15 @@ class VisualGPTQ(GPTQ):
             oc = op['main']['common']['outputCount']
 
             if name in block_gptq_map:
-                # This is a block Convolution -> write int8 GPTQ weight
+                # This is a block Convolution -> write GPTQ quantized weight
                 vw, gptq_w = block_gptq_map[name]
+                # Auto-detect quant_bits from GPTQ qweight shape:
+                #   qweight.shape[0] = ic * bits / 32, so bits = 32 * qweight.shape[0] / ic
+                packed_ic = gptq_w.qweight.shape[0]
+                quant_bits = 32 * packed_ic // ic
+                assert quant_bits in (4, 8), f"Unexpected quant_bits={quant_bits} for {name}"
                 header_bytes, weight_bytes, scale_bytes, _, _, shape_int32 = \
-                    self._build_int8_weight_data(gptq_w, quant_bits=8)
+                    self._build_gptq_weight_data(gptq_w, quant_bits=quant_bits)
 
                 new_weight_len = len(header_bytes) + len(weight_bytes)
                 new_scale_len = len(scale_bytes)
@@ -453,13 +461,13 @@ class VisualGPTQ(GPTQ):
                 external[2] = new_scale_len
                 # external[3] (bias_size) unchanged
 
-                # Update quanParameter: fp16(type=3) -> int8 quantized(type=1)
+                # Update quanParameter: fp16(type=3) -> quantized(type=1)
                 block_size = quant_block if quant_block > 0 else ic
                 num_groups = ic // block_size
                 op['main']['quanParameter'] = {
                     'quantScale': 1.0, 'scaleIn': 0.0, 'scaleOut': 0.0,
                     'useInt32': False, 'has_scaleInt': False, 'shapeInt32': shape_int32,
-                    'type': 1, 'aMaxOrBits': 8, 'aMin': 1,
+                    'type': 1, 'aMaxOrBits': quant_bits, 'aMin': 1,
                     'readType': oc * num_groups, 'weightSize': 0
                 }
 
@@ -507,5 +515,6 @@ class VisualGPTQ(GPTQ):
         with open(graph_path, 'w', encoding='utf-8') as f:
             json.dump(mnn_graph, f, ensure_ascii=False, indent=4)
 
-        print(f'  Visual GPTQ: replaced {replaced_count}/{len(block_weights)} block weights, '
+        print(f'  Visual GPTQ: replaced {replaced_count}/{len(block_weights)} block weights '
+              f'(auto-detected quant bits from GPTQ weights), '
               f'kept merger/deepstack/patch_embed as fp16')

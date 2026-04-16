@@ -60,6 +60,8 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_VULKAN;
     if (type_str == "npu")
         return MNN_FORWARD_NN;
+    if (type_str == "hiai")
+        return MNN_FORWARD_USER_0;
     return MNN_FORWARD_AUTO;
 }
 
@@ -1004,7 +1006,7 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
             prompt = user_content;
         }
     }
-    std::cout << "prompt: " << prompt << std::endl;
+    // std::cout << "prompt: " << prompt << std::endl;
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
@@ -1204,7 +1206,10 @@ VARP Llm::gen_attention_mask(int seq_len) {
             for (int i = 0; i < seq_len; i++) {
                 for (int j = 0; j < kv_seq_len; j++) {
                     int row              = i + mContext->all_seq_len;
-                    ptr[seq_len * i + j] = is_glm2 ? j > row : j <= row;
+                    // printf("row: %d, col: %d\n", row, j);
+                    // ptr[seq_len * i + j] = is_glm2 ? j > row : j <= row;
+                    // DAHU
+                    ptr[kv_seq_len * i + j] = is_glm2 ? j > row : j <= row;
                 }
             }
         }
