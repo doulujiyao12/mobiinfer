@@ -62,6 +62,8 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_NN;
     if (type_str == "hiai")
         return MNN_FORWARD_USER_0;
+    if (type_str == "hiai_delegate")
+        return MNN_FORWARD_USER_1;
     return MNN_FORWARD_AUTO;
 }
 

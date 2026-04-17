@@ -148,6 +148,8 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_NN;
     if (type_str == "hiai")
         return MNN_FORWARD_USER_0;
+    if (type_str == "hiai_delegate")
+        return MNN_FORWARD_USER_1;
     return MNN_FORWARD_AUTO;
 }
 
@@ -216,7 +218,7 @@ bool Omni::load() {
         mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0)));
     }
     Module::Config module_config;
-    if(config.type == MNN_FORWARD_NN) {
+    if(config.type == MNN_FORWARD_NN || config.type == MNN_FORWARD_USER_1) {
         module_config.shapeMutable = false;
         module_config.rearrange    = false;
     } else {
