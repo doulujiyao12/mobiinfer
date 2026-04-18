@@ -376,11 +376,18 @@ class VisualGPTQ(GPTQ):
     def apply(self, graph_path, weight_path, quant_block=128):
         """Replace visual model block weights with GPTQ quantized weights, keep merger/deepstack as fp16.
 
-        Supports both int4 and int8 GPTQ weights (auto-detected from qweight shape).
+        Auto-detects both:
+          - quant_bits (4 or 8) from qweight shape: bits = 32 * qweight.shape[0] / ic
+          - num_groups (per-channel=1, per-group=ic/block_size) from scales.shape[0]
+
+        So supports int4/int8, per-channel/per-group without user-side configuration.
         Rebuilds the entire weight file: reads all ops' external data from the original
         fp16 weight file, then writes a new weight file where block Convolutions are
         converted to quantized+scale format and non-block ops are copied as-is.
         Also updates the JSON graph's quanParameter and external fields.
+
+        quant_block parameter is retained for API compatibility but ignored — the
+        actual group layout is dictated by the GPTQ scales shape.
         """
         mnn_graph = json.load(open(graph_path, 'rt'))
         block_weights = self.classify_visual_conv_ops(mnn_graph)
@@ -462,8 +469,8 @@ class VisualGPTQ(GPTQ):
                 # external[3] (bias_size) unchanged
 
                 # Update quanParameter: fp16(type=3) -> quantized(type=1)
-                block_size = quant_block if quant_block > 0 else ic
-                num_groups = ic // block_size
+                # Auto-detect num_groups from GPTQ scales shape (per-channel=1, per-group=ic/block_size)
+                num_groups = gptq_w.scales.shape[0]
                 op['main']['quanParameter'] = {
                     'quantScale': 1.0, 'scaleIn': 0.0, 'scaleOut': 0.0,
                     'useInt32': False, 'has_scaleInt': False, 'shapeInt32': shape_int32,

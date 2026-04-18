@@ -9,6 +9,7 @@
 #define MNN_HIAI_CONV_EXECUTION_H
 
 #include <core/Backend.hpp>
+#include <core/ConvolutionCommon.hpp>
 #include <core/Execution.hpp>
 #include <core/TensorUtils.hpp>
 #include "HiAiModelManagerService.h"
@@ -52,7 +53,7 @@ private:
     std::shared_ptr<hiai::AiModelMngerClient> mMgrClient;
     std::string mModelName;
 
-    // HiAI I/O tensors
+    // HiAI I/O tensors (pre-allocated in compile phase, reused across onExecute calls)
     std::vector<std::shared_ptr<hiai::AiTensor>> mHiAIInputs;
     std::vector<std::shared_ptr<hiai::AiTensor>> mHiAIOutputs;
 
@@ -60,8 +61,26 @@ private:
     bool mCompiled = false;
     std::vector<int> mCachedInputShape;
 
-    // Cached input dimension for zero-copy AiTensor creation
+    // Cached input dimension (for re-Init if shape changes)
     hiai::TensorDimension mCachedInputDim;
+
+    // Cached AiContext (build once, reuse every Process() call)
+    hiai::AiContext mContext;
+
+    // Cached input byte size (== mHiAIInputs[0]->GetSize())
+    size_t mInputByteSize = 0;
+
+    // true when MNN tensor format differs from NCHW (NC4HW4) -> need pack conversion
+    bool mInputNeedsPackConvert = false;
+    bool mOutputNeedsPackConvert = false;
+
+    // True when this "convolution" is actually a Linear/GEMM in disguise
+    // (kH=kW=1, stride=1, dilate=1, pad=0, group=1, input H=W=1).
+    // See transformers/llm/export/utils/mnn_converter.py::rebuild_linear:
+    // Linear -> Reshape([*, ic, 1, 1]) -> Conv1x1 -> Reshape back.
+    // In that case HiAI's Convolution engine is significantly slower than
+    // using MatMul directly on the Da Vinci CUBE.
+    bool mUseMatMul = false;
 
     // Counter for unique model names
     static int sModelCounter;

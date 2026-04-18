@@ -10,6 +10,8 @@
 #include <core/ConvolutionCommon.hpp>
 #include <MNN/AutoTime.hpp>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 // Set to 1 (or pass -DHIAI_VERBOSE=1 to compiler) to print detailed op info at compile time
 #ifndef HIAI_VERBOSE
@@ -19,6 +21,28 @@
 namespace MNN {
 
 int HiAIConvExecution::sModelCounter = 0;
+
+// Detect the Linear->Conv1x1 pattern produced by mnn_converter.py::rebuild_linear:
+// an original Linear gets reshaped to [*, ic, 1, 1] and written out as a Conv with
+// kH=kW=1, stride=1, dilate=1, group=1, pad=0, and the runtime spatial dim is 1x1.
+// When this holds, the op is mathematically a GEMM Y = X * W^T (+b) and maps to
+// HiAI's MatMul much more efficiently than to its Convolution engine.
+static bool isMatMulConvertedConv(const Convolution2DCommon* common,
+                                  int inputHeight, int inputWidth) {
+    if (common->kernelX() != 1 || common->kernelY() != 1) return false;
+    if (common->strideX() != 1 || common->strideY() != 1) return false;
+    if (common->dilateX() != 1 || common->dilateY() != 1) return false;
+    if (common->group() != 1) return false;
+    if (inputHeight != 1 || inputWidth != 1) return false;
+    if (common->pads() != nullptr) {
+        for (int i = 0; i < (int)common->pads()->size(); i++) {
+            if (common->pads()->data()[i] != 0) return false;
+        }
+    } else {
+        if (common->padX() != 0 || common->padY() != 0) return false;
+    }
+    return true;
+}
 
 static std::shared_ptr<hiai::AiModelMngerClient> loadSingleModel(
     domi::ModelBufferData& modelBufferData, const std::string& modelName) {
@@ -38,6 +62,8 @@ static std::shared_ptr<hiai::AiModelMngerClient> loadSingleModel(
         printf("[HiAI Delegate] InputMemBufferCreate failed\n");
         return nullptr;
     }
+    // Frequency = 3 (high), framework = 0, model_type = 0, device_type = 0 (NPU)
+    // Higher priority (3) ensures the NPU prefers this model over others in the queue.
     auto desc = std::make_shared<hiai::AiModelDescription>(modelName, 3, 0, 0, 0);
     desc->SetModelBuffer(buffer->GetMemBufferData(), buffer->GetMemBufferSize());
 
@@ -124,85 +150,171 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     int outHeight = outputTensor->height();
     int outWidth = outputTensor->width();
 
-    // Build ge::Graph with single Convolution
+    // Decide whether this conv is actually a Linear/GEMM in disguise.
+    // If so, build a MatMul graph instead of Convolution — the NPU's Da Vinci
+    // CUBE handles GEMM far more efficiently than the conv engine for this shape.
+    mUseMatMul = isMatMulConvertedConv(conv2DCommon, inputHeight, inputWidth);
+
+    // Manual override for A/B testing. Set env var HIAI_CONV_MODE before launch:
+    //   "matmul" -> always use MatMul path (only safe when shape permits)
+    //   "conv"   -> always use Convolution path
+    //   unset/"auto" -> automatic (default)
+    if (const char* mode = std::getenv("HIAI_CONV_MODE")) {
+        if (std::strcmp(mode, "matmul") == 0) {
+            mUseMatMul = true;
+        } else if (std::strcmp(mode, "conv") == 0) {
+            mUseMatMul = false;
+        }
+    }
+
+    // Build ge::Graph
     std::string graphName = mModelName + "_graph";
 
-    // Input data node
-    hiai::op::Data inputData("input");
-    ge::TensorDesc inputDesc(ge::Shape({batch, inputChannel, inputHeight, inputWidth}),
-                              ge::FORMAT_NCHW, ge::DT_FLOAT);
-    inputData.update_input_desc_x(inputDesc);
+    // Declared outside both branches so ownership lives until graph.SetOutputs().
+    hiai::op::Data        inputData("input");
+    hiai::op::Const       weightConst(mModelName + "_weight");
+    hiai::op::Const       biasConst(mModelName + "_bias");
+    hiai::op::Convolution conv(mModelName + "_conv");
+    hiai::op::MatMul      matmul(mModelName + "_matmul");
+    hiai::op::Activation  reluOp(mModelName + "_relu");
 
-    // Weight const
-    hiai::op::Const weightConst(mModelName + "_weight");
-    {
-        ge::TensorPtr filter = std::make_shared<ge::Tensor>();
-        if (inputs.size() == 3 && conv2D->weight() == nullptr) {
-            // Dynamic weight from input tensor
-            bool isConst1 = TensorUtils::getDescribe(inputs[1])->usage == Tensor::InsideDescribe::Usage::CONSTANT;
-            if (isConst1) {
-                weightSize = inputs[1]->elementSize();
+    ge::Operator* graphOutput = nullptr;
+    bool hasBias = false;
+    const char* padMode = "SPECIFIC";  // only meaningful in Convolution path; kept here for verbose log
+
+    if (mUseMatMul) {
+        padMode = "N/A(matmul)";
+        // ── MatMul path ────────────────────────────────────────────────
+        // Raw byte layout for input/output/weight is identical to NCHW with
+        // H=W=1, so we can keep the same memcpy-based I/O; the HiAI graph
+        // just sees 2-D shapes.
+
+        // Input [N, ic]
+        ge::TensorDesc inputDesc(ge::Shape({batch, inputChannel}),
+                                  ge::FORMAT_ND, ge::DT_FLOAT);
+        inputData.update_input_desc_x(inputDesc);
+
+        // Weight [oc, ic] — rebuild_linear always embeds static weights
+        {
+            if (filterDataPtr == nullptr) {
+                if (conv2D->weight() != nullptr) {
+                    weightSize = conv2D->weight()->size();
+                    filterDataPtr = conv2D->weight()->data();
+                } else if (inputs.size() >= 2 &&
+                           TensorUtils::getDescribe(inputs[1])->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
+                    weightSize = inputs[1]->elementSize();
+                    filterDataPtr = inputs[1]->host<float>();
+                }
+            }
+            ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+            ge::TensorDesc fdesc(ge::Shape({outputCount, inputChannel}),
+                                  ge::FORMAT_ND, ge::DT_FLOAT);
+            filter->SetTensorDesc(fdesc);
+            filter->SetData((uint8_t*)filterDataPtr, weightSize * sizeof(float));
+            weightConst.set_attr_value(filter);
+        }
+
+        // Bias [oc] (optional)
+        const float* biasPtr = nullptr;
+        int biasCount = 0;
+        if (conv2D->bias() != nullptr && conv2D->bias()->size() > 0) {
+            biasPtr = conv2D->bias()->data();
+            biasCount = conv2D->bias()->size();
+        } else if (inputs.size() == 3 &&
+                   TensorUtils::getDescribe(inputs[2])->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
+            biasPtr = inputs[2]->host<float>();
+            biasCount = outputCount;
+        }
+        if (biasPtr != nullptr && biasCount > 0) {
+            hasBias = true;
+            ge::TensorPtr biasTensor = std::make_shared<ge::Tensor>();
+            ge::TensorDesc bdesc(ge::Shape({biasCount}),
+                                  ge::FORMAT_ND, ge::DT_FLOAT);
+            biasTensor->SetTensorDesc(bdesc);
+            biasTensor->SetData((uint8_t*)biasPtr, biasCount * sizeof(float));
+            biasConst.set_attr_value(biasTensor);
+        }
+
+        matmul.set_input_x1(inputData)
+              .set_input_x2(weightConst)
+              .set_attr_transpose_x1(false)
+              .set_attr_transpose_x2(true);  // weight stored as [oc, ic] -> transpose
+        if (hasBias) {
+            matmul.set_input_bias(biasConst);
+        }
+        graphOutput = &matmul;
+    } else {
+        // ── Convolution path (unchanged behaviour) ─────────────────────
+        ge::TensorDesc inputDesc(ge::Shape({batch, inputChannel, inputHeight, inputWidth}),
+                                  ge::FORMAT_NCHW, ge::DT_FLOAT);
+        inputData.update_input_desc_x(inputDesc);
+
+        // Weight const
+        {
+            ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+            if (inputs.size() == 3 && conv2D->weight() == nullptr) {
+                // Dynamic weight from input tensor
+                bool isConst1 = TensorUtils::getDescribe(inputs[1])->usage == Tensor::InsideDescribe::Usage::CONSTANT;
+                if (isConst1) {
+                    weightSize = inputs[1]->elementSize();
+                    int ic = weightSize / (kernelX * kernelY * outputCount);
+                    ge::TensorDesc fdesc(ge::Shape({outputCount, ic, kernelY, kernelX}), ge::FORMAT_NCHW, ge::DT_FLOAT);
+                    filter->SetTensorDesc(fdesc);
+                    filter->SetData((uint8_t*)inputs[1]->host<float>(), weightSize * sizeof(float));
+                }
+            } else {
+                if (filterDataPtr == nullptr) {
+                    weightSize = conv2D->weight()->size();
+                    filterDataPtr = conv2D->weight()->data();
+                }
                 int ic = weightSize / (kernelX * kernelY * outputCount);
                 ge::TensorDesc fdesc(ge::Shape({outputCount, ic, kernelY, kernelX}), ge::FORMAT_NCHW, ge::DT_FLOAT);
                 filter->SetTensorDesc(fdesc);
-                filter->SetData((uint8_t*)inputs[1]->host<float>(), weightSize * sizeof(float));
+                filter->SetData((uint8_t*)filterDataPtr, weightSize * sizeof(float));
             }
-        } else {
-            if (filterDataPtr == nullptr) {
-                weightSize = conv2D->weight()->size();
-                filterDataPtr = conv2D->weight()->data();
-            }
-            int ic = weightSize / (kernelX * kernelY * outputCount);
-            ge::TensorDesc fdesc(ge::Shape({outputCount, ic, kernelY, kernelX}), ge::FORMAT_NCHW, ge::DT_FLOAT);
-            filter->SetTensorDesc(fdesc);
-            filter->SetData((uint8_t*)filterDataPtr, weightSize * sizeof(float));
+            weightConst.set_attr_value(filter);
         }
-        weightConst.set_attr_value(filter);
-    }
 
-    // Bias const
-    hiai::op::Const biasConst(mModelName + "_bias");
-    {
-        ge::TensorPtr biasTensor = std::make_shared<ge::Tensor>();
-        if (inputs.size() == 3 && conv2D->bias() == nullptr) {
-            bool isConst2 = TensorUtils::getDescribe(inputs[2])->usage == Tensor::InsideDescribe::Usage::CONSTANT;
-            if (isConst2) {
+        // Bias const
+        {
+            ge::TensorPtr biasTensor = std::make_shared<ge::Tensor>();
+            if (inputs.size() == 3 && conv2D->bias() == nullptr) {
+                bool isConst2 = TensorUtils::getDescribe(inputs[2])->usage == Tensor::InsideDescribe::Usage::CONSTANT;
+                if (isConst2) {
+                    ge::TensorDesc bdesc(ge::Shape({1, outputCount, 1, 1}), ge::FORMAT_NCHW, ge::DT_FLOAT);
+                    biasTensor->SetTensorDesc(bdesc);
+                    biasTensor->SetData((uint8_t*)inputs[2]->host<float>(), outputCount * sizeof(float));
+                }
+            } else if (conv2D->bias() != nullptr) {
                 ge::TensorDesc bdesc(ge::Shape({1, outputCount, 1, 1}), ge::FORMAT_NCHW, ge::DT_FLOAT);
                 biasTensor->SetTensorDesc(bdesc);
-                biasTensor->SetData((uint8_t*)inputs[2]->host<float>(), outputCount * sizeof(float));
+                biasTensor->SetData((uint8_t*)conv2D->bias()->data(), conv2D->bias()->size() * sizeof(float));
             }
-        } else if (conv2D->bias() != nullptr) {
-            ge::TensorDesc bdesc(ge::Shape({1, outputCount, 1, 1}), ge::FORMAT_NCHW, ge::DT_FLOAT);
-            biasTensor->SetTensorDesc(bdesc);
-            biasTensor->SetData((uint8_t*)conv2D->bias()->data(), conv2D->bias()->size() * sizeof(float));
+            biasConst.set_attr_value(biasTensor);
         }
-        biasConst.set_attr_value(biasTensor);
+
+        // Convolution op
+        if (PadMode_VALID == conv2DCommon->padMode()) {
+            padMode = "VALID";
+        } else if (PadMode_SAME == conv2DCommon->padMode()) {
+            padMode = "SAME";
+            pads = {0, 0, 0, 0};
+        }
+
+        conv.set_input_x(inputData)
+            .set_input_filter(weightConst)
+            .set_input_bias(biasConst)
+            .set_attr_strides(ge::AttrValue::LIST_INT({strideY, strideX}))
+            .set_attr_dilations(ge::AttrValue::LIST_INT({dilateY, dilateX}))
+            .set_attr_groups(group)
+            .set_attr_pads(pads)
+            .set_attr_pad_mode(padMode);
+        graphOutput = &conv;
     }
 
-    // Convolution op
-    auto padMode = "SPECIFIC";
-    if (PadMode_VALID == conv2DCommon->padMode()) {
-        padMode = "VALID";
-    } else if (PadMode_SAME == conv2DCommon->padMode()) {
-        padMode = "SAME";
-        pads = {0, 0, 0, 0};
-    }
-
-    hiai::op::Convolution conv(mModelName + "_conv");
-    conv.set_input_x(inputData)
-        .set_input_filter(weightConst)
-        .set_input_bias(biasConst)
-        .set_attr_strides(ge::AttrValue::LIST_INT({strideY, strideX}))
-        .set_attr_dilations(ge::AttrValue::LIST_INT({dilateY, dilateX}))
-        .set_attr_groups(group)
-        .set_attr_pads(pads)
-        .set_attr_pad_mode(padMode);
-
-    // Optional ReLU
-    ge::Operator* graphOutput = &conv;
-    hiai::op::Activation reluOp(mModelName + "_relu");
+    // Optional ReLU (shared between both paths)
     if (conv2DCommon->relu() || conv2DCommon->relu6()) {
-        reluOp.set_input_x(conv)
+        reluOp.set_input_x(*graphOutput)
               .set_attr_mode(conv2DCommon->relu() ? 1 : 14);
         graphOutput = &reluOp;
     }
@@ -257,13 +369,28 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
         return INVALID_VALUE;
     }
 
-    // Cache input dimension for zero-copy AiTensor creation in onExecute
+    if (inputDims.empty()) {
+        printf("[HiAI Delegate] Empty inputDims from GetModelIOTensorDim: %s\n", mOpName.c_str());
+        return INVALID_VALUE;
+    }
+    mCachedInputDim = inputDims[0];
+
+    // Pre-allocate input AiTensor once.
+    // Init(const TensorDimension*) allocates ION memory which is the dominant
+    // per-call cost if done inside onExecute. Allocate once and reuse.
     mHiAIInputs.clear();
-    if (!inputDims.empty()) {
-        mCachedInputDim = inputDims[0];
+    {
+        auto t = std::make_shared<hiai::AiTensor>();
+        int initRet = t->Init(&mCachedInputDim);
+        if (initRet != hiai::AI_SUCCESS || t->GetBuffer() == nullptr) {
+            printf("[HiAI Delegate] Pre-allocate input AiTensor failed: %s\n", mOpName.c_str());
+            return INVALID_VALUE;
+        }
+        mInputByteSize = t->GetSize();
+        mHiAIInputs.push_back(t);
     }
 
-    // Only pre-allocate output AiTensors (output always needs ION buffer)
+    // Pre-allocate output AiTensors
     mHiAIOutputs.clear();
     for (auto& dim : outputDims) {
         auto t = std::make_shared<hiai::AiTensor>();
@@ -271,10 +398,21 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
         mHiAIOutputs.push_back(t);
     }
 
+    // Cache AiContext metadata once
+    mContext = hiai::AiContext();
+    mContext.AddPara("model_name", mModelName);
+
+    // Cache expected input format to avoid TensorUtils call in hot path
+    mInputNeedsPackConvert =
+        (TensorUtils::getDescribe(inputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4);
+    mOutputNeedsPackConvert =
+        (TensorUtils::getDescribe(outputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4);
+
 #if HIAI_VERBOSE
     int ic = (weightSize > 0 && kernelX > 0 && kernelY > 0 && outputCount > 0)
              ? weightSize / (kernelX * kernelY * outputCount) : -1;
-    printf("[HiAI CONV] op=%s\n", mOpName.c_str());
+    printf("[HiAI CONV] op=%s  path=%s\n", mOpName.c_str(),
+           mUseMatMul ? "MatMul" : "Convolution");
     printf("  input : N=%d C=%d H=%d W=%d\n", batch, inputChannel, inputHeight, inputWidth);
     printf("  output: N=%d C=%d H=%d W=%d\n", outBatch, outChannel, outHeight, outWidth);
     printf("  kernel: kH=%d kW=%d  stride: sH=%d sW=%d  dilation: dH=%d dW=%d\n",
@@ -327,80 +465,53 @@ ErrorCode HiAIConvExecution::onResize(const std::vector<Tensor*>& inputs,
 
 ErrorCode HiAIConvExecution::onExecute(const std::vector<Tensor*>& inputs,
                                         const std::vector<Tensor*>& outputs) {
-    if (!mCompiled || mMgrClient == nullptr) {
+    if (!mCompiled || mMgrClient == nullptr || mHiAIInputs.empty()) {
         printf("[HiAI Delegate] Execute called but model not compiled: %s\n", mOpName.c_str());
         return INVALID_VALUE;
     }
 
-    // Stage 1: prepare NCHW input and upload into a HiAI-owned AiTensor.
-    //   Zero-copy Init(data, dim, type) is not supported on all DDK versions
-    //   (CreateNDTensorBufferNoCopy returns "Not Support" for some shapes),
-    //   so we always allocate an AiTensor and memcpy the NCHW data in.
-    auto srcInput = inputs[0];
-    const void* nchwSrc = nullptr;
-    std::vector<uint8_t> inputScratch;
-    bool srcIsNC4HW4 = TensorUtils::getDescribe(srcInput)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4;
-    size_t nchwBytes = (size_t)srcInput->batch() * srcInput->channel() *
-                       srcInput->height() * srcInput->width() * sizeof(float);
-    if (srcIsNC4HW4) {
-        std::unique_ptr<Tensor> nchwView(new Tensor(srcInput, Tensor::CAFFE, false));
-        inputScratch.resize(nchwBytes);
-        nchwView->buffer().host = inputScratch.data();
-        MNNCPUCopyBuffer(srcInput, nchwView.get());
-        nchwSrc = inputScratch.data();
+    // ─── Stage 1: upload input into pre-allocated AiTensor ──────────────
+    // mHiAIInputs[0] was Init()-ed once in compileHiAIModel (ION buffer
+    // allocated). We only memcpy (or pack-convert) here -> no per-call alloc.
+    auto* srcInput = inputs[0];
+    auto& hiaiInput = mHiAIInputs[0];
+    void* dstBuf = hiaiInput->GetBuffer();
+
+    if (mInputNeedsPackConvert) {
+        // NC4HW4 -> NCHW directly into AiTensor buffer (skip scratch + 2nd memcpy)
+        Tensor nchwView(srcInput, Tensor::CAFFE, false);
+        nchwView.buffer().host = (uint8_t*)dstBuf;
+        MNNCPUCopyBuffer(srcInput, &nchwView);
     } else {
-        nchwSrc = srcInput->host<void>();
-    }
-    if (nchwSrc == nullptr) {
-        printf("[HiAI Delegate] Input tensor host is null: %s\n", mOpName.c_str());
-        return INVALID_VALUE;
+        const void* srcHost = srcInput->host<void>();
+        if (srcHost == nullptr) {
+            printf("[HiAI Delegate] Input host null: %s\n", mOpName.c_str());
+            return INVALID_VALUE;
+        }
+        ::memcpy(dstBuf, srcHost, mInputByteSize);
     }
 
-    auto hiaiInput = std::make_shared<hiai::AiTensor>();
-    int initRet = hiaiInput->Init(&mCachedInputDim);
-    if (initRet != hiai::AI_SUCCESS || hiaiInput->GetBuffer() == nullptr) {
-        printf("[HiAI Delegate] AiTensor Init failed: %s\n", mOpName.c_str());
-        return INVALID_VALUE;
-    }
-    ::memcpy(hiaiInput->GetBuffer(), nchwSrc, nchwBytes);
-    std::vector<std::shared_ptr<hiai::AiTensor>> hiaiInputs = {hiaiInput};
-
-    hiai::AiContext context;
-    context.AddPara("model_name", mModelName);
-    int stamp;
-    int ret = mMgrClient->Process(context, hiaiInputs, mHiAIOutputs, 1000, stamp);
+    // ─── Stage 2: NPU execute (cached context, pre-allocated I/O) ───────
+    int stamp = 0;
+    int ret = mMgrClient->Process(mContext, mHiAIInputs, mHiAIOutputs, 1000, stamp);
     if (ret != 0) {
         printf("[HiAI Delegate] Process failed for %s, ret=%d\n", mOpName.c_str(), ret);
         return CALL_BACK_STOP;
     }
-    // Confirm execution actually happened on NPU. Log every 10th call to avoid spam.
-    {
-        static std::atomic<int> sNpuExecCount{0};
-        int n = sNpuExecCount.fetch_add(1) + 1;
-        if (n <= 5 || n % 10 == 0) {
-            printf("[HiAI NPU] exec #%d op=%s (stamp=%d)\n", n, mOpName.c_str(), stamp);
-            fflush(stdout);
-        }
-    }
 
-    // Stage 2: write NCHW output back into the MNN tensor, converting format if needed.
-    if (!mHiAIOutputs.empty()) {
-        auto dstOutput = outputs[0];
-        auto src = (const void*)mHiAIOutputs[0]->GetBuffer();
-        auto size = (size_t)mHiAIOutputs[0]->GetSize();
-        if (src == nullptr || dstOutput->host<void>() == nullptr) {
-            printf("[HiAI Delegate] Output buffer null: %s\n", mOpName.c_str());
-            return INVALID_VALUE;
-        }
-        bool dstIsNC4HW4 = TensorUtils::getDescribe(dstOutput)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4;
-        if (dstIsNC4HW4) {
-            // Build a CAFFE (NCHW) view over the HiAI output buffer, then pack-convert into MNN tensor.
-            std::unique_ptr<Tensor> nchwView(new Tensor(dstOutput, Tensor::CAFFE, false));
-            nchwView->buffer().host = (uint8_t*)const_cast<void*>(src);
-            MNNCPUCopyBuffer(nchwView.get(), dstOutput);
-        } else {
-            ::memcpy(dstOutput->host<void>(), src, size);
-        }
+    // ─── Stage 3: pull output back, convert if MNN tensor is NC4HW4 ─────
+    auto* dstOutput = outputs[0];
+    const void* srcOut = mHiAIOutputs[0]->GetBuffer();
+    if (srcOut == nullptr || dstOutput->host<void>() == nullptr) {
+        printf("[HiAI Delegate] Output buffer null: %s\n", mOpName.c_str());
+        return INVALID_VALUE;
+    }
+    if (mOutputNeedsPackConvert) {
+        Tensor nchwView(dstOutput, Tensor::CAFFE, false);
+        nchwView.buffer().host = (uint8_t*)const_cast<void*>(srcOut);
+        MNNCPUCopyBuffer(&nchwView, dstOutput);
+    } else {
+        ::memcpy(dstOutput->host<void>(), srcOut, (size_t)mHiAIOutputs[0]->GetSize());
     }
 
     return NO_ERROR;

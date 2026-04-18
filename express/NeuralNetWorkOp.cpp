@@ -15,6 +15,7 @@
 #include <MNN/MNNDefine.h>
 #include "MNN_generated.h"
 #include "Utils.hpp"
+#include "core/IDSTEncoder.hpp"
 namespace MNN {
 namespace Express {
 static PadMode _convertPadMode(PaddingMode mode) {
@@ -1663,6 +1664,72 @@ VARP _Conv(std::vector<int8_t>&& weight, std::vector<float>&& bias, std::vector<
     }
 
     return (Variable::create(Expr::create(convOp.get(), {x})));
+}
+
+VARP _HybridInt8Conv(std::vector<float>&& weightFloat, std::vector<float>&& bias, VARP x,
+                     INTS channel, INTS kernelSize,
+                     PaddingMode pad, INTS stride, INTS dilate, int group, INTS pads,
+                     bool relu, bool relu6, int nbits, int quantBlock) {
+    (void)quantBlock; // currently always per-output-channel (block==0)
+    const int ic = channel[0];
+    const int oc = channel[1];
+    const int kh = kernelSize[1];
+    const int kw = kernelSize[0];
+    const int kSize = (ic / group) * kh * kw;
+    const int kNum  = oc;
+    MNN_ASSERT((int)weightFloat.size() == kNum * kSize);
+    MNN_ASSERT((int)bias.size() == oc);
+
+    // Per-output-channel symmetric scale: alpha[o] = max|w[o,:]| / ((1<<(nbits-1)) - 1)
+    const int qmax = (1 << (nbits - 1)) - 1; // 127 for nbits=8
+    const int qmin = -(1 << (nbits - 1));    // -128 for nbits=8
+    std::vector<float> alpha(kNum, 0.f);
+    for (int o = 0; o < kNum; o++) {
+        float amax = 1e-8f;
+        const float* row = weightFloat.data() + o * kSize;
+        for (int i = 0; i < kSize; i++) {
+            float v = std::fabs(row[i]);
+            if (v > amax) amax = v;
+        }
+        alpha[o] = amax / (float)qmax;
+    }
+
+    std::unique_ptr<OpT> convOp(new OpT);
+    convOp->type = OpType_Convolution;
+    if (ic == oc && ic == group) {
+        convOp->type = OpType_ConvolutionDepthwise;
+    }
+    convOp->main.type  = OpParameter_Convolution2D;
+    convOp->main.value = new Convolution2DT;
+    auto conv2D = convOp->main.AsConvolution2D();
+    conv2D->common.reset(new Convolution2DCommonT);
+    conv2D->common->padMode = _convertPadMode(pad);
+    if (pads.size() == 2) {
+        conv2D->common->padX = pads[0];
+        conv2D->common->padY = pads[1];
+    } else {
+        conv2D->common->pads = std::move(pads);
+    }
+    conv2D->common->strideX     = stride[0];
+    conv2D->common->strideY     = stride[1];
+    conv2D->common->group       = group;
+    conv2D->common->outputCount = oc;
+    conv2D->common->inputCount  = ic;
+    conv2D->common->dilateX     = dilate[0];
+    conv2D->common->dilateY     = dilate[1];
+    conv2D->common->kernelX     = kw;
+    conv2D->common->kernelY     = kh;
+    conv2D->common->relu        = relu;
+    conv2D->common->relu6       = relu6;
+
+    conv2D->quanParameter = IDSTEncoder::encode(
+        weightFloat.data(), alpha, kSize, kNum,
+        /*asymmetricQuantFlag=*/false, /*quantWeightPtr=*/nullptr,
+        /*clampMin=*/qmin, /*bits=*/nbits, /*detectSparse=*/false);
+    conv2D->weight.clear();
+    conv2D->bias = std::move(bias);
+
+    return Variable::create(Expr::create(convOp.get(), {x}));
 }
 
 VARP _CosineSimilarity(VARP input0, VARP input1, VARP inputDim) {
