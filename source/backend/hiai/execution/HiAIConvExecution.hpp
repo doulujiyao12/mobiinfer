@@ -94,6 +94,19 @@ private:
     // A/B. When false, x_quant_type=0 → fp16 MAC with int8 weight storage.
     bool mUseFullQuant = false;
 
+    // When true, build a single hiai::op::QuantizedMatMul (math_defs.h:484).
+    // x1 stays fp32 at the graph boundary; NPU quantizes it to int8 with
+    // x1_quant_scale (read from HIAI_INT8_X_SCALE env) and x1_quant_offset=0,
+    // runs int8×int8 → int32 on the CUBE MAC, rescales per-OC via
+    // x2_quant_scales (LIST_FLOAT of length OC → per-channel preserved),
+    // optionally adds int32 bias, and returns fp32. No QuantizeV2 or
+    // DequantizeV2 involved — those ops (plus int8 on the frontend MatMul x1
+    // type list) were observed to fail BuildIRModel on DDK 109.633. Only
+    // eligible for 1×1 linear shapes (isMatMulConvertedConv==true).
+    // Requires HiAI firmware >= 100.500.010.010.
+    // Mutually exclusive with mUseQuantized.
+    bool mUseMatMulInt8 = false;
+
     // Set by onResize to temporarily force the dequant fp32 path when the int8
     // QuantizedConvolution graph failed to compile on this firmware.
     bool mDisableQuantRetry = false;
