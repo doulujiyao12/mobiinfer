@@ -10,6 +10,7 @@
 #include <core/ConvolutionCommon.hpp>
 #include <MNN/AutoTime.hpp>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -128,14 +129,6 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     const float* filterDataPtr = nullptr;
     std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon;
 
-    if (nullptr != conv2D->quanParameter()) {
-        quanCommon = ConvolutionCommon::load(mOp, backend(), true);
-        if (quanCommon != nullptr && quanCommon->weightFloat.get() != nullptr) {
-            filterDataPtr = quanCommon->weightFloat.get();
-            weightSize = quanCommon->weightFloat.size();
-        }
-    }
-
     // Get input shape (NCHW)
     auto inputTensor = inputs[0];
     int batch = inputTensor->batch();
@@ -159,11 +152,83 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     //   "matmul" -> always use MatMul path (only safe when shape permits)
     //   "conv"   -> always use Convolution path
     //   unset/"auto" -> automatic (default)
+    bool matmulForced = false;
+    bool convForced   = false;
     if (const char* mode = std::getenv("HIAI_CONV_MODE")) {
         if (std::strcmp(mode, "matmul") == 0) {
-            mUseMatMul = true;
+            mUseMatMul    = true;
+            matmulForced  = true;
         } else if (std::strcmp(mode, "conv") == 0) {
-            mUseMatMul = false;
+            mUseMatMul  = false;
+            convForced  = true;
+        }
+    }
+
+    // ── Try real int8 path (hiai::op::QuantizedConvolution) ───────────────
+    // HiAI's QuantizedConvolution supports DT_INT8 filter + per-output-channel
+    // filter_quant_scales and runs on Da Vinci CUBE's int8 MAC.
+    // QuantizedMatMul only supports per-tensor x2 scales, so we cannot use
+    // it for per-channel quant — if the op is int8 eligible we always build
+    // the Convolution form, even for the 1x1 linear-shape case (auto-select).
+    //
+    // Eligibility:
+    //   - op has quanParameter
+    //   - forceInt8 loader returns 8-bit symmetric weight (alpha.size() == oc)
+    //   - HIAI_CONV_QUANT is not "off"
+    //   - user did not pin matmul via HIAI_CONV_MODE=matmul
+    // On any mismatch we fall through to the existing dequant+fp path.
+    //
+    // HIAI_CONV_QUANT modes:
+    //   "off"         -> don't use any quantized NPU op (dequant to fp32)
+    //   unset/"auto"  -> weight-only: x_quant_type=0, filter int8 per-channel.
+    //                    Fast IR build, fp16 MAC (weight storage compressed).
+    //   "full"        -> real int8×int8 CUBE MAC: x_quant_type=1,
+    //                    x_quant_scale read from HIAI_INT8_X_SCALE env (default
+    //                    1/127). Loses per-call dynamic input scale, so
+    //                    accuracy is rough — intended for perf A/B only.
+    mUseQuantized = false;
+    mUseFullQuant = false;
+    std::shared_ptr<ConvolutionCommon::Int8Common> quantCommon;
+    bool quantAllowed = !mDisableQuantRetry;
+    const char* quantModeStr = std::getenv("HIAI_CONV_QUANT");
+    if (quantAllowed && quantModeStr && std::strcmp(quantModeStr, "off") == 0) {
+        quantAllowed = false;
+    }
+    bool wantFullQuant = (quantAllowed && quantModeStr &&
+                          std::strcmp(quantModeStr, "full") == 0);
+    if (quantAllowed && !matmulForced && conv2D->quanParameter() != nullptr) {
+        quantCommon = ConvolutionCommon::load(mOp, backend(), false, true);
+        if (quantCommon != nullptr && quantCommon->weight.get() != nullptr &&
+            !quantCommon->asymmetric &&
+            quantCommon->alpha.get() != nullptr &&
+            (int)quantCommon->alpha.size() == outputCount &&
+            quantCommon->originBits == 8 &&
+            !quantCommon->canUseInt4) {
+            mUseQuantized = true;
+            mUseFullQuant = wantFullQuant;
+            // Per-channel quant runs only through Convolution form.
+            // This overrides the auto MatMul heuristic for 1x1 linear shapes,
+            // but respects an explicit HIAI_CONV_MODE=conv setting trivially.
+            if (matmulForced) {
+                // Cannot use per-channel on MatMul; keep mUseMatMul=true and
+                // disable quant to fall back to dequant path.
+                mUseQuantized = false;
+                mUseFullQuant = false;
+                quantCommon.reset();
+            } else {
+                mUseMatMul = false;
+            }
+        }
+    }
+
+    // Fallback: if we're NOT going to use the real int8 path, the existing
+    // quanParameter block must still dequantize to fp32 so the float graph
+    // sees a real weight tensor.
+    if (!mUseQuantized && conv2D->quanParameter() != nullptr) {
+        quanCommon = ConvolutionCommon::load(mOp, backend(), true);
+        if (quanCommon != nullptr && quanCommon->weightFloat.get() != nullptr) {
+            filterDataPtr = quanCommon->weightFloat.get();
+            weightSize = quanCommon->weightFloat.size();
         }
     }
 
@@ -171,18 +236,119 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     std::string graphName = mModelName + "_graph";
 
     // Declared outside both branches so ownership lives until graph.SetOutputs().
-    hiai::op::Data        inputData("input");
-    hiai::op::Const       weightConst(mModelName + "_weight");
-    hiai::op::Const       biasConst(mModelName + "_bias");
-    hiai::op::Convolution conv(mModelName + "_conv");
-    hiai::op::MatMul      matmul(mModelName + "_matmul");
-    hiai::op::Activation  reluOp(mModelName + "_relu");
+    hiai::op::Data               inputData("input");
+    hiai::op::Const              weightConst(mModelName + "_weight");
+    hiai::op::Const              biasConst(mModelName + "_bias");
+    hiai::op::Convolution        conv(mModelName + "_conv");
+    hiai::op::QuantizedConvolution qconv(mModelName + "_qconv");
+    hiai::op::MatMul             matmul(mModelName + "_matmul");
+    hiai::op::Activation         reluOp(mModelName + "_relu");
 
     ge::Operator* graphOutput = nullptr;
     bool hasBias = false;
     const char* padMode = "SPECIFIC";  // only meaningful in Convolution path; kept here for verbose log
 
-    if (mUseMatMul) {
+    if (mUseQuantized) {
+        // ── QuantizedConvolution path ─────────────────────────────────────
+        // Two sub-modes:
+        //   mUseFullQuant=false: weight-only. x_quant_type=0, x stays fp32,
+        //                         NPU dequants weight to fp16 before CUBE MAC
+        //                         → fp16 compute throughput.
+        //   mUseFullQuant=true : genuine int8 MAC. x_quant_type=1, NPU quantizes
+        //                         x to int8 at op input using a fixed
+        //                         x_quant_scale (read from HIAI_INT8_X_SCALE,
+        //                         default 1/127). int8×int8 → int32 MAC,
+        //                         rescale + bias at output.
+        //
+        // Bias formula (per op doc):
+        //     quant_bias[c] = bias[c] / (x_quant_scale * filter_scale[c])
+        //
+        // Filter: DT_INT8 [Co, Ci/group, Hk, Wk]
+        // Bias:   DT_INT32 [1, Co, 1, 1]
+
+        // Pick x_quant_scale used for both the op attr and the bias conversion.
+        float xScale = 1.0f;  // weight-only mode ignores this
+        int   xQuantType = 0;
+        if (mUseFullQuant) {
+            xQuantType = 1;
+            xScale = 1.0f / 127.0f;
+            if (const char* s = std::getenv("HIAI_INT8_X_SCALE")) {
+                float v = (float)std::atof(s);
+                if (v > 0.0f && std::isfinite(v)) xScale = v;
+            }
+        }
+
+        ge::TensorDesc inputDesc(ge::Shape({batch, inputChannel, inputHeight, inputWidth}),
+                                  ge::FORMAT_NCHW, ge::DT_FLOAT);
+        inputData.update_input_desc_x(inputDesc);
+
+        // Int8 filter const
+        const int8_t* int8Filter = quantCommon->weight.get();
+        int int8FilterLen        = quantCommon->weight.size();
+        {
+            int ic = int8FilterLen / (kernelX * kernelY * outputCount);
+            ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+            ge::TensorDesc fdesc(ge::Shape({outputCount, ic, kernelY, kernelX}),
+                                  ge::FORMAT_NCHW, ge::DT_INT8);
+            filter->SetTensorDesc(fdesc);
+            filter->SetData((uint8_t*)int8Filter, int8FilterLen * sizeof(int8_t));
+            weightConst.set_attr_value(filter);
+        }
+
+        // Per-channel scales
+        std::vector<float> scalesVec(quantCommon->alpha.get(),
+                                      quantCommon->alpha.get() + quantCommon->alpha.size());
+
+        // Optional int32 bias.
+        std::vector<int32_t> biasInt32;
+        if (conv2D->bias() != nullptr && conv2D->bias()->size() > 0) {
+            hasBias = true;
+            const float* bf = conv2D->bias()->data();
+            int bc = conv2D->bias()->size();
+            biasInt32.resize(bc);
+            for (int c = 0; c < bc; c++) {
+                float fs = (c < (int)scalesVec.size()) ? scalesVec[c] : 1.0f;
+                if (fs == 0.0f) fs = 1e-12f;
+                double denom = (double)xScale * (double)fs;
+                double q = (double)bf[c] / denom;
+                if (q >  2147483647.0) q =  2147483647.0;
+                if (q < -2147483648.0) q = -2147483648.0;
+                biasInt32[c] = (int32_t)llround(q);
+            }
+            ge::TensorPtr biasTensor = std::make_shared<ge::Tensor>();
+            ge::TensorDesc bdesc(ge::Shape({1, bc, 1, 1}),
+                                  ge::FORMAT_NCHW, ge::DT_INT32);
+            biasTensor->SetTensorDesc(bdesc);
+            biasTensor->SetData((uint8_t*)biasInt32.data(), bc * sizeof(int32_t));
+            biasConst.set_attr_value(biasTensor);
+        }
+
+        // Pad mode
+        if (PadMode_VALID == conv2DCommon->padMode()) {
+            padMode = "VALID";
+        } else if (PadMode_SAME == conv2DCommon->padMode()) {
+            padMode = "SAME";
+            pads = {0, 0, 0, 0};
+        }
+
+        qconv.set_input_x(inputData)
+             .set_input_filter(weightConst)
+             .set_attr_strides(ge::AttrValue::LIST_INT({strideY, strideX}))
+             .set_attr_dilations(ge::AttrValue::LIST_INT({dilateY, dilateX}))
+             .set_attr_pads(pads)
+             .set_attr_pad_mode(padMode)
+             .set_attr_groups(group)
+             .set_attr_data_format("NCHW")
+             .set_attr_x_quant_type(xQuantType)
+             .set_attr_filter_quant_type(1)
+             .set_attr_x_quant_scale(xScale)
+             .set_attr_x_quant_offset(0)
+             .set_attr_filter_quant_scales(scalesVec);
+        if (hasBias) {
+            qconv.set_input_bias(biasConst);
+        }
+        graphOutput = &qconv;
+    } else if (mUseMatMul) {
         padMode = "N/A(matmul)";
         // ── MatMul path ────────────────────────────────────────────────
         // Raw byte layout for input/output/weight is identical to NCHW with
@@ -411,8 +577,12 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
 #if HIAI_VERBOSE
     int ic = (weightSize > 0 && kernelX > 0 && kernelY > 0 && outputCount > 0)
              ? weightSize / (kernelX * kernelY * outputCount) : -1;
-    printf("[HiAI CONV] op=%s  path=%s\n", mOpName.c_str(),
-           mUseMatMul ? "MatMul" : "Convolution");
+    const char* pathStr = mUseQuantized
+        ? (mUseFullQuant ? "QuantizedConvolution(int8 MAC)"
+                         : "QuantizedConvolution(int8 weight, fp16 MAC)")
+        : (mUseMatMul ? "MatMul" : "Convolution");
+    printf("[HiAI CONV] op=%s  path=%s\n", mOpName.c_str(), pathStr);
+    (void)convForced;
     printf("  input : N=%d C=%d H=%d W=%d\n", batch, inputChannel, inputHeight, inputWidth);
     printf("  output: N=%d C=%d H=%d W=%d\n", outBatch, outChannel, outHeight, outWidth);
     printf("  kernel: kH=%d kW=%d  stride: sH=%d sW=%d  dilation: dH=%d dW=%d\n",
@@ -426,6 +596,10 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
            (conv2D->bias() != nullptr || (inputs.size() == 3)) ? "yes" : "no",
            conv2DCommon->relu() ? "yes" : "no",
            conv2DCommon->relu6() ? "yes" : "no");
+    if (mUseQuantized) {
+        printf("  quant : filter=DT_INT8 oc=%d  scales(per-channel)=%d  input=fp32\n",
+               outputCount, (int)(quantCommon ? quantCommon->alpha.size() : 0));
+    }
     fflush(stdout);
 #endif
 
@@ -453,6 +627,20 @@ ErrorCode HiAIConvExecution::onResize(const std::vector<Tensor*>& inputs,
     }
 
     auto code = compileHiAIModel(inputs, outputs);
+    if (code != NO_ERROR && mUseQuantized && !mDisableQuantRetry) {
+        // The int8 QuantizedConvolution IR build just failed (firmware or
+        // driver doesn't accept this op variant). Retry once on the plain
+        // dequant→fp32 path so we stay on the NPU instead of falling all the
+        // way back to CPU.
+        printf("[HiAI Delegate] int8 path failed, retrying with dequant fp32: %s\n",
+               mOpName.c_str());
+        if (mMgrClient != nullptr) {
+            mMgrClient->UnLoadModel();
+            mMgrClient = nullptr;
+        }
+        mDisableQuantRetry = true;
+        code = compileHiAIModel(inputs, outputs);
+    }
     if (code != NO_ERROR) {
         printf("[HiAI Delegate] Compile failed for %s, falling back\n", mOpName.c_str());
         return code;

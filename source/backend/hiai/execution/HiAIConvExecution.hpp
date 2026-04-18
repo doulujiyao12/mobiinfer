@@ -82,6 +82,22 @@ private:
     // using MatMul directly on the Da Vinci CUBE.
     bool mUseMatMul = false;
 
+    // True when the op is a weight-quantized conv whose symmetric per-channel
+    // int8 filter is used directly by hiai::op::QuantizedConvolution (runs on
+    // Da Vinci CUBE's int8 MAC path). False means dequantize to fp32 and fall
+    // back to the regular Convolution/MatMul path.
+    bool mUseQuantized = false;
+
+    // When true AND mUseQuantized, also set x_quant_type=1 so the NPU runs
+    // genuine int8×int8 MAC (reads HIAI_INT8_X_SCALE env for x_quant_scale;
+    // default 1/127). Accuracy is rough by design — mode is meant for perf
+    // A/B. When false, x_quant_type=0 → fp16 MAC with int8 weight storage.
+    bool mUseFullQuant = false;
+
+    // Set by onResize to temporarily force the dequant fp32 path when the int8
+    // QuantizedConvolution graph failed to compile on this firmware.
+    bool mDisableQuantRetry = false;
+
     // Counter for unique model names
     static int sModelCounter;
 };
