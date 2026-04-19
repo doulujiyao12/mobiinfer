@@ -107,6 +107,10 @@ private:
     // Mutually exclusive with mUseQuantized.
     bool mUseMatMulInt8 = false;
 
+    // Similar to mUseMatMulInt8 but uses hiai::op::QuantizedFullyConnection.
+    // Triggered by HIAI_CONV_QUANT="fc_int8".
+    bool mUseFCInt8 = false;
+
     // Set by onResize to temporarily force the dequant fp32 path when the int8
     // QuantizedConvolution graph failed to compile on this firmware.
     bool mDisableQuantRetry = false;

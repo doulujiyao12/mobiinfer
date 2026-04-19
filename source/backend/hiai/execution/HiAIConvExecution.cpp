@@ -16,7 +16,7 @@
 
 // Set to 1 (or pass -DHIAI_VERBOSE=1 to compiler) to print detailed op info at compile time
 #ifndef HIAI_VERBOSE
-#define HIAI_VERBOSE 0
+#define HIAI_VERBOSE 1
 #endif
 
 // Gate for the int8-path diagnostic helpers (isolation probe, extra failure
@@ -24,7 +24,7 @@
 // hunting the BuildIRModel failure; pass -DHIAI_INT8_DIAG=0 to strip the
 // code & output once the int8 path works.
 #ifndef HIAI_INT8_DIAG
-#define HIAI_INT8_DIAG 0
+#define HIAI_INT8_DIAG 1
 #endif
 
 namespace MNN {
@@ -200,6 +200,214 @@ static bool probeQuantizedMatMul(int batch, int inputChannel, int outputCount,
     subProbeQMatMulPerChannelBias(batch, inputChannel, outputCount, tag);
     return true;
 }
+
+// Shared QuantizedFullyConnection graph builder for all QFC-variant sub-probes.
+// Shapes mirror the main qfc path (matches mindspore reference impl):
+//   x: [N, IC]  ND  DT_FLOAT   (2D — 4D NCHW + axis=1 was rejected on DDK 109.633)
+//   w: [OC, IC] ND  DT_INT8
+//   b: [OC]     ND  DT_INT32   (1D — spec requires)
+// perChannel=false → w_quant_scales has length 1 (per-tensor weight scale)
+// perChannel=true  → w_quant_scales has length OC (per-channel)
+// withBias=true    → attach a zero int32 1D bias const of length OC
+static bool tryBuildQFC(int batch, int inputChannel, int outputCount,
+                        bool perChannel, bool withBias,
+                        const std::string& name) {
+    hiai::op::Data data(name + "_in");
+    ge::TensorDesc desc(ge::Shape({batch, inputChannel}),
+                         ge::FORMAT_ND, ge::DT_FLOAT);
+    data.update_input_desc_x(desc);
+
+    hiai::op::Const w(name + "_w");
+    {
+        ge::TensorPtr t = std::make_shared<ge::Tensor>();
+        ge::TensorDesc fdesc(ge::Shape({outputCount, inputChannel}),
+                              ge::FORMAT_ND, ge::DT_INT8);
+        t->SetTensorDesc(fdesc);
+        std::vector<int8_t> ones((size_t)outputCount * (size_t)inputChannel, 1);
+        t->SetData((uint8_t*)ones.data(), ones.size() * sizeof(int8_t));
+        w.set_attr_value(t);
+    }
+
+    std::vector<float> wScales(perChannel ? outputCount : 1, 1.0f / 127.0f);
+
+    hiai::op::Const biasConst(name + "_bias");
+    if (withBias) {
+        ge::TensorPtr t = std::make_shared<ge::Tensor>();
+        ge::TensorDesc bdesc(ge::Shape({outputCount}), ge::FORMAT_ND, ge::DT_INT32);
+        t->SetTensorDesc(bdesc);
+        std::vector<int32_t> zeros(outputCount, 0);
+        t->SetData((uint8_t*)zeros.data(), zeros.size() * sizeof(int32_t));
+        biasConst.set_attr_value(t);
+    }
+
+    hiai::op::QuantizedFullyConnection qfc(name + "_qfc");
+    qfc.set_input_x(data)
+       .set_input_w(w)
+       .set_attr_num_output(outputCount)
+       .set_attr_transpose(false)
+       .set_attr_axis(1)
+       .set_attr_x_quant_type(1)
+       .set_attr_w_quant_type(1)
+       .set_attr_x_quant_scale(1.0f / 127.0f)
+       .set_attr_x_quant_offset(0)
+       .set_attr_w_quant_scales(wScales);
+    if (withBias) qfc.set_input_b(biasConst);
+
+    ge::Graph graph(name + "_graph");
+    std::vector<ge::Operator> ins{data};
+    std::vector<ge::Operator> outs{qfc};
+    graph.SetInputs(ins).SetOutputs(outs);
+    return tryBuildGraph(graph, name);
+}
+
+// Sub-probe QFC-pt:    per-tensor weight scale (list size 1), no bias.
+// Sub-probe QFC-pc:    per-OC weight scales (list size OC), no bias.
+// Sub-probe QFC-pc+b:  per-OC weight scales + 1D int32 bias.
+//                      This is the full shape of the main-path graph.
+static bool subProbeQFCPerTensor(int batch, int inputChannel, int outputCount, const std::string& tag) {
+    bool ok = tryBuildQFC(batch, inputChannel, outputCount,
+                           /*perChannel*/false, /*withBias*/false,
+                           "hiai_subQFCpt_" + tag);
+    printf("[HiAI Diag] sub-probe(QFC-pt)      QuantizedFC per-tensor           build = %s\n",
+           ok ? "OK" : "FAIL");
+    return ok;
+}
+static bool subProbeQFCPerChannel(int batch, int inputChannel, int outputCount, const std::string& tag) {
+    bool ok = tryBuildQFC(batch, inputChannel, outputCount,
+                           /*perChannel*/true, /*withBias*/false,
+                           "hiai_subQFCpc_" + tag);
+    printf("[HiAI Diag] sub-probe(QFC-pc)      QuantizedFC per-channel          build = %s\n",
+           ok ? "OK" : "FAIL");
+    return ok;
+}
+static bool subProbeQFCPerChannelBias(int batch, int inputChannel, int outputCount, const std::string& tag) {
+    bool ok = tryBuildQFC(batch, inputChannel, outputCount,
+                           /*perChannel*/true, /*withBias*/true,
+                           "hiai_subQFCpcb_" + tag);
+    printf("[HiAI Diag] sub-probe(QFC-pc+bias) QuantizedFC per-channel+bias     build = %s\n",
+           ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// Sub-probe QFC-rs: mimic mindspore's working pattern exactly:
+//   Data([N, IC, 1, 1] NCHW) -> Reshape(shape const = [N, IC]) -> QFC(per-tensor, no bias)
+// If QFC-pt (direct Data→QFC) FAILs but QFC-rs OKs, the DDK's QFC lowering
+// requires an explicit Reshape op upstream — x coming straight from Data is
+// rejected by the pattern-match rule. That would mean the main-path fix is
+// to insert an hiai::op::Reshape before feeding QFC.
+static bool subProbeQFCWithReshape(int batch, int inputChannel, int outputCount, const std::string& tag) {
+    std::string name = "hiai_subQFCrs_" + tag;
+
+    // Data: keep 4D NCHW (mindspore's input is typically 4D before reshape)
+    hiai::op::Data data(name + "_in");
+    ge::TensorDesc ddesc(ge::Shape({batch, inputChannel, 1, 1}),
+                          ge::FORMAT_NCHW, ge::DT_FLOAT);
+    data.update_input_desc_x(ddesc);
+
+    // Reshape shape const: 1D int32 tensor of 2 elements → target shape [N, IC]
+    hiai::op::Const shapeConst(name + "_rs_shape");
+    {
+        ge::TensorPtr t = std::make_shared<ge::Tensor>();
+        ge::TensorDesc sdesc(ge::Shape({2}), ge::FORMAT_NCHW, ge::DT_INT32);
+        t->SetTensorDesc(sdesc);
+        std::vector<int32_t> shp = {batch, inputChannel};
+        t->SetData((uint8_t*)shp.data(), shp.size() * sizeof(int32_t));
+        shapeConst.set_attr_value(t);
+    }
+    hiai::op::Reshape reshape(name + "_rs");
+    reshape.set_input_x(data).set_input_shape(shapeConst);
+
+    // Weight: 2D [OC, IC] ND int8
+    hiai::op::Const w(name + "_w");
+    {
+        ge::TensorPtr t = std::make_shared<ge::Tensor>();
+        ge::TensorDesc fdesc(ge::Shape({outputCount, inputChannel}), ge::FORMAT_ND, ge::DT_INT8);
+        t->SetTensorDesc(fdesc);
+        std::vector<int8_t> ones((size_t)outputCount * (size_t)inputChannel, 1);
+        t->SetData((uint8_t*)ones.data(), ones.size() * sizeof(int8_t));
+        w.set_attr_value(t);
+    }
+
+    hiai::op::QuantizedFullyConnection qfc(name + "_qfc");
+    std::vector<float> wScales(1, 1.0f / 127.0f);
+    qfc.set_input_x(reshape)          // ← x comes from Reshape, not Data
+       .set_input_w(w)
+       .set_attr_num_output(outputCount)
+       .set_attr_x_quant_type(1)
+       .set_attr_w_quant_type(1)
+       .set_attr_x_quant_scale(1.0f / 127.0f)
+       .set_attr_x_quant_offset(0)
+       .set_attr_w_quant_scales(wScales);
+
+    ge::Graph graph(name + "_graph");
+    std::vector<ge::Operator> ins{data};
+    std::vector<ge::Operator> outs{qfc};
+    graph.SetInputs(ins).SetOutputs(outs);
+    bool ok = tryBuildGraph(graph, name);
+    printf("[HiAI Diag] sub-probe(QFC-rs)      Data->Reshape->QFC per-tensor    build = %s\n",
+           ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// Sub-probe FC-fp: plain hiai::op::FullyConnection with float weight, no quant.
+// Purpose: confirm whether the FullyConnection op *family* is at all lower-able
+// on this DDK. If QFC variants all FAIL but FC-fp OK → QFC specifically not
+// implemented (use matmul_int8 instead). If FC-fp also FAILs → the FC family
+// itself is broken on this DDK / shape.
+static bool subProbeFCFloat(int batch, int inputChannel, int outputCount, const std::string& tag) {
+    std::string name = "hiai_subFCfp_" + tag;
+
+    hiai::op::Data data(name + "_in");
+    ge::TensorDesc ddesc(ge::Shape({batch, inputChannel}), ge::FORMAT_ND, ge::DT_FLOAT);
+    data.update_input_desc_x(ddesc);
+
+    hiai::op::Const w(name + "_w");
+    {
+        ge::TensorPtr t = std::make_shared<ge::Tensor>();
+        ge::TensorDesc fdesc(ge::Shape({outputCount, inputChannel}), ge::FORMAT_ND, ge::DT_FLOAT);
+        t->SetTensorDesc(fdesc);
+        std::vector<float> ones((size_t)outputCount * (size_t)inputChannel, 1.0f);
+        t->SetData((uint8_t*)ones.data(), ones.size() * sizeof(float));
+        w.set_attr_value(t);
+    }
+
+    hiai::op::FullyConnection fc(name + "_fc");
+    fc.set_input_x(data)
+      .set_input_w(w)
+      .set_attr_num_output(outputCount);
+
+    ge::Graph graph(name + "_graph");
+    std::vector<ge::Operator> ins{data};
+    std::vector<ge::Operator> outs{fc};
+    graph.SetInputs(ins).SetOutputs(outs);
+    bool ok = tryBuildGraph(graph, name);
+    printf("[HiAI Diag] sub-probe(FC-fp)       FullyConnection(float) baseline  build = %s\n",
+           ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// Combined probe: runs all QFC isolations + two discriminators. Pinpoints
+// where BuildIRModel rejects the QuantizedFullyConnection main-path graph:
+//   QFC-pt FAIL                    → Data→QFC direct is rejected
+//   QFC-rs OK  (w/ QFC-pt FAIL)    → lowering needs explicit Reshape upstream.
+//                                    Fix main path by inserting hiai::op::Reshape.
+//   QFC-rs FAIL + FC-fp OK         → QFC op not implemented on this DDK (but
+//                                    plain FullyConnection is). Fall back to
+//                                    matmul_int8 or dequant→FC path.
+//   FC-fp FAIL                     → FullyConnection family unsupported for
+//                                    this shape. Give up FC entirely.
+//   QFC-pc FAIL (w/ QFC-pt OK)     → per-channel w_quant_scales rejected.
+//   QFC-pc+bias FAIL (others OK)   → 1D int32 bias wiring rejected.
+//   All OK but main-path FAIL      → shape / format mismatch vs real tensor.
+static bool probeQuantizedFC(int batch, int inputChannel, int outputCount,
+                             const std::string& tag) {
+    subProbeQFCPerTensor      (batch, inputChannel, outputCount, tag);
+    subProbeQFCPerChannel     (batch, inputChannel, outputCount, tag);
+    subProbeQFCPerChannelBias (batch, inputChannel, outputCount, tag);
+    subProbeQFCWithReshape    (batch, inputChannel, outputCount, tag);
+    subProbeFCFloat           (batch, inputChannel, outputCount, tag);
+    return true;
+}
 #endif // HIAI_INT8_DIAG
 
 static std::shared_ptr<hiai::AiModelMngerClient> loadSingleModel(
@@ -350,9 +558,12 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     //                    int8×int8 CUBE MAC + MatMul engine, fp32 out.
     //                    Only eligible when shape is 1×1 linear.
     //                    Requires HiAI firmware >= 100.500.010.010.
+    //   "fc_int8"     -> single hiai::op::QuantizedFullyConnection.
+    //                    Similar to matmul_int8 but natively supports per-channel.
     mUseQuantized = false;
     mUseFullQuant = false;
     mUseMatMulInt8 = false;
+    mUseFCInt8 = false;
     std::shared_ptr<ConvolutionCommon::Int8Common> quantCommon;
     bool quantAllowed = !mDisableQuantRetry;
     const char* quantModeStr = std::getenv("HIAI_CONV_QUANT");
@@ -363,6 +574,8 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
                           std::strcmp(quantModeStr, "full") == 0);
     bool wantMatMulInt8 = (quantAllowed && quantModeStr &&
                            std::strcmp(quantModeStr, "matmul_int8") == 0);
+    bool wantFCInt8 = (quantAllowed && quantModeStr &&
+                       std::strcmp(quantModeStr, "fc_int8") == 0);
     if (quantAllowed && !matmulForced && conv2D->quanParameter() != nullptr) {
         quantCommon = ConvolutionCommon::load(mOp, backend(), false, true);
         if (quantCommon != nullptr && quantCommon->weight.get() != nullptr &&
@@ -371,7 +584,7 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
             (int)quantCommon->alpha.size() == outputCount &&
             quantCommon->originBits == 8 &&
             !quantCommon->canUseInt4) {
-            // Prefer matmul_int8 when requested AND shape qualifies.
+            // Prefer matmul_int8/fc_int8 when requested AND shape qualifies.
             // Falls back to QuantizedConvolution (per-channel weight-only or
             // full) when shape unsuitable — user intent (int8 on NPU) preserved.
             bool shape1x1Linear = isMatMulConvertedConv(conv2DCommon,
@@ -379,6 +592,9 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
             if (wantMatMulInt8 && shape1x1Linear && !matmulForced) {
                 mUseMatMulInt8 = true;
                 mUseMatMul     = false;  // handled by our own MatMul op
+            } else if (wantFCInt8 && shape1x1Linear && !matmulForced) {
+                mUseFCInt8     = true;
+                mUseMatMul     = false;
             } else {
                 mUseQuantized = true;
                 mUseFullQuant = wantFullQuant;
@@ -401,7 +617,7 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     // Fallback: if we're NOT going to use any real int8 path, the existing
     // quanParameter block must still dequantize to fp32 so the float graph
     // sees a real weight tensor.
-    if (!mUseQuantized && !mUseMatMulInt8 && conv2D->quanParameter() != nullptr) {
+    if (!mUseQuantized && !mUseMatMulInt8 && !mUseFCInt8 && conv2D->quanParameter() != nullptr) {
         quanCommon = ConvolutionCommon::load(mOp, backend(), true);
         if (quanCommon != nullptr && quanCommon->weightFloat.get() != nullptr) {
             filterDataPtr = quanCommon->weightFloat.get();
@@ -422,12 +638,98 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
     hiai::op::Activation         reluOp(mModelName + "_relu");
     // QuantizedMatMul op for the matmul_int8 path (see math_defs.h:484).
     hiai::op::QuantizedMatMul    qmm(mModelName + "_qmm");
+    // QuantizedFullyConnection for the fc_int8 path (see nn_defs.h).
+    hiai::op::QuantizedFullyConnection qfc(mModelName + "_qfc");
 
     ge::Operator* graphOutput = nullptr;
     bool hasBias = false;
     const char* padMode = "SPECIFIC";  // only meaningful in Convolution path; kept here for verbose log
 
-    if (mUseMatMulInt8) {
+    if (mUseFCInt8) {
+        padMode = "N/A(qfc)";
+        
+        float sX = 1.0f / 127.0f;
+        if (const char* s = std::getenv("HIAI_INT8_X_SCALE")) {
+            float v = (float)std::atof(s);
+            if (v > 0.0f && std::isfinite(v)) sX = v;
+        }
+
+        // Input shape: 2D [N, IC] FORMAT_ND.
+        // Mindspore's working QFC reference explicitly reshapes x to 2D before
+        // feeding the op (see its fullconnection_int8_npu.cc). The 4D NCHW
+        // [N, IC, 1, 1] + axis=1 form from the HiAI spec example was rejected
+        // by BuildIRModel on DDK 109.633; the backend lowering only accepts
+        // rank==2 x. Byte layout is identical (IC*1*1 bytes per row) — we
+        // just relabel the shape.
+        ge::TensorDesc inputDesc(ge::Shape({batch, inputChannel}),
+                                  ge::FORMAT_ND, ge::DT_FLOAT);
+        inputData.update_input_desc_x(inputDesc);
+
+        // Weight: 2D [OC, IC] FORMAT_ND. Same relabel — raw bytes unchanged.
+        const int8_t* wPtr = quantCommon->weight.get();
+        int wLen           = quantCommon->weight.size();
+        {
+            ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+            ge::TensorDesc fdesc(ge::Shape({outputCount, inputChannel}),
+                                  ge::FORMAT_ND, ge::DT_INT8);
+            filter->SetTensorDesc(fdesc);
+            filter->SetData((uint8_t*)wPtr, wLen * sizeof(int8_t));
+            weightConst.set_attr_value(filter);
+        }
+
+        // Scales: length OC
+        const float* wScale = quantCommon->alpha.get();
+        std::vector<float> wScales(wScale, wScale + outputCount);
+
+        // Bias (if any) -> Int32 [1, OC, 1, 1]
+        bool hasRealBias = false;
+        if (conv2D->bias() != nullptr && conv2D->bias()->size() > 0) {
+            hasRealBias = true;
+            const float* bf = conv2D->bias()->data();
+            int          bc = conv2D->bias()->size();
+            std::vector<int32_t> biasInt32(outputCount, 0);
+            for (int c = 0; c < outputCount && c < bc; c++) {
+                float ws = wScale[c];
+                if (ws == 0.0f) ws = 1e-12f;
+                double denom = (double)sX * (double)ws;
+                double bInt  = (double)bf[c] / denom;
+                if (bInt >  2147483647.0) bInt =  2147483647.0;
+                if (bInt < -2147483648.0) bInt = -2147483648.0;
+                biasInt32[c] = (int32_t)llround(bInt);
+            }
+            ge::TensorPtr bt = std::make_shared<ge::Tensor>();
+            // nn_defs.h:687 — "b : 1D tensor for bias, must be a Const-OP."
+            // 4D [1,OC,1,1] NCHW was rejected by BuildIRModel on DDK 109.633.
+            ge::TensorDesc bdesc(ge::Shape({outputCount}),
+                                  ge::FORMAT_ND, ge::DT_INT32);
+            bt->SetTensorDesc(bdesc);
+            bt->SetData((uint8_t*)biasInt32.data(),
+                        outputCount * sizeof(int32_t));
+            biasConst.set_attr_value(bt);
+        }
+
+        qfc.set_input_x(inputData)
+           .set_input_w(weightConst)
+           .set_attr_num_output(outputCount)
+           .set_attr_transpose(false)  // The data is OCxIC in NCHW, so it's already properly aligned for false (OI/HW).
+           .set_attr_axis(1)
+           .set_attr_x_quant_type(1)
+           .set_attr_w_quant_type(1)
+           .set_attr_x_quant_scale(sX)
+           .set_attr_x_quant_offset(0)
+           .set_attr_w_quant_scales(wScales);
+        
+        if (hasRealBias) {
+            qfc.set_input_b(biasConst);
+        }
+        graphOutput = &qfc;
+
+#if HIAI_INT8_DIAG
+        printf("[HiAI qfc BUILD] op=%s\n", mOpName.c_str());
+        printf("    QuantizedFullyConnection: x=fp32[%d,%d] w=int8[%d,%d] bias=%s\n",
+               batch, inputChannel, outputCount, inputChannel, hasRealBias ? "int32[OC]" : "none");
+#endif
+    } else if (mUseMatMulInt8) {
         // ── QuantizedMatMul path ──────────────────────────────────────────
         // Single op: hiai::op::QuantizedMatMul (math_defs.h:484, available
         // since HiAI v100.500.010.010). x1 stays fp32 at the graph boundary;
@@ -796,20 +1098,22 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
 #if HIAI_INT8_DIAG
         printf("[HiAI Delegate] BuildIRModel failed for %s (path=%s)\n",
                mOpName.c_str(),
-               mUseMatMulInt8 ? "qmatmul"
+               mUseFCInt8 ? "qfc" :
+               (mUseMatMulInt8 ? "qmatmul"
                                : (mUseQuantized ? (mUseFullQuant ? "qconv_full" : "qconv_woonly")
-                                                : (mUseMatMul ? "matmul" : "conv")));
+                                                : (mUseMatMul ? "matmul" : "conv"))));
         printf("[HiAI Diag] model.Save size=%zu bytes, CreateModelBuff out_size=%u\n",
                buffer.GetSize(), (unsigned)omModelBuff.length);
         // Run isolation probes. For the qmatmul path we test: float MatMul
         // baseline → QuantizedMatMul per-tensor → per-channel → per-channel+bias.
-        // Ladder of FAILs pinpoints which attr/shape the DDK rejects.
-        if (mUseMatMulInt8) {
+        // ladder of FAILs pinpoints which attr/shape the DDK rejects.
+        if (mUseMatMulInt8 || mUseFCInt8) {
             auto* inputTensor = inputs[0];
             int bProbe  = inputTensor->batch();
             int cProbe  = inputTensor->channel();
             int ocProbe = outputs[0]->channel();
-            probeQuantizedMatMul(bProbe, cProbe, ocProbe, mOpName);
+            if (mUseMatMulInt8) probeQuantizedMatMul(bProbe, cProbe, ocProbe, mOpName);
+            if (mUseFCInt8)     probeQuantizedFC    (bProbe, cProbe, ocProbe, mOpName);
         }
 #else
         printf("[HiAI Delegate] BuildIRModel failed for %s\n", mOpName.c_str());
@@ -877,12 +1181,14 @@ ErrorCode HiAIConvExecution::compileHiAIModel(const std::vector<Tensor*>& inputs
 #if HIAI_VERBOSE
     int ic = (weightSize > 0 && kernelX > 0 && kernelY > 0 && outputCount > 0)
              ? weightSize / (kernelX * kernelY * outputCount) : -1;
-    const char* pathStr = mUseMatMulInt8
-        ? "QuantizedMatMul(int8 MAC)"
-        : (mUseQuantized
-           ? (mUseFullQuant ? "QuantizedConvolution(int8 MAC)"
-                            : "QuantizedConvolution(int8 weight, fp16 MAC)")
-           : (mUseMatMul ? "MatMul" : "Convolution"));
+    const char* pathStr = mUseFCInt8
+        ? "QuantizedFullyConnection(int8 MAC)"
+        : (mUseMatMulInt8
+           ? "QuantizedMatMul(int8 MAC)"
+           : (mUseQuantized
+              ? (mUseFullQuant ? "QuantizedConvolution(int8 MAC)"
+                               : "QuantizedConvolution(int8 weight, fp16 MAC)")
+              : (mUseMatMul ? "MatMul" : "Convolution")));
     printf("[HiAI CONV] op=%s  path=%s\n", mOpName.c_str(), pathStr);
     (void)convForced;
     printf("  input : N=%d C=%d H=%d W=%d\n", batch, inputChannel, inputHeight, inputWidth);

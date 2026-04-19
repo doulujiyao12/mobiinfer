@@ -523,7 +523,17 @@ class LlmExporter(torch.nn.Module):
                 quant_bit_visual = self.args.visual_quant_bit
             if self.args.visual_quant_block is not None:
                 quant_block_visual = self.args.visual_quant_block
-            if self.args.visual_gptq_path is not None:
+            if self.args.visual_keep_matmul:
+                # fp16 + MatMul preserved (no MatMul->Conv fold). No GPTQ applied.
+                self.mnn_converter.export_visual_fp16_matmul(
+                    vision_onnx,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym,
+                    slim_json=not self.args.visual_json_full,
+                    emit_json=not self.args.visual_no_json
+                )
+            elif self.args.visual_gptq_path is not None:
                 # GPTQ path: onnx2mnn(fp16) -> mnn2json -> apply visual gptq(blocks->int8) -> json2mnn
                 # merger/deepstack/patch_embed keep fp16, only blocks are replaced with GPTQ int8
                 self.mnn_converter.export_visual_with_gptq(
@@ -741,6 +751,9 @@ def build_args(parser):
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
     parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
+    parser.add_argument('--visual_keep_matmul', action='store_true', help='Export visual model as fp16 with MatMul preserved (no MatMul->Conv fold). No GPTQ applied. Overrides --visual_gptq_path.')
+    parser.add_argument('--visual_json_full', action='store_true', help='Keep full (un-slimmed) visual.mnn.json with inline weight arrays. Only effective with --visual_keep_matmul. Default: slim (strip weight arrays).')
+    parser.add_argument('--visual_no_json', action='store_true', help='Skip visual.mnn.json generation entirely (mnn2json step is memory-heavy on large fp16 models). Only effective with --visual_keep_matmul.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import copy
 import json
 import torch
@@ -61,7 +62,7 @@ class MNNConverter:
             log_fp.close()
 
     @spinner_run(f'convert onnx model to ')
-    def onnx2mnn(self, onnx_path, mnn_path, args = [], transformer_fuse = True, group_conv_native = False, weight_sym = False, save_external_data = True):
+    def onnx2mnn(self, onnx_path, mnn_path, args = [], transformer_fuse = True, group_conv_native = False, weight_sym = False, save_external_data = True, keep_matmul = False):
         convert_args = [
             '',
             '-f',
@@ -80,6 +81,8 @@ class MNNConverter:
             convert_args += ['--weightQuantAsymmetric=0']
         if save_external_data:
             convert_args += ['--saveExternalData']
+        if keep_matmul:
+            convert_args += ['--convertMatmulToConv=0']
         if self.args.hqq:
             convert_args += ['--hqq']
         convert_args += args
@@ -98,6 +101,26 @@ class MNNConverter:
         ]
         self.convert(convert_args)
         return json_path
+
+    @staticmethod
+    def slim_mnn_json(json_path, min_array_bytes=1024):
+        # mnn2json emits each large inline weight array on its own line as `[ ... ]`.
+        # Replace those with `[]` so the JSON stays loadable but loses the bulk payload.
+        # The .mnn file is untouched; inference reads .mnn, not .json.
+        tmp_path = json_path + '.slim.tmp'
+        original_size = os.path.getsize(json_path)
+        with open(json_path, 'r') as fin, open(tmp_path, 'w') as fout:
+            for line in fin:
+                stripped = line.lstrip()
+                if (len(line) > min_array_bytes
+                        and stripped.startswith('[')
+                        and line.rstrip().endswith(']')):
+                    fout.write('[]\n')
+                else:
+                    fout.write(line)
+        os.replace(tmp_path, json_path)
+        slimmed_size = os.path.getsize(json_path)
+        return original_size, slimmed_size
 
     def json2mnn(self, json_path, mnn_path):
         convert_args = [
@@ -256,6 +279,53 @@ class MNNConverter:
         self.mnn2json(self.mnn_model_path, mnn_json)
         self.apply_visual_gptq(mnn_json, visual_gptq_path, quant_block)
         self.json2mnn(mnn_json, self.mnn_model_path)
+
+    def export_visual_fp16_matmul(self, onnx_path,
+                                   transformer_fuse=True, group_conv_native=False,
+                                   weight_sym=None, slim_json=True, emit_json=True):
+        """Visual fp16 export with MatMul preserved (no MatMul->Conv conversion).
+
+        Pipeline: onnx2mnn(--fp16 --convertMatmulToConv=0) -> mnn2json
+        Produces visual.mnn + visual.mnn.weight + visual.mnn.json where linear/matmul
+        ops remain as MatMul (with a Const fp16 weight input) instead of being folded
+        into kernel 1x1 Convolution. No GPTQ weight replacement is performed.
+
+        Note: fp16 Const weights stay inline in the .mnn file because MNN converter's
+        RemoveAndStoreParam does not externalize DT_HALF Blobs. The resulting .mnn and
+        .json files are therefore larger than the conv-folded version.
+        """
+        self.onnx_model_path = onnx_path
+        self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
+        self.mnn_model_path = os.path.join(self.args.dst_path, self.mnn_name)
+        self.mnn_weight_path = f'{self.mnn_model_path}.weight'
+        if weight_sym is None:
+            weight_sym = self.args.sym
+        self.onnx2mnn(self.onnx_model_path, self.mnn_model_path,
+                      ['--fp16'], transformer_fuse=transformer_fuse,
+                      group_conv_native=group_conv_native,
+                      weight_sym=weight_sym,
+                      keep_matmul=True)
+        if not emit_json:
+            print(f'[visual fp16] skip mnn2json (--visual_no_json). Only {self.mnn_model_path} is produced.', flush=True)
+            return
+        mnn_json = f'{self.mnn_model_path}.json'
+        print(f'[visual fp16] dumping mnn -> json. Note: mnnconvert buffers the entire JSON in memory and writes at the end, so the file stays 0 bytes for most of the duration. This is NOT a hang.', flush=True)
+        print(f'[visual fp16] manual repro: python -c "import sys; sys.argv=[\'\', \'-f\', \'MNN\', \'--modelFile\', \'{self.mnn_model_path}\', \'--JsonFile\', \'{mnn_json}\']; from MNN.tools import mnnconvert; mnnconvert.main()"', flush=True)
+        t0 = time.time()
+        # Do NOT redirect mnn2json stdout: we want live progress visible for this slow step.
+        sys.argv = ['', '-f', 'MNN', '--modelFile', str(self.mnn_model_path), '--JsonFile', str(mnn_json)]
+        try:
+            from MNN.tools import mnnconvert
+            mnnconvert.main()
+        finally:
+            sys.argv = []
+        print(f'[visual fp16] mnn2json done in {time.time()-t0:.1f}s', flush=True)
+        if slim_json:
+            t1 = time.time()
+            orig, slim = self.slim_mnn_json(mnn_json)
+            print(f'[visual fp16] slim done in {time.time()-t1:.1f}s: {orig/1e9:.2f}GB -> {slim/1e6:.2f}MB', flush=True)
+        else:
+            print(f'[visual fp16] keeping full JSON ({os.path.getsize(mnn_json)/1e9:.2f}GB, slim disabled)', flush=True)
 
     @spinner_run(f'export split lora to ')
     def export_lora(self, mnn_json):

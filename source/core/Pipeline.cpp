@@ -7,6 +7,7 @@
 //
 
 #include <string.h>
+// #include <fstream>
 #include "core/Pipeline.hpp"
 #include "core/Backend.hpp"
 #include "core/Macro.h"
@@ -18,7 +19,7 @@
 
 // TODO: Find better way for debug
 //#define MNN_OP_SEPERATE
-//#define MNN_PIPELINE_DEBUG
+// #define MNN_PIPELINE_DEBUG
 namespace MNN {
 static std::set<OpType> _getQuantPropagateOp(Runtime::CompilerType type) {
     std::set<OpType> propagateOpTypes = { OpType_Raster, OpType_ReLU, OpType_ReLU6, OpType_Pooling,
@@ -560,11 +561,28 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
                     cached         = true;
                 }
             }
+            // Dump every op that enters the pipeline to op.txt (append mode,
+            // file opened once per process).
+            // {
+            //     static std::ofstream sOpDumpFile("op.txt", std::ios::out | std::ios::app);
+            //     if (sOpDumpFile.is_open()) {
+            //         sOpDumpFile << EnumNameOpType(iter.op->type())
+            //                     << "\t"
+            //                     << (iter.op->name() ? iter.op->name()->c_str() : "?")
+            //                     << (cached ? "\tcached" : "")
+            //                     << "\n";
+            //         sOpDumpFile.flush();
+            //     }
+            // }
+
             std::shared_ptr<BufferStorage> tmpStorage;
             if (nullptr == iter.execution) {
                 iter.execution.reset(OpCommonUtils::createExecutionWithExternal(mBackend.get(), iter.inputs, iter.outputs, iter.op, &loader, tmpStorage));
             }
             if (nullptr == iter.execution) {
+                // 这里是"主 backend(NPU) 不支持，落到 backup
+                // backend(CPU)"
+                // MNN_PRINT("[FALLBACK] op type=%s name=%s -> backup backend\n", EnumNameOpType(iter.op->type()), iter.op->name() ? iter.op->name()->c_str(): "?");
                 // Try Backup
                 iter.execution.reset(OpCommonUtils::createExecutionWithExternal(mBackupBackend.get(), iter.inputs, iter.outputs, iter.op, &loader, tmpStorage));
                 if (nullptr == iter.execution) {
