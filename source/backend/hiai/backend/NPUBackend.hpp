@@ -352,6 +352,12 @@ namespace MNN {
         map<int, int> mSclipMap;
         map<unsigned long, int> mInputMap;
 
+        // Added for Memory Optimization
+        std::map<const Tensor*, int> mConstRefCounts;
+        std::set<const Tensor*> mKeepConsts;
+        void consumeConst(const Tensor* tensor);
+        void addConstRef(const Tensor* tensor);
+
         // For Data inputs with rank > 4 that had unit dims squeezed so the HiAI
         // Data op stays within the 4-D DDK limit, this maps inputIndex -> list
         // of dim positions that were removed. Consumers (e.g. NPUGatherV2 applied

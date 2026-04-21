@@ -62,31 +62,40 @@ ErrorCode NPUConvolution::onResize(const std::vector<Tensor *> &inputs, const st
     }
 
     shared_ptr<hiai::op::Convolution> conv(new hiai::op::Convolution(opName));
-    mConst_w = hiai::op::Const(opName + "_w_const");
-    mConst_b = hiai::op::Const(opName + "_b_const");
     if (inputs.size() == 3 && conv2D->weight() == nullptr) {
         bool isConst1 = TensorUtils::getDescribe(inputs[1])->usage==Tensor::InsideDescribe::Usage::CONSTANT;
         bool isConst2 = TensorUtils::getDescribe(inputs[2])->usage==Tensor::InsideDescribe::Usage::CONSTANT;
         if (isConst1 && isConst2) {
-            {
-                weightSize = inputs[1]->elementSize();
-                int inputCount = weightSize / (kernelX * kernelY * outputCount);
-                ge::TensorDesc fdesc(ge::Shape({outputCount, inputCount, kernelY, kernelX}), ge::DT_FLOAT);
-                ge::TensorPtr filter = std::make_shared<ge::Tensor>();
-                filter->SetTensorDesc(fdesc);
-                filter->SetData((uint8_t *)inputs[1]->host<float>(), weightSize * sizeof(float));
-                mConst_w.set_attr_value(filter);
-            }
-            {
-                weightSize = inputs[2]->elementSize();
-                ge::TensorDesc fdesc(ge::Shape({1, outputCount, 1, 1}), ge::DT_FLOAT);
-                ge::TensorPtr filter = std::make_shared<ge::Tensor>();
-                filter->SetTensorDesc(fdesc);
-                filter->SetData((uint8_t *)inputs[2]->host<float>(), weightSize * sizeof(float));
-                mConst_b.set_attr_value(filter);
+            // Only (re)build mConst_w / mConst_b while the const tensor host memory is still alive.
+            // After consumeConst releases host on an earlier onResize, subsequent onResize calls reuse
+            // the already-populated mConst_w / mConst_b to avoid dereferencing a freed pointer.
+            if (inputs[1]->host<float>() != nullptr && inputs[2]->host<float>() != nullptr) {
+                mConst_w = hiai::op::Const(opName + "_w_const");
+                mConst_b = hiai::op::Const(opName + "_b_const");
+                {
+                    weightSize = inputs[1]->elementSize();
+                    int inputCount = weightSize / (kernelX * kernelY * outputCount);
+                    ge::TensorDesc fdesc(ge::Shape({outputCount, inputCount, kernelY, kernelX}), ge::DT_FLOAT);
+                    ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+                    filter->SetTensorDesc(fdesc);
+                    filter->SetData((uint8_t *)inputs[1]->host<float>(), weightSize * sizeof(float));
+                    mConst_w.set_attr_value(filter);
+                    mNpuBackend->consumeConst(inputs[1]);
+                }
+                {
+                    weightSize = inputs[2]->elementSize();
+                    ge::TensorDesc fdesc(ge::Shape({1, outputCount, 1, 1}), ge::DT_FLOAT);
+                    ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+                    filter->SetTensorDesc(fdesc);
+                    filter->SetData((uint8_t *)inputs[2]->host<float>(), weightSize * sizeof(float));
+                    mConst_b.set_attr_value(filter);
+                    mNpuBackend->consumeConst(inputs[2]);
+                }
             }
         }
     } else {
+        mConst_w = hiai::op::Const(opName + "_w_const");
+        mConst_b = hiai::op::Const(opName + "_b_const");
         if (filterDataPtr == nullptr) {
             weightSize = conv2D->weight()->size();
             filterDataPtr = conv2D->weight()->data();

@@ -51,6 +51,12 @@ ErrorCode NPUBatchMatMul::onResize(const std::vector<Tensor *> &inputs, const st
     auto opName = mOp->name()->str();
     bool isConst0 = TensorUtils::getDescribe(inputs[0])->usage==Tensor::InsideDescribe::Usage::CONSTANT;
     bool isConst1 = TensorUtils::getDescribe(inputs[1])->usage==Tensor::InsideDescribe::Usage::CONSTANT;
+
+    // Idempotent: only consume while host is alive. On a repeated onResize the const
+    // was already freed by an earlier consume, so skip to avoid spurious refcount work.
+    if (isConst0 && inputs[0]->host<void>() != nullptr) mNpuBackend->consumeConst(inputs[0]);
+    if (isConst1 && inputs[1]->host<void>() != nullptr) mNpuBackend->consumeConst(inputs[1]);
+
     auto param = mOp->main_as_BatchMatMulParam();
     shared_ptr<hiai::op::BatchMatMul> batchMatMul(new hiai::op::BatchMatMul(opName));
     if (isConst0 && !isConst1) {

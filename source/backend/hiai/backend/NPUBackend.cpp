@@ -459,6 +459,32 @@ namespace MNN {
         }
     }
 
+    void NPUBackend::addConstRef(const Tensor* tensor) {
+        if (tensor == nullptr) return;
+        if (TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT || 
+            TensorUtils::getDescribeOrigin(tensor)->mem.get() != nullptr) {
+            mConstRefCounts[tensor]++;
+        }
+    }
+
+    void NPUBackend::consumeConst(const Tensor* tensor) {
+        if (tensor == nullptr) return;
+        if (mKeepConsts.find(tensor) != mKeepConsts.end()) return;
+
+        auto iter = mConstRefCounts.find(tensor);
+        if (iter != mConstRefCounts.end()) {
+            iter->second--;
+            if (iter->second <= 0) {
+                auto des = TensorUtils::getDescribeOrigin(tensor);
+                if (des->mem.get() != nullptr) {
+                    des->mem = nullptr; 
+                    const_cast<Tensor*>(tensor)->buffer().host = nullptr;
+                }
+                mConstRefCounts.erase(iter);
+            }
+        }
+    }
+
     Execution* NPUBackend::onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op) {
 
         auto map = getCreatorMap();
@@ -479,6 +505,12 @@ namespace MNN {
 
         MNN_HIAI_LOG("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
                      (const void*)op, (int)op->type(), opName, inputs.size(), outputs.size());
+
+        for (auto input : inputs) {
+            if (TensorUtils::getDescribe(input)->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
+                addConstRef(input);
+            }
+        }
 
         auto exe = iter->second->onCreate(inputs, outputs, op, this);
 
@@ -540,6 +572,15 @@ namespace MNN {
             auto index = mInputMap.find((unsigned long)(const_cast<Tensor*>(dstTensor)));
             MNN_ASSERT(index != mInputMap.end());
             shared_ptr<hiai::AiTensor> input = mInputTensors[index->second];
+            if (srcTensor->host<void>() == nullptr) {
+                // Upstream (usually an earlier NPU chunk) did not materialize its
+                // output to host before this input-copy; without this guard we would
+                // memcpy(npu_buf, NULL, size) and crash. Caller should readMap the
+                // producer VARP between chunks.
+                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, skip memcpy\n",
+                          (int)input->GetSize());
+                return;
+            }
             memcpy(input->GetBuffer(), srcTensor->host<void>(), (size_t)input->GetSize());
         } else if(isOutputCopy){
             int index;
@@ -551,12 +592,17 @@ namespace MNN {
                 }
             }
             if(flag == false) {
-                MNN_PRINT("MNNTensor and HIAITensor mismatch!");
+                MNN_HIAI_LOG("MNNTensor and HIAITensor mismatch!");
                 return;
             }
 
             shared_ptr<hiai::AiTensor> output = mOutputTensors[index];
             Tensor* tmpTensor = const_cast<Tensor*>(dstTensor);
+            if (tmpTensor->buffer().host == nullptr) {
+                MNN_HIAI_LOG("[NPU] onCopyBuffer isOutputCopy: dst host is NULL, size=%d, skip memcpy\n",
+                          (int)output->GetSize());
+                return;
+            }
             memcpy(tmpTensor->buffer().host, output->GetBuffer(), (size_t)output->GetSize());
         }
 #ifdef HIAI_DEBUG
@@ -578,6 +624,8 @@ namespace MNN {
         mMNNOutTensors.clear();
         mSclipMap.clear();
         mInputSqueezedAxes.clear();
+        mConstRefCounts.clear();
+        mKeepConsts.clear();
         if (mMgrClient != nullptr) {
             mMgrClient->UnLoadModel();
         }

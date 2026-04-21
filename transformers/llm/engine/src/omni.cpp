@@ -590,7 +590,14 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                     return std::vector<int>(0);
                 }
                 curHidden = chunkOut[0];
+                // Each HiAI model has isolated ION I/O buffers, so chunk-to-chunk
+                // handoff must go through a host copy. Express allocates the host
+                // intermediate lazily; force materialize every chunk output to host
+                // here so the next chunk (or the CPU post-module) sees a populated
+                // host buffer and does not crash in NPUBackend::onCopyBuffer.
+                (void)curHidden->readMap<void>();
                 for (size_t j = 1; j < chunkOut.size(); j++) {
+                    (void)chunkOut[j]->readMap<void>();
                     allDeepstack.push_back(chunkOut[j]);
                 }
             }
