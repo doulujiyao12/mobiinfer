@@ -331,10 +331,18 @@ class LlmExporter(torch.nn.Module):
                 config['visual_blocks_model'] = 'visual_blocks.mnn'
                 config['visual_post_model'] = 'visual_post.mnn'
                 config['visual_blocks_backend_type'] = 'hiai'
-                # Optional NPU/CPU sub-split for the blocks module. Non-invasive:
-                # only added when the user opts in via --visual_npu_layers N > 0.
-                # Absent fields mean "use the monolithic visual_blocks.mnn above".
-                if getattr(self.args, 'visual_npu_layers', 0) > 0:
+                # K-chunk NPU split (new): populates visual_blocks_chunks list.
+                # Takes priority over legacy --visual_npu_layers.
+                npu_chunks = int(getattr(self.args, 'visual_npu_chunks', 0) or 0)
+                if npu_chunks > 0:
+                    config['visual_blocks_chunks'] = [
+                        f'visual_blocks_npu_{ci}.mnn' for ci in range(npu_chunks)
+                    ]
+                # Optional NPU/CPU sub-split for the blocks module (legacy 2-chunk).
+                # Only added when the user opts in via --visual_npu_layers N > 0
+                # AND --visual_npu_chunks is not set. Absent fields mean "use the
+                # monolithic visual_blocks.mnn above".
+                elif getattr(self.args, 'visual_npu_layers', 0) > 0:
                     config['visual_npu_layers'] = int(self.args.visual_npu_layers)
                     config['visual_blocks_npu_model'] = 'visual_blocks_npu.mnn'
                     config['visual_blocks_cpu_model'] = 'visual_blocks_cpu.mnn'
@@ -723,12 +731,15 @@ class LlmExporter(torch.nn.Module):
                         })
 
         # --- Export blocks to ONNX ---
-        # When --visual_npu_layers > 0 the runtime only uses the two chunk files
-        # (visual_blocks_npu.mnn / visual_blocks_cpu.mnn) — the monolithic
-        # visual_blocks.mnn would just be dead weight on disk AND building it
-        # through self._convert_visual_piece(...) is as memory-heavy as the
-        # thing we're trying to avoid. Skip it in that case.
-        _skip_monolithic_blocks = int(getattr(self.args, 'visual_npu_layers', 0) or 0) > 0
+        # When --visual_npu_layers > 0 or --visual_npu_chunks > 0 the runtime
+        # only uses the chunk files (visual_blocks_npu*.mnn [+ visual_blocks_cpu.mnn])
+        # — the monolithic visual_blocks.mnn would just be dead weight on disk AND
+        # building it through self._convert_visual_piece(...) is as memory-heavy
+        # as the thing we're trying to avoid. Skip it in that case.
+        _skip_monolithic_blocks = (
+            int(getattr(self.args, 'visual_npu_layers', 0) or 0) > 0
+            or int(getattr(self.args, 'visual_npu_chunks', 0) or 0) > 0
+        )
         blocks_onnx = None
         if not _skip_monolithic_blocks:
             blocks_onnx = os.path.join(self.onnx_path, 'visual_blocks.onnx')
@@ -781,86 +792,100 @@ class LlmExporter(torch.nn.Module):
                 self._convert_visual_piece(blocks_onnx)
             self._convert_visual_piece(post_onnx)
 
-        # --- Optional NPU/CPU sub-split of blocks (--visual_npu_layers N > 0) ---
-        # Additive: the monolithic visual_blocks.mnn is still produced above; we only
-        # *also* emit visual_blocks_npu.mnn (first N layers) and visual_blocks_cpu.mnn
-        # (remaining layers). Both use the same I/O signature as visual_blocks.mnn so
-        # they can be loaded by the same Module API; the runtime chains them.
+        # --- Optional NPU chunk export of blocks ---
+        # Two activation modes (mutually exclusive; --visual_npu_chunks takes priority):
+        #
+        #  (1) --visual_npu_chunks K > 0  (new):
+        #      Split the blocks into K roughly-equal NPU chunks. Emits
+        #        visual_blocks_npu_0.mnn ... visual_blocks_npu_{K-1}.mnn
+        #      all targeting the same NPU runtime. Each chunk is O(1/K) the
+        #      weights of the monolithic module, so HiAI IR-build peak memory
+        #      scales down by K. Runtime chains them in order.
+        #
+        #  (2) --visual_npu_layers N > 0  (legacy 2-chunk):
+        #      First N layers → visual_blocks_npu.mnn (NPU),
+        #      Remaining layers → visual_blocks_cpu.mnn (CPU).
+        #      File names preserved for back-compat with existing configs.
+        #
+        # Neither set: skip entirely (the monolithic visual_blocks.mnn above is
+        # the only blocks artifact).
+        npu_chunks = int(getattr(self.args, 'visual_npu_chunks', 0) or 0)
         npu_layers = int(getattr(self.args, 'visual_npu_layers', 0) or 0)
-        if npu_layers > 0:
+        if npu_chunks > 0 or npu_layers > 0:
             total = len(self.visual.blocks)
-            if npu_layers >= total:
-                raise ValueError(f"--visual_npu_layers={npu_layers} must be < total blocks ({total})")
 
-            # Re-use the already-computed pre outputs (hidden_states, rotary_pos_emb)
-            # and attention_mask from above — shapes match exactly what blocks saw.
-            # Build the two chunks.
-            npu_chunk, npu_ds_idx = self._build_visual_blocks_chunk(
-                0, npu_layers, meta['has_deepstack'], meta['deepstack_indexes'])
-            cpu_chunk, cpu_ds_idx = self._build_visual_blocks_chunk(
-                npu_layers, total, meta['has_deepstack'], meta['deepstack_indexes'])
-            npu_chunk.eval(); cpu_chunk.eval()
-
-            # Dry-run the NPU chunk to get the mid hidden_states (input for CPU chunk).
-            _reset_kv_cache(npu_chunk)
-            npu_out = npu_chunk(hidden_states, rotary_pos_emb, attention_mask)
-            if isinstance(npu_out, tuple):
-                hidden_mid = npu_out[0]
+            # Resolve chunk boundaries and per-chunk file names.
+            # Each entry is (start, end, onnx_basename, is_last_cpu_only).
+            chunk_specs = []
+            if npu_chunks > 0:
+                if npu_chunks < 2:
+                    raise ValueError(f"--visual_npu_chunks must be >= 2 (got {npu_chunks}); "
+                                     f"use --visual_npu_chunks=0 + monolithic for K=1")
+                if npu_chunks > total:
+                    raise ValueError(f"--visual_npu_chunks={npu_chunks} must be <= total blocks ({total})")
+                # Equal split with the remainder absorbed into the last chunk,
+                # so chunk sizes differ by at most 1.
+                base = total // npu_chunks
+                rem = total % npu_chunks
+                cursor = 0
+                for ci in range(npu_chunks):
+                    size = base + (1 if ci < rem else 0)
+                    s, e = cursor, cursor + size
+                    chunk_specs.append((s, e, f'visual_blocks_npu_{ci}.onnx', False))
+                    cursor = e
+                assert cursor == total
             else:
-                hidden_mid = npu_out
+                # Legacy 2-chunk: NPU first-N + CPU rest. Preserve old names.
+                if npu_layers >= total:
+                    raise ValueError(f"--visual_npu_layers={npu_layers} must be < total blocks ({total})")
+                chunk_specs.append((0, npu_layers, 'visual_blocks_npu.onnx', False))
+                chunk_specs.append((npu_layers, total, 'visual_blocks_cpu.onnx', True))
 
-            # --- Export NPU chunk ---
-            npu_onnx = os.path.join(self.onnx_path, 'visual_blocks_npu.onnx')
-            _reset_kv_cache(npu_chunk)
-            npu_out_names = ['hidden_states']
-            npu_dyn = {
-                'hidden_states_in': {0: 'size'},
-                'rotary_pos_emb': {0: 'size'},
-                'attention_mask': {1: 'size', 2: 'size'},
-                'hidden_states': {0: 'size'},
-            }
-            # Deepstack indexes are sorted; NPU chunk emits the first
-            # len(npu_ds_idx) entries of meta['deepstack_indexes'], in order.
-            # Use the SAME global index ordering the post module expects
-            # (deepstack_hidden_0, deepstack_hidden_1, ...).
-            for k in range(len(npu_ds_idx)):
-                name = f'deepstack_hidden_{k}'
-                npu_out_names.append(name)
-                npu_dyn[name] = {0: 'size'}
-            onnx_export(npu_chunk,
-                        (hidden_states, rotary_pos_emb, attention_mask),
-                        npu_onnx,
-                        input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
-                        output_names=npu_out_names,
-                        dynamic_axes=npu_dyn)
+            # Export each chunk. Between chunks, dry-run to get the next chunk's
+            # hidden_states input. rotary_pos_emb and attention_mask are reused.
+            last_hidden = hidden_states
+            global_ds_cursor = 0
+            chunk_onnx_paths = []
+            for (s, e, fname, _is_cpu_tail) in chunk_specs:
+                chunk_module, local_ds_idx = self._build_visual_blocks_chunk(
+                    s, e, meta['has_deepstack'], meta['deepstack_indexes'])
+                chunk_module.eval()
 
-            # --- Export CPU chunk ---
-            cpu_onnx = os.path.join(self.onnx_path, 'visual_blocks_cpu.onnx')
-            _reset_kv_cache(cpu_chunk)
-            cpu_out_names = ['hidden_states']
-            cpu_dyn = {
-                'hidden_states_in': {0: 'size'},
-                'rotary_pos_emb': {0: 'size'},
-                'attention_mask': {1: 'size', 2: 'size'},
-                'hidden_states': {0: 'size'},
-            }
-            # CPU chunk emits the remaining deepstack entries. Their global
-            # positions start at len(npu_ds_idx).
-            npu_ds_count = len(npu_ds_idx)
-            for k in range(len(cpu_ds_idx)):
-                name = f'deepstack_hidden_{npu_ds_count + k}'
-                cpu_out_names.append(name)
-                cpu_dyn[name] = {0: 'size'}
-            onnx_export(cpu_chunk,
-                        (hidden_mid, rotary_pos_emb, attention_mask),
-                        cpu_onnx,
-                        input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
-                        output_names=cpu_out_names,
-                        dynamic_axes=cpu_dyn)
+                chunk_onnx = os.path.join(self.onnx_path, fname)
+                _reset_kv_cache(chunk_module)
+                out_names = ['hidden_states']
+                dyn = {
+                    'hidden_states_in': {0: 'size'},
+                    'rotary_pos_emb': {0: 'size'},
+                    'attention_mask': {1: 'size', 2: 'size'},
+                    'hidden_states': {0: 'size'},
+                }
+                # Deepstack outputs use GLOBAL indices, matching what the post
+                # module expects (deepstack_hidden_0 .. _{M-1}). Each chunk emits
+                # only the subset whose global layer index falls in [s, e).
+                for k in range(len(local_ds_idx)):
+                    name = f'deepstack_hidden_{global_ds_cursor + k}'
+                    out_names.append(name)
+                    dyn[name] = {0: 'size'}
+                onnx_export(chunk_module,
+                            (last_hidden, rotary_pos_emb, attention_mask),
+                            chunk_onnx,
+                            input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
+                            output_names=out_names,
+                            dynamic_axes=dyn)
+                chunk_onnx_paths.append(chunk_onnx)
+
+                # Dry-run to propagate hidden_states into the next chunk.
+                # ViT blocks are shape-preserving, so this only fixes input
+                # tensor values; shapes don't drift.
+                _reset_kv_cache(chunk_module)
+                chunk_out = chunk_module(last_hidden, rotary_pos_emb, attention_mask)
+                last_hidden = chunk_out[0] if isinstance(chunk_out, tuple) else chunk_out
+                global_ds_cursor += len(local_ds_idx)
 
             if self.mnn_converter:
-                self._convert_visual_piece(npu_onnx)
-                self._convert_visual_piece(cpu_onnx)
+                for p in chunk_onnx_paths:
+                    self._convert_visual_piece(p)
 
     def _convert_visual_piece(self, onnx_path):
         """Route a single visual-split onnx file through whichever MNN conversion
@@ -1155,6 +1180,7 @@ def build_args(parser):
     parser.add_argument('--visual_no_json', action='store_true', help='Skip visual.mnn.json generation entirely (mnn2json step is memory-heavy on large fp16 models). Only effective with --visual_keep_matmul.')
     parser.add_argument('--visual_split', action='store_true', help='Export visual model as 3 separate .mnn files (visual_pre.mnn / visual_blocks.mnn / visual_post.mnn) so blocks can run on NPU while pre/post run on CPU. Uses the same quant flags as the non-split path.')
     parser.add_argument('--visual_npu_layers', type=int, default=0, help='[TEMPORARY NPU TEST] With --visual_split, put the first N transformer blocks into visual_blocks_npu.mnn (for NPU) and the remaining into visual_blocks_cpu.mnn (for CPU). Default 0 = disabled, existing --visual_split behaviour preserved. Non-invasive: pre/post and DeepStack merging are unchanged; merely shards the blocks wrapper so the NPU build phase is cheap to test.')
+    parser.add_argument('--visual_npu_chunks', type=int, default=0, help='With --visual_split, split the visual transformer blocks into K roughly equal NPU chunks (visual_blocks_npu_0.mnn ... visual_blocks_npu_{K-1}.mnn) so each HiAI IR-build processes only 1/K of the weights. Recommended when the monolithic build OOMs. Overrides --visual_npu_layers when > 0. Default 0 = disabled. Example: --visual_npu_chunks 4 on a 24-block ViT produces 4 chunks of 6 blocks each.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')

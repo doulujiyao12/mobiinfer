@@ -259,14 +259,28 @@ bool Omni::load() {
                 nullptr == mVisionPostModule.get()) {
                 return false;
             }
-            // Two paths:
-            //  (a) visual_npu_layers == 0 (default): load the monolithic
-            //      visual_blocks.mnn on the NPU runtime.
-            //  (b) visual_npu_layers > 0 (temporary NPU test mode): skip the
-            //      monolithic file entirely (it doesn't even need to exist on
-            //      disk) and load the two chunks instead. This avoids the OOM
-            //      that happens during the large monolithic IR build.
-            if (mConfig->visual_npu_layers() > 0) {
+            // Three paths, highest priority first:
+            //  (a) visual_blocks_chunks non-empty: K-chunk NPU split. Each chunk
+            //      is a smaller .mnn; loading them sequentially keeps the HiAI
+            //      IR-build peak memory at O(1/K) of the monolithic build.
+            //  (b) visual_npu_layers > 0 (legacy 2-chunk): first N layers on NPU,
+            //      rest on CPU. Kept for back-compat.
+            //  (c) default: monolithic visual_blocks.mnn on the NPU runtime.
+            auto chunkPaths = mConfig->visual_blocks_chunks();
+            if (!chunkPaths.empty()) {
+                mVisionBlocksChunkModules.reserve(chunkPaths.size());
+                for (size_t i = 0; i < chunkPaths.size(); i++) {
+                    std::shared_ptr<Module> mod(Module::load(
+                        {}, {}, chunkPaths[i].c_str(),
+                        mVisionBlocksRuntimeManager, &npuModuleCfg));
+                    if (nullptr == mod.get()) {
+                        MNN_ERROR("visual_blocks chunk[%zu] load failed: %s\n",
+                                  i, chunkPaths[i].c_str());
+                        return false;
+                    }
+                    mVisionBlocksChunkModules.push_back(mod);
+                }
+            } else if (mConfig->visual_npu_layers() > 0) {
                 mVisionBlocksNpuModule.reset(Module::load(
                     {}, {}, mConfig->visual_blocks_npu_model().c_str(),
                     mVisionBlocksRuntimeManager, &npuModuleCfg));
@@ -560,7 +574,30 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
         }
         VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
         VARPS blocksOut;
-        if (mVisionBlocksNpuModule.get() != nullptr &&
+        if (!mVisionBlocksChunkModules.empty()) {
+            // K-chunk NPU split: chain each chunk's hidden_states output into the
+            // next chunk's input; rotary_pos_emb and attention_mask are reused.
+            // Deepstack outputs from each chunk are appended in chunk order,
+            // which matches the GLOBAL deepstack ordering the post module
+            // expects (export side names them deepstack_hidden_0 .. _{M-1}).
+            VARP curHidden = preOut[0];
+            VARPS allDeepstack;
+            for (size_t i = 0; i < mVisionBlocksChunkModules.size(); i++) {
+                VARPS chunkIn = {curHidden, preOut[1], attention_mask};
+                auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
+                if (chunkOut.empty()) {
+                    MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
+                    return std::vector<int>(0);
+                }
+                curHidden = chunkOut[0];
+                for (size_t j = 1; j < chunkOut.size(); j++) {
+                    allDeepstack.push_back(chunkOut[j]);
+                }
+            }
+            blocksOut.reserve(1 + allDeepstack.size());
+            blocksOut.push_back(curHidden);
+            for (auto& d : allDeepstack) blocksOut.push_back(d);
+        } else if (mVisionBlocksNpuModule.get() != nullptr &&
             mVisionBlocksCpuModule.get() != nullptr &&
             mConfig->visual_npu_layers() > 0) {
             // Temporary NPU test mode: first-N layers on NPU, rest on CPU. The two

@@ -145,6 +145,8 @@ public:
         mVisionBlocksModule.reset();
         mVisionBlocksNpuModule.reset();
         mVisionBlocksCpuModule.reset();
+        for (auto& m : mVisionBlocksChunkModules) { m.reset(); }
+        mVisionBlocksChunkModules.clear();
         mVisionPostModule.reset();
         mAudioModule.reset();
     }
@@ -186,6 +188,12 @@ private:
     // Both share the same I/O signature as mVisionBlocksModule (hidden, rotary, mask →
     // hidden + deepstack outputs), so the pre/post wiring is unchanged.
     std::shared_ptr<Module> mVisionBlocksNpuModule, mVisionBlocksCpuModule;
+    // K-chunk NPU split (generalization of the 2-chunk path above). Populated
+    // when LlmConfig::visual_blocks_chunks() is non-empty: one Module per chunk,
+    // all loaded on mVisionBlocksRuntimeManager and chained in order at runtime.
+    // Takes priority over mVisionBlocksNpuModule / mVisionBlocksCpuModule and
+    // over mVisionBlocksModule when non-empty.
+    std::vector<std::shared_ptr<Module>> mVisionBlocksChunkModules;
     std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;

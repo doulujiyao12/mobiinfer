@@ -163,6 +163,27 @@ public:
         return base_dir_ + config_.value("visual_blocks_cpu_model", "visual_blocks_cpu.mnn");
     }
 
+    // K-chunk NPU split (new, takes priority over visual_npu_layers when present).
+    // When the config contains "visual_blocks_chunks": [name0, name1, ...], each
+    // entry is a .mnn file holding a roughly-equal slice of the visual blocks.
+    // All chunks run on the NPU runtime and are chained at inference time, so
+    // each HiAI IR-build handles O(1/K) weights — avoids OOM on the monolithic
+    // build. Returns absolute paths (base_dir_ prepended); empty vector = disabled.
+    std::vector<std::string> visual_blocks_chunks() const {
+        std::vector<std::string> out;
+        if (!config_.contains("visual_blocks_chunks")) return out;
+        auto arr = config_["visual_blocks_chunks"];
+        if (!arr.is_array()) return out;
+        out.reserve(arr.size());
+        for (size_t i = 0; i < arr.size(); i++) {
+            auto item = arr[i];
+            if (item.is_string()) {
+                out.push_back(base_dir_ + item.get<std::string>());
+            }
+        }
+        return out;
+    }
+
     std::string visual_post_model() const {
         return base_dir_ + config_.value("visual_post_model", "visual_post.mnn");
     }

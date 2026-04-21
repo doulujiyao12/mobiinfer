@@ -465,3 +465,4 @@ transformers/llm/export/model_1visualblockfp16/
 transformers/llm/export/model_sangevisual_fp16/
 transformers/llm/export/visual_blocks.mnn
 transformers/llm/export/visual_blocks.mnn.weight
+transformers/llm/export/model_allnpuvisualfp16/
