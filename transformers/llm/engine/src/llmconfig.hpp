@@ -135,6 +135,42 @@ public:
         return base_dir_ + config_.value("visual_model", "visual.mnn");
     }
 
+    bool visual_split() const {
+        return config_.value("visual_split", false);
+    }
+
+    std::string visual_pre_model() const {
+        return base_dir_ + config_.value("visual_pre_model", "visual_pre.mnn");
+    }
+
+    std::string visual_blocks_model() const {
+        return base_dir_ + config_.value("visual_blocks_model", "visual_blocks.mnn");
+    }
+
+    // Optional NPU/CPU sub-split of the blocks module (temporary NPU test mode).
+    // visual_npu_layers() > 0 signals: load visual_blocks_npu_model() (first N
+    // layers) onto the NPU runtime and visual_blocks_cpu_model() (remaining
+    // layers) onto the CPU runtime, then chain them at runtime. When
+    // visual_npu_layers() == 0 (default) the monolithic visual_blocks_model()
+    // path is used and the two extra getters are not consulted.
+    int visual_npu_layers() const {
+        return config_.value("visual_npu_layers", 0);
+    }
+    std::string visual_blocks_npu_model() const {
+        return base_dir_ + config_.value("visual_blocks_npu_model", "visual_blocks_npu.mnn");
+    }
+    std::string visual_blocks_cpu_model() const {
+        return base_dir_ + config_.value("visual_blocks_cpu_model", "visual_blocks_cpu.mnn");
+    }
+
+    std::string visual_post_model() const {
+        return base_dir_ + config_.value("visual_post_model", "visual_post.mnn");
+    }
+
+    std::string visual_blocks_backend_type() const {
+        return config_.value("visual_blocks_backend_type", "hiai");
+    }
+
     std::string npu_model_dir() const {
         return base_dir_ + config_.value("npu_model_dir", "");
     }

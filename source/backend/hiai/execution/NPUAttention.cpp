@@ -36,10 +36,14 @@ NPUAttention::NPUAttention(MNN::Backend *b, const MNN::Op *op, const std::vector
 
 ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     mNpuBackend->setNetworkInput(inputs, mOp);
-    auto opName = mOp->name()->str();
+    std::string opName = (mOp && mOp->name()) ? mOp->name()->str()
+                                              : ("NPUAttention_anon_" + std::to_string((uintptr_t)mOp));
+    MNN_HIAI_LOG("NPUAttention.onResize: ENTER op=%s type=%d inputCnt=%zu outputCnt=%zu",
+                 opName.c_str(), mOp ? (int)mOp->type() : -1, inputs.size(), outputs.size());
 
     if (inputs.size() < 3) {
         MNN_ERROR("NPUAttention expects at least 3 inputs (Q,K,V), got %d\n", (int)inputs.size());
+        MNN_HIAI_LOG("NPUAttention.onResize: FAIL not enough inputs (need>=3)");
         return INPUT_DATA_ERROR;
     }
     auto query = inputs[0];
@@ -47,17 +51,33 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     auto value = inputs[2];
     if (query->buffer().dimensions != 4) {
         MNN_ERROR("NPUAttention requires 4D Q/K/V, got %d\n", query->buffer().dimensions);
+        MNN_HIAI_LOG("NPUAttention.onResize: FAIL Q is %dD (need 4D)", query->buffer().dimensions);
         return NOT_SUPPORT;
     }
     const int batch    = query->length(0);
     const int seqLen   = query->length(1);
     const int numHead  = query->length(2);
     const int headDim  = query->length(3);
+    MNN_HIAI_LOG("  Q[B=%d,Sq=%d,H=%d,D=%d] K[%d,%d,%d,%d] V[%d,%d,%d,%d] mask=%s",
+                 batch, seqLen, numHead, headDim,
+                 key->length(0), key->length(1), key->length(2), key->length(3),
+                 value->length(0), value->length(1), value->length(2), value->length(3),
+                 inputs.size() >= 4 ? "yes" : "no");
 
     // Fetch graph ops for Q, K, V.
     auto qIndex = mOp->inputIndexes()->data()[0];
     auto kIndex = mOp->inputIndexes()->data()[1];
     auto vIndex = mOp->inputIndexes()->data()[2];
+    if (mNpuBackend->mGrapMap.find(qIndex) == mNpuBackend->mGrapMap.end() ||
+        mNpuBackend->mGrapMap.find(kIndex) == mNpuBackend->mGrapMap.end() ||
+        mNpuBackend->mGrapMap.find(vIndex) == mNpuBackend->mGrapMap.end()) {
+        MNN_HIAI_LOG("NPUAttention.onResize: FAIL Q/K/V producer op not found in mGrapMap "
+                     "(qIdx=%d %s, kIdx=%d %s, vIdx=%d %s)",
+                     qIndex, mNpuBackend->mGrapMap.count(qIndex) ? "ok" : "MISS",
+                     kIndex, mNpuBackend->mGrapMap.count(kIndex) ? "ok" : "MISS",
+                     vIndex, mNpuBackend->mGrapMap.count(vIndex) ? "ok" : "MISS");
+        return INVALID_VALUE;
+    }
     auto qOp    = mNpuBackend->mGrapMap[qIndex].back().first;
     auto kOp    = mNpuBackend->mGrapMap[kIndex].back().first;
     auto vOp    = mNpuBackend->mGrapMap[vIndex].back().first;
@@ -92,11 +112,41 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
 
     shared_ptr<ge::Operator> preSoftmax = qk;
     shared_ptr<hiai::op::Add> masked;
+    shared_ptr<hiai::op::Reshape> maskReshape;
     if (inputs.size() >= 4) {
         auto mIndex = mOp->inputIndexes()->data()[3];
         auto mOpGraph = mNpuBackend->mGrapMap[mIndex].back().first;
-        masked.reset(new hiai::op::Add(opName + "_mask_add"));
-        (*masked).set_input_x1(*qk.get()).set_input_x2(*mOpGraph.get());
+        auto mask = inputs[3];
+
+        // qk is 4D [B, H, S_q, S_kv]. The MNN attention_mask is typically 3D
+        // [B, S_q, S_kv]. HiAI's Add op lowering rank-promotes the 3D operand
+        // internally and in some versions that lowering produces a 5D
+        // intermediate tensor, which DDK rejects with
+        //   "data dim count is illegal, need <= 4, real:5".
+        // Avoid the implicit broadcast entirely: explicitly Reshape the mask
+        // to 4D [B, 1, S_q, S_kv] so both Add operands have matching rank=4.
+        int maskDims = mask->buffer().dimensions;
+        if (maskDims == 3) {
+            vector<int32_t> maskShape = {batch, 1, mask->length(1), mask->length(2)};
+            vector<int64_t> shapeShape{static_cast<int64_t>(maskShape.size())};
+            mMaskShapeConst = hiai::op::Const(opName + "_mask_shape");
+            ge::TensorDesc sdesc(ge::Shape(shapeShape), ge::FORMAT_NCHW, ge::DT_INT32);
+            ge::TensorPtr sTensor = std::make_shared<ge::Tensor>();
+            sTensor->SetTensorDesc(sdesc);
+            sTensor->SetData(reinterpret_cast<const uint8_t *>(maskShape.data()),
+                             maskShape.size() * sizeof(int32_t));
+            mMaskShapeConst.set_attr_value(sTensor);
+
+            maskReshape.reset(new hiai::op::Reshape(opName + "_mask_reshape"));
+            (*maskReshape).set_input_x(*mOpGraph.get()).set_input_shape(mMaskShapeConst);
+
+            masked.reset(new hiai::op::Add(opName + "_mask_add"));
+            (*masked).set_input_x1(*qk.get()).set_input_x2(*maskReshape.get());
+        } else {
+            // Mask already 4D (or unusual rank) — feed as-is.
+            masked.reset(new hiai::op::Add(opName + "_mask_add"));
+            (*masked).set_input_x1(*qk.get()).set_input_x2(*mOpGraph.get());
+        }
         preSoftmax = masked;
     }
 
@@ -134,6 +184,9 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     chain.push_back(vPerm);
     chain.push_back(qScaled);
     chain.push_back(qk);
+    if (maskReshape) {
+        chain.push_back(maskReshape);
+    }
     if (masked) {
         chain.push_back(masked);
     }

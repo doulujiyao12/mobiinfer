@@ -19,9 +19,18 @@ NPURank::NPURank(MNN::Backend *b, const MNN::Op *op, const std::vector<Tensor *>
 
 ErrorCode NPURank::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     mNpuBackend->setNetworkInput(inputs, mOp);
-    auto opName = mOp->name()->str();
+    std::string opName = (mOp && mOp->name()) ? mOp->name()->str()
+                                              : ("NPURank_anon_" + std::to_string((uintptr_t)mOp));
+    MNN_HIAI_LOG("NPURank.onResize: ENTER op=%s type=%d inputCnt=%zu",
+                 opName.c_str(), mOp ? (int)mOp->type() : -1, inputs.size());
 
     auto inputIndex = mOp->inputIndexes()->data()[0];
+    MNN_HIAI_LOG("  inputIdx=%d in_dim=%d",
+                 inputIndex, inputs.empty() ? -1 : inputs[0]->buffer().dimensions);
+    if (mNpuBackend->mGrapMap.find(inputIndex) == mNpuBackend->mGrapMap.end()) {
+        MNN_HIAI_LOG("NPURank.onResize: FAIL producer op not found for idx=%d", inputIndex);
+        return INVALID_VALUE;
+    }
     auto iops       = mNpuBackend->mGrapMap[inputIndex];
     auto xOp        = iops.back().first;
 
@@ -32,6 +41,7 @@ ErrorCode NPURank::onResize(const std::vector<Tensor *> &inputs, const std::vect
         (*rankOp).set_input_x(xOp->GetOutput(mNpuBackend->mSclipMap[inputIndex]));
     }
     mNpuBackend->setOutputOps(mOp, {rankOp}, outputs);
+    MNN_HIAI_LOG("NPURank.onResize: EXIT op=%s OK", opName.c_str());
     return NO_ERROR;
 }
 

@@ -653,12 +653,29 @@ static bool _RebuildExternalOp(FileLoader* external, const MNN::Op* origin, flat
     if (externalTmp) {
         delete external;
     }
+    // Preserve the original Op's index vectors so backends that look up producer ops
+    // by input/output index (e.g. NPU) can still resolve them after rebuild.
+    // Without these, origin->inputIndexes() disappears in the rebuilt Op and any
+    // backend doing mGrapMap[idx] lookups crashes.
+    flatbuffers::Offset<flatbuffers::Vector<int>> inputIndexesFbb = 0;
+    if (nullptr != origin->inputIndexes()) {
+        std::vector<int> tmp(origin->inputIndexes()->begin(), origin->inputIndexes()->end());
+        inputIndexesFbb = builder.CreateVector(tmp);
+    }
+    flatbuffers::Offset<flatbuffers::Vector<int>> outputIndexesFbb = 0;
+    if (nullptr != origin->outputIndexes()) {
+        std::vector<int> tmp(origin->outputIndexes()->begin(), origin->outputIndexes()->end());
+        outputIndexesFbb = builder.CreateVector(tmp);
+    }
     OpBuilder builder_(builder);
     builder_.add_name(opNameFbb);
     builder_.add_externalPath(externalPathFbb);
     builder_.add_main(parameterMain);
     builder_.add_type(origin->type());
     builder_.add_main_type(origin->main_type());
+    builder_.add_inputIndexes(inputIndexesFbb);
+    builder_.add_outputIndexes(outputIndexesFbb);
+    builder_.add_defaultDimentionFormat(origin->defaultDimentionFormat());
     builder.Finish(builder_.Finish());
     return true;
 }
@@ -718,6 +735,17 @@ Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const st
             tmpstore.reset(new BufferStorage);
             tmpstore->storage = builder.ReleaseRaw(tmpstore->allocated_size, tmpstore->offset);
         }
+    } else {
+        // For Scale / LayerNorm (and any other op_type going through _RebuildExternalOp):
+        // newOp points into `builder`, a stack-local FlatBufferBuilder. When this function
+        // returns, `builder` is destroyed and newOp becomes a dangling pointer.
+        // Executions (e.g. NPULayerNorm) cache mOp = newOp and dereference it later at
+        // onResize, reading freed memory (type=0, name=null, inputIndexes=null → segfault).
+        // We MUST preserve `builder`'s storage for the lifetime of the Execution. The
+        // Convolution2D path above already does this via tmpstore when onClone fails — do
+        // the same unconditionally for every non-conv external rebuild.
+        tmpstore.reset(new BufferStorage);
+        tmpstore->storage = builder.ReleaseRaw(tmpstore->allocated_size, tmpstore->offset);
     }
     return execution;
 #endif

@@ -26,8 +26,31 @@
 
 #include <stdio.h>
 #include <map>
+#include <chrono>
 #include <memory>
 #include <core/TensorUtils.hpp>
+
+// Toggle verbose NPU backend logging at compile time. Pass -DHIAI_VERBOSE=1 or
+// flip the default below to 1 to print each stage of NPU graph construction,
+// IR build, model load, tensor IO, and per-op execute. Use it to triage
+// whether a failure is:
+//   (a) op-type not-supported  -> "[NPU] Don't support type ..." in onCreate
+//   (b) per-op setup failure   -> "[HIAI_V] <op> onResize ..." shows which
+//                                  execution returned an error before IR build
+//   (c) graph build failure    -> BuildIRModel failed with stage trace
+//   (d) model load failure     -> LoadModelSync returned null
+//   (e) IO dimension mismatch  -> GetModelIOTensorDim failed or shape mismatch
+//   (f) execute failure        -> Process returned non-zero
+#ifndef HIAI_VERBOSE
+#define HIAI_VERBOSE 1
+#endif
+
+#if HIAI_VERBOSE
+#define MNN_HIAI_LOG(fmt, ...) \
+    do { printf("[HIAI_V] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
+#else
+#define MNN_HIAI_LOG(fmt, ...) do {} while (0)
+#endif
 
 #ifdef HIAI_DEBUG
 #include <android/trace.h>
@@ -328,6 +351,13 @@ namespace MNN {
 
         map<int, int> mSclipMap;
         map<unsigned long, int> mInputMap;
+
+        // For Data inputs with rank > 4 that had unit dims squeezed so the HiAI
+        // Data op stays within the 4-D DDK limit, this maps inputIndex -> list
+        // of dim positions that were removed. Consumers (e.g. NPUGatherV2 applied
+        // to a squeezed rotary_pos_emb) look here to translate axes/shapes from
+        // the MNN view back to the squeezed HiAI view.
+        map<int, std::vector<int>> mInputSqueezedAxes;
     public:
         class Creator {
         public:
@@ -350,6 +380,9 @@ namespace MNN {
         MNNTensorList mMNNOutTensors;
         const NPURuntime* mNPURuntime;
         BackendConfig::PrecisionMode mPrecision;
+#if HIAI_VERBOSE
+        std::chrono::steady_clock::time_point mResizeTimerStart;
+#endif
 
 #ifdef HIAI_DEBUG
         void *(*ATrace_beginSection) (const char* sectionName);

@@ -141,6 +141,11 @@ public:
     Omni(std::shared_ptr<LlmConfig> config);
     ~Omni() {
         mVisionModule.reset();
+        mVisionPreModule.reset();
+        mVisionBlocksModule.reset();
+        mVisionBlocksNpuModule.reset();
+        mVisionBlocksCpuModule.reset();
+        mVisionPostModule.reset();
         mAudioModule.reset();
     }
     virtual bool load() override;
@@ -173,6 +178,15 @@ private:
     std::vector<int> processImageContent(const std::string& content, const std::map<std::string, PromptImagePart>& images);
     std::vector<int> processAudioContent(const std::string& content, const std::map<std::string, PromptAudioPart>& audios);
     std::shared_ptr<Module> mVisionModule, mAudioModule;
+    std::shared_ptr<Module> mVisionPreModule, mVisionBlocksModule, mVisionPostModule;
+    // Temporary NPU test mode: when LlmConfig::visual_npu_layers() > 0, the monolithic
+    // mVisionBlocksModule is not used; instead these two modules are chained.
+    //  mVisionBlocksNpuModule : first N layers, runs on mVisionBlocksRuntimeManager (NPU).
+    //  mVisionBlocksCpuModule : remaining layers, runs on mProcessorRuntimeManager (CPU).
+    // Both share the same I/O signature as mVisionBlocksModule (hidden, rotary, mask →
+    // hidden + deepstack outputs), so the pre/post wiring is unchanged.
+    std::shared_ptr<Module> mVisionBlocksNpuModule, mVisionBlocksCpuModule;
+    std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;
     // m_rope position ids

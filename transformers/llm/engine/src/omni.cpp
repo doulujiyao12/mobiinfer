@@ -226,9 +226,74 @@ bool Omni::load() {
         module_config.rearrange    = true;
     }
     if (mConfig->is_visual()) {
-        mVisionModule.reset(Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
-        if (nullptr == mVisionModule.get()) {
-            return false;
+        if (mConfig->visual_split()) {
+            // Split mode: pre/post on mProcessorRuntimeManager (usually CPU),
+            // blocks on a dedicated runtime (typically NPU/HiAI).
+            ScheduleConfig npuCfg;
+            BackendConfig npuBackendConfig;
+            npuCfg.type          = backend_type_convert(mConfig->visual_blocks_backend_type());
+            npuCfg.numThread     = 1;
+            npuCfg.backendConfig = &npuBackendConfig;
+            mVisionBlocksRuntimeManager.reset(
+                Executor::RuntimeManager::createRuntimeManager(npuCfg));
+            setRuntimeHint(mVisionBlocksRuntimeManager);
+
+            Module::Config npuModuleCfg;
+            if (npuCfg.type == MNN_FORWARD_USER_0 ||
+                npuCfg.type == MNN_FORWARD_USER_1 ||
+                npuCfg.type == MNN_FORWARD_NN) {
+                npuModuleCfg.shapeMutable = false;
+                npuModuleCfg.rearrange    = false;
+            } else {
+                npuModuleCfg.shapeMutable = true;
+                npuModuleCfg.rearrange    = true;
+            }
+
+            mVisionPreModule.reset(Module::load(
+                {}, {}, mConfig->visual_pre_model().c_str(),
+                mProcessorRuntimeManager, &module_config));
+            mVisionPostModule.reset(Module::load(
+                {}, {}, mConfig->visual_post_model().c_str(),
+                mProcessorRuntimeManager, &module_config));
+            if (nullptr == mVisionPreModule.get() ||
+                nullptr == mVisionPostModule.get()) {
+                return false;
+            }
+            // Two paths:
+            //  (a) visual_npu_layers == 0 (default): load the monolithic
+            //      visual_blocks.mnn on the NPU runtime.
+            //  (b) visual_npu_layers > 0 (temporary NPU test mode): skip the
+            //      monolithic file entirely (it doesn't even need to exist on
+            //      disk) and load the two chunks instead. This avoids the OOM
+            //      that happens during the large monolithic IR build.
+            if (mConfig->visual_npu_layers() > 0) {
+                mVisionBlocksNpuModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_npu_model().c_str(),
+                    mVisionBlocksRuntimeManager, &npuModuleCfg));
+                mVisionBlocksCpuModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_cpu_model().c_str(),
+                    mProcessorRuntimeManager, &module_config));
+                if (nullptr == mVisionBlocksNpuModule.get() ||
+                    nullptr == mVisionBlocksCpuModule.get()) {
+                    MNN_ERROR("visual_npu_layers=%d set but failed to load npu/cpu chunk modules (%s / %s)\n",
+                              mConfig->visual_npu_layers(),
+                              mConfig->visual_blocks_npu_model().c_str(),
+                              mConfig->visual_blocks_cpu_model().c_str());
+                    return false;
+                }
+            } else {
+                mVisionBlocksModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_model().c_str(),
+                    mVisionBlocksRuntimeManager, &npuModuleCfg));
+                if (nullptr == mVisionBlocksModule.get()) {
+                    return false;
+                }
+            }
+        } else {
+            mVisionModule.reset(Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
+            if (nullptr == mVisionModule.get()) {
+                return false;
+            }
         }
     }
     if (mConfig->is_audio()) {
@@ -282,9 +347,15 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     AUTOTIME;
     const bool dumpLog = shouldDumpX86Log(mConfig);
     MNN::Express::ExecutorScope s(mExecutor);
-    const auto inputNames = mVisionModule->getInfo()->inputNames;
-    bool hasWindowIndex = inputNames.size() == 4 && inputNames[3] == "window_index";
-    bool isQwen3VL = inputNames.size() == 5 && inputNames[3] == "idx_tensor";
+    const bool isSplit = mConfig->visual_split();
+    const auto& probeModule = isSplit ? mVisionPreModule : mVisionModule;
+    const auto inputNames = probeModule->getInfo()->inputNames;
+    // In split mode pre-module drops the "attention_mask" input (mask goes to
+    // blocks). Offsets after position_ids shift by -1 accordingly.
+    const int maskOffset = isSplit ? 0 : 1;
+    bool hasWindowIndex = (!isSplit) && inputNames.size() == 4 && inputNames[3] == "window_index";
+    bool isQwen3VL = inputNames.size() == (size_t)(4 + maskOffset)
+                     && inputNames[2 + maskOffset] == "idx_tensor";
     const int patch_size = isQwen3VL ? 16 : 14;
     constexpr int temporal_patch_size = 2;
     constexpr int merge_size = 2;
@@ -470,7 +541,62 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
             }
         }
     }
-    auto outputs = mVisionModule->onForward(moduleInputs);
+    VARPS outputs;
+    if (isSplit) {
+        // moduleInputs layout (monolithic):
+        //   [patches, position_ids, attention_mask, (idx_tensor, weight_tensor) | window_index]
+        // Pre inputs = moduleInputs minus attention_mask (index 2).
+        VARPS preInputs;
+        preInputs.reserve(moduleInputs.size() - 1);
+        for (size_t i = 0; i < moduleInputs.size(); ++i) {
+            if (i == 2) continue; // skip attention_mask
+            preInputs.push_back(moduleInputs[i]);
+        }
+        auto preOut = mVisionPreModule->onForward(preInputs);
+        if (preOut.size() < 2) {
+            MNN_ERROR("visual_pre expected >=2 outputs (hidden_states, rotary_pos_emb), got %zu\n",
+                      preOut.size());
+            return std::vector<int>(0);
+        }
+        VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
+        VARPS blocksOut;
+        if (mVisionBlocksNpuModule.get() != nullptr &&
+            mVisionBlocksCpuModule.get() != nullptr &&
+            mConfig->visual_npu_layers() > 0) {
+            // Temporary NPU test mode: first-N layers on NPU, rest on CPU. The two
+            // modules share identical I/O signature (hidden, rotary, mask → hidden
+            // + deepstack_hidden_k for k in their local range). Deepstack outputs
+            // are concatenated in original global order: NPU chunk outputs first
+            // (for layers < N), then CPU chunk outputs (for layers >= N).
+            auto npuOut = mVisionBlocksNpuModule->onForward(blocksIn);
+            if (npuOut.empty()) {
+                MNN_ERROR("visual_blocks_npu: empty output\n");
+                return std::vector<int>(0);
+            }
+            VARPS cpuIn = {npuOut[0], preOut[1], attention_mask};
+            auto cpuOut = mVisionBlocksCpuModule->onForward(cpuIn);
+            if (cpuOut.empty()) {
+                MNN_ERROR("visual_blocks_cpu: empty output\n");
+                return std::vector<int>(0);
+            }
+            blocksOut.reserve(cpuOut.size() + (npuOut.size() - 1));
+            // Final hidden_states comes from the CPU chunk (last layer).
+            blocksOut.push_back(cpuOut[0]);
+            // Deepstack from NPU chunk (indexes < N) first.
+            for (size_t i = 1; i < npuOut.size(); i++) {
+                blocksOut.push_back(npuOut[i]);
+            }
+            // Then deepstack from CPU chunk (indexes >= N).
+            for (size_t i = 1; i < cpuOut.size(); i++) {
+                blocksOut.push_back(cpuOut[i]);
+            }
+        } else {
+            blocksOut = mVisionBlocksModule->onForward(blocksIn);
+        }
+        outputs = mVisionPostModule->onForward(blocksOut);
+    } else {
+        outputs = mVisionModule->onForward(moduleInputs);
+    }
     auto imageEmbedding = outputs[0];
     if (outputs.size() == 2) {
         mDeepStackEmbeddings.push_back(outputs[1]);
@@ -840,7 +966,8 @@ std::vector<int> Omni::visionProcess(VARP image) {
     }
     Timer _t;
     std::vector<int> imgIds;
-    const auto inputNames = mVisionModule->getInfo()->inputNames;
+    const auto& probeModule = mConfig->visual_split() ? mVisionPreModule : mVisionModule;
+    const auto inputNames = probeModule->getInfo()->inputNames;
     if (inputNames.size() >= 3 && inputNames[0] == "patches") {
         imgIds = qwen2VisionProcess(image);
     } else if (inputNames[0] == "pixel_values") {

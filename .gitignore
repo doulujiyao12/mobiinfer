@@ -457,3 +457,11 @@ kirin9030/
 transformers/llm/export/model_visual8mat_json/
 transformers/llm/export/model_visual_8perchannel/
 transformers/llm/export/model_visualmatmul/
+
+
+
+hiai-log.txt
+transformers/llm/export/model_1visualblockfp16/
+transformers/llm/export/model_sangevisual_fp16/
+transformers/llm/export/visual_blocks.mnn
+transformers/llm/export/visual_blocks.mnn.weight

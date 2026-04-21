@@ -24,6 +24,7 @@ public:
 private:
     hiai::op::Const mScaleConst;
     hiai::op::Const mOutShapeConst;
+    hiai::op::Const mMaskShapeConst;
 };
 
 } // namespace MNN

@@ -300,10 +300,51 @@ namespace MNN {
     }
 
     void NPUBackend::setNetworkInput(const std::vector<Tensor *> &inputs, const Op* op) {
-       for (size_t i = 0; i < op->inputIndexes()->size(); i++) {
+       const char* opName = (op && op->name()) ? op->name()->c_str() : "<anon>";
+       MNN_HIAI_LOG("setNetworkInput: op_ptr=%p op=%s type=%d inputCnt=%zu",
+                    (const void*)op, opName, op ? (int)op->type() : -1, inputs.size());
+#if HIAI_VERBOSE
+       // Log every input tensor's shape + rank so we can locate any tensor
+       // that exceeds HiAI's 4-D limit. The DDK error
+       //   "data dim count is illegal, need <= 4, real:5"
+       // says *some* op sees a 5-D input; this loop pinpoints which one.
+       for (size_t i = 0; i < inputs.size(); i++) {
+           Tensor* t = inputs[i];
+           if (t == nullptr) { continue; }
+           std::string dimStr;
+           int nd = t->buffer().dimensions;
+           for (int d = 0; d < nd; d++) {
+               dimStr += std::to_string(t->buffer().dim[d].extent);
+               if (d + 1 < nd) dimStr += "x";
+           }
+           bool bad = (nd > 4);
+           MNN_HIAI_LOG("  in[%zu] rank=%d dims=[%s]%s",
+                        i, nd, dimStr.c_str(), bad ? "  <<<<< 5D+  HiAI rejects" : "");
+       }
+#endif
+       if (op == nullptr) {
+           MNN_HIAI_LOG("setNetworkInput: ABORT op is null");
+           return;
+       }
+       if (op->inputIndexes() == nullptr) {
+           MNN_HIAI_LOG("setNetworkInput: ABORT op->inputIndexes() is null (op=%s type=%d)",
+                        opName, (int)op->type());
+           return;
+       }
+       size_t idxCount = op->inputIndexes()->size();
+       if (idxCount != inputs.size()) {
+           MNN_HIAI_LOG("setNetworkInput: WARN inputIndexes.size=%zu != inputs.size=%zu (op=%s)",
+                        idxCount, inputs.size(), opName);
+       }
+       for (size_t i = 0; i < idxCount && i < inputs.size(); i++) {
             auto inputIndex = op->inputIndexes()->data()[i];
-            auto outputIndex = op->outputIndexes()->data()[i];
+            auto outputIndex = (op->outputIndexes() && i < op->outputIndexes()->size())
+                                ? op->outputIndexes()->data()[i] : -1;
             Tensor *inputTensor = inputs[i];
+            if (inputTensor == nullptr) {
+                MNN_HIAI_LOG("setNetworkInput: ABORT inputs[%zu] is null (op=%s)", i, opName);
+                continue;
+            }
             bool isInput = TensorUtils::getDescribe(inputTensor)->usage==Tensor::InsideDescribe::Usage::INPUT;
             if (isInput && mGrapMap.find(inputIndex) == mGrapMap.end()) {
                 auto opName = string("input") + to_string(inputIndex);
@@ -311,6 +352,35 @@ namespace MNN {
                 vector<int64_t> dims;
                 for(int32_t i = 0; i < inputTensor->buffer().dimensions; i++) {
                     dims.push_back(inputTensor->buffer().dim[i].extent);
+                }
+                // HiAI DDK rejects Data ops with rank > 4. For network inputs that
+                // come in as 5D (e.g. Qwen3VL rotary_pos_emb [2, 1, S, 1, D] carrying
+                // stacked cos/sin over seq/head), squeeze leading/middle unit dims
+                // until rank <= 4. Record the removed-dim indices so downstream
+                // consumers (NPUGatherV2) can compensate for the reshape.
+                // Byte layout is preserved — squeezing a size-1 dim is a no-op on
+                // the data, just relabels the shape.
+                std::vector<int> squeezedDims;
+                while (dims.size() > 4) {
+                    int removeAt = -1;
+                    for (size_t d = 0; d < dims.size(); d++) {
+                        if (dims[d] == 1) { removeAt = (int)d; break; }
+                    }
+                    if (removeAt < 0) break;
+                    dims.erase(dims.begin() + removeAt);
+                    squeezedDims.push_back(removeAt);
+                }
+                if (!squeezedDims.empty()) {
+                    mInputSqueezedAxes[inputIndex] = squeezedDims;
+#if HIAI_VERBOSE
+                    std::string sqStr;
+                    for (size_t k = 0; k < squeezedDims.size(); k++) {
+                        sqStr += std::to_string(squeezedDims[k]);
+                        if (k + 1 < squeezedDims.size()) sqStr += ",";
+                    }
+                    MNN_HIAI_LOG("  (squeezed unit dims [%s] to keep rank<=4 for input idx=%d)",
+                                 sqStr.c_str(), inputIndex);
+#endif
                 }
                 ge::TensorDesc desc(ge::Shape(dims), ge::FORMAT_NCHW, ge::DT_FLOAT);
                 if (TensorUtils::getDescribe(inputTensor)->dimensionFormat == MNN_DATA_FORMAT::MNN_DATA_FORMAT_NHWC) {
@@ -329,6 +399,18 @@ namespace MNN {
                 mGrapMap.insert(make_pair(inputIndex, ops));
                 std::pair<int, std::vector<ge::Operator>> item(outputIndex, {*data.get()});
                 mInputOps.insert(item);
+#if HIAI_VERBOSE
+                {
+                    std::string dimStr;
+                    for (size_t d = 0; d < dims.size(); d++) {
+                        dimStr += std::to_string(dims[d]);
+                        if (d + 1 < dims.size()) dimStr += "x";
+                    }
+                    MNN_HIAI_LOG("  +Data op name=%s idx=%d dims=[%s] dtype_code=%d bits=%d",
+                                 opName.c_str(), inputIndex, dimStr.c_str(),
+                                 (int)inputTensor->getType().code, (int)inputTensor->getType().bits);
+                }
+#endif
             }
 
             bool isConst = TensorUtils::getDescribe(inputTensor)->usage==Tensor::InsideDescribe::Usage::CONSTANT;
@@ -357,6 +439,18 @@ namespace MNN {
                         filter->SetData((uint8_t *)inputTensor->host<int64_t>(), inputTensor->elementSize() * sizeof(int64_t));
                     }
                     mConst->set_attr_value(filter);
+#if HIAI_VERBOSE
+                    {
+                        std::string dimStr;
+                        for (size_t d = 0; d < dims.size(); d++) {
+                            dimStr += std::to_string(dims[d]);
+                            if (d + 1 < dims.size()) dimStr += "x";
+                        }
+                        MNN_HIAI_LOG("  +Const op name=%s idx=%d dims=[%s] elemCnt=%d",
+                                     opName.c_str(), inputIndex, dimStr.c_str(),
+                                     inputTensor->elementSize());
+                    }
+#endif
                 }
                 vector<pair<shared_ptr<ge::Operator>, string>> ops;
                 ops.emplace_back(make_pair(mConst, ""));
@@ -369,7 +463,8 @@ namespace MNN {
 
         auto map = getCreatorMap();
         auto iter = map->find(op->type());
-        
+        const char* opName = (op && op->name()) ? op->name()->c_str() : "<anon>";
+
         if (iter == map->end()) {
             MNN_ERROR("map not find !!! \n");
             if(op != nullptr){
@@ -377,8 +472,13 @@ namespace MNN {
                     MNN_PRINT("[NPU] Don't support type %d, %s\n", op->type(), op->name()->c_str());
                 }
             }
+            MNN_HIAI_LOG("onCreate MISS: op_ptr=%p op_type=%d op_name=%s (no creator registered — fallback to CPU)",
+                         (const void*)op, (int)op->type(), opName);
             return nullptr;
         }
+
+        MNN_HIAI_LOG("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
+                     (const void*)op, (int)op->type(), opName, inputs.size(), outputs.size());
 
         auto exe = iter->second->onCreate(inputs, outputs, op, this);
 
@@ -389,6 +489,8 @@ namespace MNN {
                     MNN_PRINT("[NPU] The Creator Don't support type %d, %s\n", op->type(), op->name()->c_str());
                 }
             }
+            MNN_HIAI_LOG("onCreate FAIL: op_ptr=%p creator returned null for op_type=%d op_name=%s",
+                         (const void*)op, (int)op->type(), opName);
             return nullptr;
         }
 
@@ -396,10 +498,14 @@ namespace MNN {
     }
 
     void NPUBackend::NPUBackend::onExecuteBegin() const {
+        MNN_HIAI_LOG("onExecuteBegin");
     }
-    
+
     void NPUBackend::onExecuteEnd() const {
-        process(0);
+        MNN_HIAI_LOG("onExecuteEnd: -> process()");
+        int ret = process(0);
+        MNN_HIAI_LOG("onExecuteEnd: process ret=%d (%s)",
+                     ret, ret == 0 ? "OK" : "FAILED");
     }
 
     Backend::MemObj* NPUBackend::onAcquire(const Tensor* tensor, StorageType storageType) {
@@ -459,6 +565,11 @@ namespace MNN {
     }
 
     void NPUBackend::onResizeBegin() {
+#if HIAI_VERBOSE
+        mResizeTimerStart = std::chrono::steady_clock::now();
+#endif
+        MNN_HIAI_LOG("onResizeBegin: clearing existing graph state (was_compiled=%d)",
+                     mMgrClient != nullptr ? 1 : 0);
         mGrapMap.clear();
         mOutGEOpMap.clear();
         mInputOps.clear();
@@ -466,32 +577,57 @@ namespace MNN {
         mOutputTensors.clear();
         mMNNOutTensors.clear();
         mSclipMap.clear();
+        mInputSqueezedAxes.clear();
         if (mMgrClient != nullptr) {
             mMgrClient->UnLoadModel();
         }
     }
 
     ErrorCode NPUBackend::onResizeEnd() {
-        return bulidIRModelAndLoad();
+        MNN_HIAI_LOG("onResizeEnd: start IR build and load");
+#if HIAI_VERBOSE
+        auto t0 = std::chrono::steady_clock::now();
+#endif
+        auto code = bulidIRModelAndLoad();
+#if HIAI_VERBOSE
+        auto t1 = std::chrono::steady_clock::now();
+        double buildMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double totalMs = std::chrono::duration<double, std::milli>(t1 - mResizeTimerStart).count();
+        MNN_HIAI_LOG("onResizeEnd: %s (code=%d) build_and_load=%.1fms total_resize=%.1fms",
+                     code == NO_ERROR ? "OK" : "FAILED", (int)code, buildMs, totalMs);
+#else
+        MNN_HIAI_LOG("onResizeEnd: %s (code=%d)",
+                     code == NO_ERROR ? "OK" : "FAILED", (int)code);
+#endif
+        return code;
     }
 
     int NPUBackend::getInOutTensorInfo(string modelName) {
         if (mMgrClient == nullptr) {
+            MNN_HIAI_LOG("getInOutTensorInfo: mMgrClient is null, abort");
             return -1;
         }
         int ret = mMgrClient->GetModelIOTensorDim(modelName, mInputDimension, mOutputDimension);
         if (ret != hiai::AI_SUCCESS) {
             MNN_ERROR("[NPU] Get model IO Tensor failed: %d \n", ret);
+            MNN_HIAI_LOG("getInOutTensorInfo: GetModelIOTensorDim FAILED ret=%d", ret);
             return -1;
         }
 
         MNN_PRINT("mInputDimension : %lu , mOutputDimension : %lu \n", mInputDimension.size(), mOutputDimension.size());
+        MNN_HIAI_LOG("getInOutTensorInfo: npuInputs=%zu npuOutputs=%zu",
+                     mInputDimension.size(), mOutputDimension.size());
 
+        int idx = 0;
         for (auto in_dim : mInputDimension)
         {
             shared_ptr<hiai::AiTensor> input = make_shared<hiai::AiTensor>();
             input->Init(&in_dim);
             mInputTensors.push_back(input);
+            MNN_HIAI_LOG("  npuInput[%d] DIM:%u,%u,%u,%u", idx,
+                         in_dim.GetNumber(), in_dim.GetChannel(),
+                         in_dim.GetHeight(), in_dim.GetWidth());
+            idx++;
         }
         auto index = 0;
         for (auto out_dim : mOutputDimension)
@@ -513,6 +649,10 @@ namespace MNN {
                 index++;
             }
         }
+        if (mOutputTensors.size() != mMNNOutTensors.size()) {
+            MNN_HIAI_LOG("getInOutTensorInfo: MISMATCH npuOutputs=%zu vs mnnOutputs=%zu (onCopyBuffer will error)",
+                         mOutputTensors.size(), mMNNOutTensors.size());
+        }
         return 0;
     }
     ErrorCode NPUBackend::bulidIRModelAndLoad() {
@@ -525,54 +665,85 @@ namespace MNN {
             outputOps.push_back(*outOp.first.get());
         }
         MNN_PRINT("mOutputOps : %lu \n", outputOps.size());
+        MNN_HIAI_LOG("bulidIRModelAndLoad: graph_inputs=%zu graph_outputs=%zu mGrapMap.size=%zu",
+                     inputs.size(), outputOps.size(), mGrapMap.size());
 
         string graphName = string("Graph1");
         string version = string("model_v000011");
         string modelName = to_string(0);
         mModelName.push_back(modelName);
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 1] ge::Graph(%s) ctor", graphName.c_str());
         ge::Graph graph(graphName);
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 2] graph.SetInputs(%zu).SetOutputs(%zu) ...", inputs.size(), outputOps.size());
         graph.SetInputs(inputs).SetOutputs(outputOps);
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 3] SetInputs/SetOutputs DONE");
 
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 4] ge::Model ctor + SetGraph ...");
         ge::Model model(modelName, version);
         model.SetGraph(graph);
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 5] Model.SetGraph DONE");
 
 
         domi::HiaiIrBuild ir_build;
         domi::ModelBufferData om_model_buff;
 
+        // model.Save(buffer) serializes the entire Graph (including every Const weight)
+        // into a single FlatBuffer. For a 24-block ViT that's hundreds of MB — the peak
+        // RAM during serialization can exceed 3 GB on-device and will get OOM-killed by
+        // the HarmonyOS watchdog. The main IR build path (CreateModelBuff / BuildIRModel)
+        // takes `model` directly and does NOT need the saved buffer. Only dump the IR file
+        // when HIAI_DEBUG is on.
+#ifdef HIAI_DEBUG
         ge::Buffer buffer;
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 6a] model.Save() START (HIAI_DEBUG path — memory heavy)...");
         ge::GraphErrCodeStatus geret = model.Save(buffer);
         if (geret != 0) {
             MNN_ERROR("[NPU] Model save failed \n");
+            MNN_HIAI_LOG("bulidIRModelAndLoad: model.Save FAILED geret=%d", (int)geret);
+        } else {
+            MNN_HIAI_LOG("bulidIRModelAndLoad: model.Save OK bytes=%zu", buffer.GetSize());
         }
-#ifdef HIAI_DEBUG
         WriteToBufferFile(buffer, "/data/local/tmp/test.irpb");
+#else
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 6] model.Save() SKIPPED (HIAI_DEBUG off — saves RAM)");
 #endif
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 7] CreateModelBuff() START ...");
         bool createBufferSuc = ir_build.CreateModelBuff(model, om_model_buff);
 
         if (!createBufferSuc) {
             MNN_ERROR("[NPU] Create Model Buff failed \n");
+            MNN_HIAI_LOG("bulidIRModelAndLoad: CreateModelBuff FAILED");
+        } else {
+            MNN_HIAI_LOG("bulidIRModelAndLoad: CreateModelBuff OK length=%u", (unsigned)om_model_buff.length);
         }
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 8] BuildIRModel() START (this can take 30s-5min for large graphs) ...");
         bool buildIRSuc = ir_build.BuildIRModel(model, om_model_buff);
         if (!buildIRSuc) {
             MNN_ERROR("[NPU] IR model build failed  \n");
+            MNN_HIAI_LOG("bulidIRModelAndLoad: BuildIRModel FAILED (likely unsupported op attr, dtype or shape in graph)");
             ir_build.ReleaseModelBuff(om_model_buff);
             return INVALID_VALUE;
         }
+        MNN_HIAI_LOG("bulidIRModelAndLoad: BuildIRModel OK out_length=%u", (unsigned)om_model_buff.length);
 #ifdef HIAI_DEBUG
         WriteToOMFile(om_model_buff, "/data/local/tmp/test.om");
 #endif
+        MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 9] LoadModelSync() START ...");
         mMgrClient = LoadModelSync(om_model_buff, modelName);
 
         if (mMgrClient == nullptr) {
             MNN_ERROR("[NPU] Model Manager Client is null \n");
+            MNN_HIAI_LOG("bulidIRModelAndLoad: LoadModelSync FAILED (NPU firmware rejected OM model)");
             ir_build.ReleaseModelBuff(om_model_buff);
             return INVALID_VALUE;
         }
+        MNN_HIAI_LOG("bulidIRModelAndLoad: LoadModelSync OK model=%s", modelName.c_str());
 
         ir_build.ReleaseModelBuff(om_model_buff);
 
         int result = getInOutTensorInfo(modelName);
+        MNN_HIAI_LOG("bulidIRModelAndLoad: getInOutTensorInfo %s",
+                     result == 0 ? "OK" : "FAILED");
         return (result == 0) ? NO_ERROR : INVALID_VALUE;
     }
 
@@ -587,9 +758,30 @@ namespace MNN {
 
         int istamp;
 
-        int ret = mMgrClient->Process(context, *(const_cast<vector<shared_ptr<hiai::AiTensor>>*>(&mInputTensors)), 
+#if HIAI_VERBOSE
+        auto t0 = std::chrono::steady_clock::now();
+#endif
+        MNN_HIAI_LOG("process: modelIdx=%d inTensors=%zu outTensors=%zu -> Process(..)",
+                     modelIndex, mInputTensors.size(), mOutputTensors.size());
+        int ret = mMgrClient->Process(context, *(const_cast<vector<shared_ptr<hiai::AiTensor>>*>(&mInputTensors)),
                                       *(const_cast<vector<shared_ptr<hiai::AiTensor>>*>(&mOutputTensors)), 1000,
                                       istamp);
+#if HIAI_VERBOSE
+        auto t1 = std::chrono::steady_clock::now();
+        double processMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (ret != 0) {
+            MNN_HIAI_LOG("process: FAILED ret=%d in %.1fms (NPU runtime error — check shapes)",
+                         ret, processMs);
+        } else {
+            MNN_HIAI_LOG("process: OK istamp=%d in %.1fms", istamp, processMs);
+        }
+#else
+        if (ret != 0) {
+            MNN_HIAI_LOG("process: FAILED ret=%d (NPU runtime error — check if inputs matched compiled shape)", ret);
+        } else {
+            MNN_HIAI_LOG("process: OK istamp=%d", istamp);
+        }
+#endif
 #ifdef HIAI_DEBUG
         ATrace_endSection();
 #endif
@@ -597,26 +789,63 @@ namespace MNN {
     }
 
     shared_ptr<ge::Operator> NPUBackend::getInputOps(const Op *op, int index) {
+        const char* opName = (op && op->name()) ? op->name()->c_str() : "<anon>";
+        int opType = op ? (int)op->type() : -1;
+        if (op == nullptr || op->inputIndexes() == nullptr) {
+            MNN_HIAI_LOG("getInputOps: ABORT op=%s type=%d has null inputIndexes — returning empty Data stub",
+                         opName, opType);
+            // Return an empty Data op stub so callers that do `*xOp.get()` don't segfault;
+            // the graph will fail BuildIRModel later (visible in logs) rather than crashing here.
+            return std::make_shared<hiai::op::Data>(string("_bad_input_stub_") + to_string((uintptr_t)op));
+        }
         vector<shared_ptr<ge::Operator>> ops;
         bool find = false;
         for (size_t i = 0; i < op->inputIndexes()->size(); i++){
             auto inputIndex = op->inputIndexes()->data()[i];
-            // printf("inputIndex : %d \n", inputIndex);
             auto iter = mGrapMap.find(inputIndex);
             if(iter != mGrapMap.end()){
                 find = true;
                 auto xOp        = iter->second.back().first;
                 ops.emplace_back(xOp);
+            } else {
+                MNN_HIAI_LOG("getInputOps: miss producer idx=%d for op=%s type=%d (i=%zu)",
+                             inputIndex, opName, opType, i);
             }
         }
         if(find == false){
             MNN_PRINT("not find input \n ");
+            MNN_HIAI_LOG("getInputOps: ALL producers missing for op=%s type=%d inCnt=%u",
+                         opName, opType, (unsigned)op->inputIndexes()->size());
         };
+        if (ops.empty() || index < 0 || index >= (int)ops.size()) {
+            MNN_HIAI_LOG("getInputOps: ABORT out-of-bounds op=%s type=%d requested idx=%d but ops.size=%zu",
+                         opName, opType, index, ops.size());
+            return std::make_shared<hiai::op::Data>(string("_oob_input_stub_") + to_string((uintptr_t)op));
+        }
         return ops[index];
     }
 
     void NPUBackend::setOutputOps(const Op *op, vector<shared_ptr<ge::Operator>>&& HIAI_op,
                                   const std::vector<Tensor *> &outputs){
+        const char* opNameStr = (op && op->name()) ? op->name()->c_str() : "<anon>";
+        MNN_HIAI_LOG("setOutputOps: op=%s type=%d hiaiChain=%zu outputs=%zu",
+                     opNameStr, op ? (int)op->type() : -1, HIAI_op.size(), outputs.size());
+#if HIAI_VERBOSE
+        // Log each output tensor's shape; same reason as setNetworkInput.
+        for (size_t i = 0; i < outputs.size(); i++) {
+            Tensor* t = outputs[i];
+            if (t == nullptr) { continue; }
+            std::string dimStr;
+            int nd = t->buffer().dimensions;
+            for (int d = 0; d < nd; d++) {
+                dimStr += std::to_string(t->buffer().dim[d].extent);
+                if (d + 1 < nd) dimStr += "x";
+            }
+            bool bad = (nd > 4);
+            MNN_HIAI_LOG("  out[%zu] rank=%d dims=[%s]%s",
+                         i, nd, dimStr.c_str(), bad ? "  <<<<< 5D+  HiAI rejects" : "");
+        }
+#endif
         if(op->type() == OpType_Slice || op->type() == OpType_TopKV2){
             for (size_t i = 0; i < op->outputIndexes()->size(); i++){
                 auto index = op->outputIndexes()->data()[i];
@@ -635,7 +864,7 @@ namespace MNN {
         MNNTensorList tensors;
         for (auto out: outputs)
         {
-            bool isOutput = (TensorUtils::getDescribe(out)->usage 
+            bool isOutput = (TensorUtils::getDescribe(out)->usage
                             ==Tensor::InsideDescribe::Usage::OUTPUT);
             if(isOutput == true){
                 tensors.push_back(out);
@@ -643,6 +872,7 @@ namespace MNN {
         }
         if(!tensors.empty()) {
             mOutGEOpMap.insert(make_pair(HIAI_op[HIAI_op.size()-1], tensors));
+            MNN_HIAI_LOG("  +terminal output(s) registered: count=%zu", tensors.size());
         }
     }
 
