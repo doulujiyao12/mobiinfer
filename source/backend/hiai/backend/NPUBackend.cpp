@@ -506,11 +506,13 @@ namespace MNN {
         MNN_HIAI_LOG("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
                      (const void*)op, (int)op->type(), opName, inputs.size(), outputs.size());
 
+#if defined(MNN_HIAI_FREE_CONST_HOST) && (MNN_HIAI_FREE_CONST_HOST + 0)
         for (auto input : inputs) {
             if (TensorUtils::getDescribe(input)->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
                 addConstRef(input);
             }
         }
+#endif
 
         auto exe = iter->second->onCreate(inputs, outputs, op, this);
 
@@ -592,7 +594,11 @@ namespace MNN {
                 }
             }
             if(flag == false) {
-                MNN_HIAI_LOG("MNNTensor and HIAITensor mismatch!");
+                MNN_HIAI_LOG("MNNTensor and HIAITensor mismatch! srcTensor=%p dstTensor=%p mMNNOutTensors.size=%zu", 
+                             srcTensor, dstTensor, mMNNOutTensors.size());
+                for(size_t i=0; i<mMNNOutTensors.size(); i++) {
+                    MNN_HIAI_LOG("  mMNNOutTensors[%zu]=%p usage=%d", i, mMNNOutTensors[i], TensorUtils::getDescribe(mMNNOutTensors[i])->usage);
+                }
                 return;
             }
 

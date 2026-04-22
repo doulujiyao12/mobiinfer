@@ -16,7 +16,7 @@
 
 // Set to 1 (or pass -DHIAI_VERBOSE=1 to compiler) to print detailed op info at compile time
 #ifndef HIAI_VERBOSE
-#define HIAI_VERBOSE 1
+#define HIAI_VERBOSE 0
 #endif
 
 // Gate for the int8-path diagnostic helpers (isolation probe, extra failure
@@ -24,7 +24,7 @@
 // hunting the BuildIRModel failure; pass -DHIAI_INT8_DIAG=0 to strip the
 // code & output once the int8 path works.
 #ifndef HIAI_INT8_DIAG
-#define HIAI_INT8_DIAG 1
+#define HIAI_INT8_DIAG 0
 #endif
 
 namespace MNN {

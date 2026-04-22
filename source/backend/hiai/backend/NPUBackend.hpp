@@ -9,6 +9,16 @@
 #ifndef MNN_NPUBACKEND_H
 #define MNN_NPUBACKEND_H
 
+// Enable freeing the host-side memory of CONSTANT input tensors (weights / biases)
+// after they have been copied into HiAI Const ops during graph build. This shrinks
+// peak RAM during multi-chunk NPU model load, at the cost of requiring every
+// consumer op to call NPUBackend::consumeConst exactly as many times as
+// addConstRef was called.
+//
+// Comment out (or pass -DMNN_HIAI_FREE_CONST_HOST=0) to keep the legacy behaviour
+// of retaining host weights across the lifetime of the session.
+#define MNN_HIAI_FREE_CONST_HOST 1
+
 #include <graph/attr_value.h>
 #include <graph/operator_hiai_reg.h>
 #include <graph/op/all_ops.h>

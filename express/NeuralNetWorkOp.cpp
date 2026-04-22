@@ -1738,6 +1738,26 @@ VARP _CosineSimilarity(VARP input0, VARP input1, VARP inputDim) {
     return (Variable::create(Expr::create(std::move(cosineSimilarityOp), {input0, input1, inputDim})));
 }
 
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+VARP _Attention(VARP query, VARP key, VARP value, VARP mask, bool kv_cache) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type       = OpType_Attention;
+    op->main.type  = OpParameter_AttentionParam;
+    op->main.value = new AttentionParamT;
+    op->main.AsAttentionParam()->kv_cache = kv_cache;
+    std::vector<VARP> inputs = {query, key, value};
+    if (mask.get() != nullptr) {
+        inputs.push_back(mask);
+    }
+    return Variable::create(Expr::create(std::move(op), std::move(inputs)));
+}
+#else
+VARP _Attention(VARP, VARP, VARP, VARP, bool) {
+    MNN_ERROR("_Attention requires MNN_SUPPORT_TRANSFORMER_FUSE=ON\n");
+    return nullptr;
+}
+#endif
+
 VARP _GridSample(VARP input, VARP grid, InterpolationMethod mode, GridSamplePaddingMode paddingMode, bool alignCorners) {
     std::unique_ptr<OpT> op(new OpT);
     op->type                                       = OpType_GridSample;

@@ -80,7 +80,9 @@ ErrorCode NPUConvolution::onResize(const std::vector<Tensor *> &inputs, const st
                     filter->SetTensorDesc(fdesc);
                     filter->SetData((uint8_t *)inputs[1]->host<float>(), weightSize * sizeof(float));
                     mConst_w.set_attr_value(filter);
+#if defined(MNN_HIAI_FREE_CONST_HOST) && (MNN_HIAI_FREE_CONST_HOST + 0)
                     mNpuBackend->consumeConst(inputs[1]);
+#endif
                 }
                 {
                     weightSize = inputs[2]->elementSize();
@@ -89,7 +91,9 @@ ErrorCode NPUConvolution::onResize(const std::vector<Tensor *> &inputs, const st
                     filter->SetTensorDesc(fdesc);
                     filter->SetData((uint8_t *)inputs[2]->host<float>(), weightSize * sizeof(float));
                     mConst_b.set_attr_value(filter);
+#if defined(MNN_HIAI_FREE_CONST_HOST) && (MNN_HIAI_FREE_CONST_HOST + 0)
                     mNpuBackend->consumeConst(inputs[2]);
+#endif
                 }
             }
         }
