@@ -11,11 +11,13 @@
 #endif
 #include <regex>
 #include <algorithm>
+#include <cctype>
 #include <random>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <cstdlib>
+#include <MNN/Interpreter.hpp>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
 #include "omni.hpp"
@@ -36,6 +38,10 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+#ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#endif
 
 namespace {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -123,6 +129,40 @@ static void dumpVarpToLog(std::ofstream& ofs, const std::string& name, VARP var)
         ofs << ptr[i] << " ";
     }
     ofs << "\n";
+}
+
+static std::string varShapeString(const VARP& v) {
+    if (v.get() == nullptr || v->getInfo() == nullptr) return "<null>";
+    std::ostringstream oss;
+    auto info = v->getInfo();
+    for (int i = 0; i < (int)info->dim.size(); i++) {
+        oss << info->dim[i];
+        if (i + 1 < (int)info->dim.size()) oss << "x";
+    }
+    return oss.str();
+}
+
+static VARP makeHostBridgeVar(const VARP& src, const char* name) {
+    if (src.get() == nullptr || src->getInfo() == nullptr) return src;
+    auto info = src->getInfo();
+    auto srcHost = src->readMap<uint8_t>();
+    if (srcHost == nullptr) {
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: source host null, keep original var (shape=[%s])\n",
+                  varShapeString(src).c_str());
+        return src;
+    }
+    auto bridge = Express::_Input(info->dim, NCHW, info->type);
+    auto dstHost = bridge->writeMap<uint8_t>();
+    if (dstHost == nullptr) {
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: bridge writeMap null, keep original var (shape=[%s])\n",
+                  varShapeString(src).c_str());
+        return src;
+    }
+    ::memcpy(dstHost, srcHost, (size_t)info->size * (size_t)info->type.bytes());
+    if (name != nullptr) {
+        bridge->setName(name);
+    }
+    return bridge;
 }
 }
 
@@ -236,7 +276,10 @@ bool Omni::load() {
             npuCfg.backendConfig = &npuBackendConfig;
             mVisionBlocksRuntimeManager.reset(
                 Executor::RuntimeManager::createRuntimeManager(npuCfg));
-            setRuntimeHint(mVisionBlocksRuntimeManager);
+            // A/B switch: vision encoder blocks should not rely on decoder KV
+            // hints. Keep default behavior (true) unless explicitly disabled.
+            bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", true);
+            setRuntimeHint(mVisionBlocksRuntimeManager, visualBlocksKvHints);
 
             Module::Config npuModuleCfg;
             if (npuCfg.type == MNN_FORWARD_USER_0 ||
@@ -268,11 +311,50 @@ bool Omni::load() {
             //  (c) default: monolithic visual_blocks.mnn on the NPU runtime.
             auto chunkPaths = mConfig->visual_blocks_chunks();
             if (!chunkPaths.empty()) {
+                // Optional per-chunk backend routing.
+                // If absent, keep historical behavior: all chunks on NPU runtime.
+                std::vector<bool> chunkRunOnNpu(chunkPaths.size(), true);
+                if (mConfig->config_.contains("visual_blocks_chunk_backends")) {
+                    auto arr = mConfig->config_["visual_blocks_chunk_backends"];
+                    if (!arr.is_array() || arr.size() != chunkPaths.size()) {
+                        MNN_ERROR("visual_blocks_chunk_backends must be an array and size must equal visual_blocks_chunks (%zu)\n",
+                                  chunkPaths.size());
+                        return false;
+                    }
+                    for (size_t i = 0; i < arr.size(); i++) {
+                        if (!arr[i].is_string()) {
+                            MNN_ERROR("visual_blocks_chunk_backends[%zu] must be string 'cpu' or 'npu'\n", i);
+                            return false;
+                        }
+                        auto bk = arr[i].get<std::string>();
+                        std::transform(bk.begin(), bk.end(), bk.begin(),
+                                       [](unsigned char c) { return (char)std::tolower(c); });
+                        if (bk == "cpu") {
+                            chunkRunOnNpu[i] = false;
+                        } else if (bk == "npu" || bk == "hiai") {
+                            chunkRunOnNpu[i] = true;
+                        } else {
+                            MNN_ERROR("visual_blocks_chunk_backends[%zu] invalid value: %s (expect cpu/npu)\n",
+                                      i, bk.c_str());
+                            return false;
+                        }
+                    }
+                }
                 mVisionBlocksChunkModules.reserve(chunkPaths.size());
+                const auto npuCacheBaseDir = mConfig->npu_model_dir();
                 for (size_t i = 0; i < chunkPaths.size(); i++) {
+                    auto targetRuntime = chunkRunOnNpu[i] ? mVisionBlocksRuntimeManager : mProcessorRuntimeManager;
+                    auto targetModuleCfg = chunkRunOnNpu[i] ? &npuModuleCfg : &module_config;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                    if (chunkRunOnNpu[i] && !npuCacheBaseDir.empty()) {
+                        auto chunkNpuDir = npuCacheBaseDir + "/chunk_" + std::to_string(i);
+                        mVisionBlocksRuntimeManager->setExternalPath(
+                            chunkNpuDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                    }
+#endif
                     std::shared_ptr<Module> mod(Module::load(
                         {}, {}, chunkPaths[i].c_str(),
-                        mVisionBlocksRuntimeManager, &npuModuleCfg));
+                        targetRuntime, targetModuleCfg));
                     if (nullptr == mod.get()) {
                         MNN_ERROR("visual_blocks chunk[%zu] load failed: %s\n",
                                   i, chunkPaths[i].c_str());
@@ -280,6 +362,12 @@ bool Omni::load() {
                     }
                     mVisionBlocksChunkModules.push_back(mod);
                 }
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                if (!npuCacheBaseDir.empty()) {
+                    mVisionBlocksRuntimeManager->setExternalPath(
+                        npuCacheBaseDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                }
+#endif
             } else if (mConfig->visual_npu_layers() > 0) {
                 mVisionBlocksNpuModule.reset(Module::load(
                     {}, {}, mConfig->visual_blocks_npu_model().c_str(),
@@ -572,6 +660,19 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                       preOut.size());
             return std::vector<int>(0);
         }
+        // Pre outputs / mask may come from non-CPU runtime; force host materialize
+        // before feeding blocks to avoid src.host==NULL during NPU input copy.
+        auto pre0Ptr = preOut[0]->readMap<void>();
+        auto pre1Ptr = preOut[1]->readMap<void>();
+        auto maskPtr = attention_mask->readMap<void>();
+        if (pre0Ptr == nullptr || pre1Ptr == nullptr || maskPtr == nullptr) {
+            MNN_ERROR("[vision-chunk] pre materialize null: pre0=%p pre1=%p mask=%p "
+                      "pre0Shape=[%s] pre1Shape=[%s] maskShape=[%s]\n",
+                      pre0Ptr, pre1Ptr, maskPtr,
+                      varShapeString(preOut[0]).c_str(),
+                      varShapeString(preOut[1]).c_str(),
+                      varShapeString(attention_mask).c_str());
+        }
         VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
         VARPS blocksOut;
         if (!mVisionBlocksChunkModules.empty()) {
@@ -584,12 +685,27 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
             VARPS allDeepstack;
             for (size_t i = 0; i < mVisionBlocksChunkModules.size(); i++) {
                 VARPS chunkIn = {curHidden, preOut[1], attention_mask};
+                // Mixed CPU/NPU chunk routing requires explicit host-side materialize
+                // before each chunk run.
+                auto in0 = chunkIn[0]->readMap<void>();
+                auto in1 = chunkIn[1]->readMap<void>();
+                auto in2 = chunkIn[2]->readMap<void>();
+                if (in0 == nullptr || in1 == nullptr || in2 == nullptr) {
+                    MNN_ERROR("[vision-chunk] chunk[%zu] input host null: in0=%p in1=%p in2=%p "
+                              "shape0=[%s] shape1=[%s] shape2=[%s]\n",
+                              i, in0, in1, in2,
+                              varShapeString(chunkIn[0]).c_str(),
+                              varShapeString(chunkIn[1]).c_str(),
+                              varShapeString(chunkIn[2]).c_str());
+                }
                 auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
                 if (chunkOut.empty()) {
                     MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
                     return std::vector<int>(0);
                 }
-                curHidden = chunkOut[0];
+                // Bridge NPU output through an explicit host-backed VARP before
+                // feeding the next chunk, to avoid src.host==NULL in onCopyBuffer.
+                curHidden = makeHostBridgeVar(chunkOut[0], "vision_chunk_hidden_bridge");
                 // Each HiAI model has isolated ION I/O buffers, so chunk-to-chunk
                 // handoff must go through a host copy. Express allocates the host
                 // intermediate lazily; force materialize every chunk output to host
@@ -598,7 +714,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                 (void)curHidden->readMap<void>();
                 for (size_t j = 1; j < chunkOut.size(); j++) {
                     (void)chunkOut[j]->readMap<void>();
-                    allDeepstack.push_back(chunkOut[j]);
+                    allDeepstack.push_back(makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge"));
                 }
             }
             blocksOut.reserve(1 + allDeepstack.size());
@@ -617,6 +733,9 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                 MNN_ERROR("visual_blocks_npu: empty output\n");
                 return std::vector<int>(0);
             }
+            (void)npuOut[0]->readMap<void>();
+            (void)preOut[1]->readMap<void>();
+            (void)attention_mask->readMap<void>();
             VARPS cpuIn = {npuOut[0], preOut[1], attention_mask};
             auto cpuOut = mVisionBlocksCpuModule->onForward(cpuIn);
             if (cpuOut.empty()) {

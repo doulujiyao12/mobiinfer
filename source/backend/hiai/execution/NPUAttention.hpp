@@ -11,6 +11,10 @@
 #ifndef MNN_NPUAttention_HPP
 #define MNN_NPUAttention_HPP
 
+#ifndef MNN_HIAI_USE_LOCAL_NPU_FIXES
+#define MNN_HIAI_USE_LOCAL_NPU_FIXES 1
+#endif
+
 #include "NPUCommonExecution.hpp"
 
 namespace MNN {
@@ -25,6 +29,12 @@ private:
     hiai::op::Const mScaleConst;
     hiai::op::Const mOutShapeConst;
     hiai::op::Const mMaskShapeConst;
+
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+    float mScaleData;
+    std::vector<int32_t> mOutShapeData;
+    std::vector<int32_t> mMaskShapeData;
+#endif
 };
 
 } // namespace MNN

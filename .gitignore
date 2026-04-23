@@ -467,3 +467,4 @@ transformers/llm/export/visual_blocks.mnn
 transformers/llm/export/visual_blocks.mnn.weight
 transformers/llm/export/model_allnpuvisualfp16/
 transformers/llm/export/model_chunk6_npufp16/
+transformers/llm/export/model_12chunk_4bit/

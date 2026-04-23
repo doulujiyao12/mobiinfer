@@ -135,7 +135,7 @@ void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCall
     mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
-void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg) {
+void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg, bool enable_kv_hints) {
     rtg->setHint(MNN::Interpreter::INIT_THREAD_NUMBER, 4);
 
     rtg->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);
@@ -144,9 +144,10 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     int legacyAttentionMode = mConfig->config_.value("quant_qkv", 8); // compatibility
     int attentionMode = mConfig->config_.value("attention_mode", legacyAttentionMode); // try to read 'attention_mode'
 
-    // 3. 设置 Hint
+    // 3. Configure attention-related hints. For vision-only runtimes we can
+    // disable KV-related hinting to avoid accidental decoder-style behavior.
     rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, attentionMode);
-    if (mConfig->reuse_kv() && attentionMode == 10) {
+    if (enable_kv_hints && mConfig->reuse_kv() && attentionMode == 10) {
         rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, 9);
     }
     if (mConfig->use_cached_mmap()) {
@@ -165,7 +166,7 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     rtg->setExternalPath(mConfig->npu_model_dir(), MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
     rtg->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, mConfig->config_.value("dynamic_option", 0));
 
-    rtg->setHintPtr(Interpreter::KVCACHE_INFO, mMeta.get());
+    rtg->setHintPtr(Interpreter::KVCACHE_INFO, enable_kv_hints ? mMeta.get() : nullptr);
     if (backend_type_convert(mConfig->backend_type()) != 0) { // not cpu
         std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";
         rtg->setCache(cacheFilePath + "/mnn_cachefile.bin");

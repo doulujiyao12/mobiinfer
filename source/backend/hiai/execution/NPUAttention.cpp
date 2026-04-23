@@ -22,6 +22,7 @@
 
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 
+#include <algorithm>
 #include <cmath>
 #include "NPUAttention.hpp"
 #include "NPUBackend.hpp"
@@ -56,13 +57,25 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     }
     const int batch    = query->length(0);
     const int seqLen   = query->length(1);
+    const int kvLen    = key->length(1);
     const int numHead  = query->length(2);
     const int headDim  = query->length(3);
+    auto attnParam = mOp ? mOp->main_as_AttentionParam() : nullptr;
+    const bool isDecoder = (attnParam != nullptr) && attnParam->kv_cache();
+    const int pastLen = isDecoder ? std::max(0, kvLen - seqLen) : 0;
+    const bool hasKvCacheInfo = (mNpuBackend->getMetaPtr() != nullptr);
+    const int attentionOption = mNpuBackend->attentionOptionHint();
     MNN_HIAI_LOG("  Q[B=%d,Sq=%d,H=%d,D=%d] K[%d,%d,%d,%d] V[%d,%d,%d,%d] mask=%s",
                  batch, seqLen, numHead, headDim,
                  key->length(0), key->length(1), key->length(2), key->length(3),
                  value->length(0), value->length(1), value->length(2), value->length(3),
                  inputs.size() >= 4 ? "yes" : "no");
+    MNN_HIAI_LOG("  attn_debug: is_decoder=%d q_len=%d kv_len=%d past_len=%d has_kvcache_info=%d attention_option=%d",
+                 isDecoder ? 1 : 0, seqLen, kvLen, pastLen, hasKvCacheInfo ? 1 : 0, attentionOption);
+    if (!isDecoder && (pastLen != 0 || hasKvCacheInfo)) {
+        MNN_HIAI_LOG("  attn_warn: encoder attention sees decoder-ish signals (past_len=%d, has_kvcache_info=%d)",
+                     pastLen, hasKvCacheInfo ? 1 : 0);
+    }
 
     // Fetch graph ops for Q, K, V.
     auto qIndex = mOp->inputIndexes()->data()[0];
@@ -82,33 +95,58 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     auto kOp    = mNpuBackend->mGrapMap[kIndex].back().first;
     auto vOp    = mNpuBackend->mGrapMap[vIndex].back().first;
 
-    // 1) Permute Q/K/V from [B, S, H, D] to [B, H, S, D]: order = {0, 2, 1, 3}
+    // 1) Permute Q/K/V
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+    // Q, V: [B, S, H, D] -> [B, H, S, D]: order = {0, 2, 1, 3}
+    // K: [B, S, H, D] -> [B, H, D, S]: order = {0, 2, 3, 1}
     const vector<int64_t> toHead = {0, 2, 1, 3};
+    const vector<int64_t> kToHead = {0, 2, 3, 1};
+#else
+    // Q/K/V: [B, S, H, D] -> [B, H, S, D]: order = {0, 2, 1, 3}
+    const vector<int64_t> toHead = {0, 2, 1, 3};
+#endif
     shared_ptr<hiai::op::Permute> qPerm(new hiai::op::Permute(opName + "_q_perm"));
     (*qPerm).set_input_x(*qOp.get()).set_attr_order(toHead);
     shared_ptr<hiai::op::Permute> kPerm(new hiai::op::Permute(opName + "_k_perm"));
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+    (*kPerm).set_input_x(*kOp.get()).set_attr_order(kToHead);
+#else
     (*kPerm).set_input_x(*kOp.get()).set_attr_order(toHead);
+#endif
     shared_ptr<hiai::op::Permute> vPerm(new hiai::op::Permute(opName + "_v_perm"));
     (*vPerm).set_input_x(*vOp.get()).set_attr_order(toHead);
 
     // 2) Scale Q by 1/sqrt(headDim) using a scalar const + Mul.
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+    mScaleData = 1.0f / std::sqrt(static_cast<float>(headDim));
+#else
     const float scale = 1.0f / std::sqrt(static_cast<float>(headDim));
+#endif
     mScaleConst = hiai::op::Const(opName + "_scale_const");
     {
         vector<int64_t> scaleShape{1};
         ge::TensorDesc sdesc(ge::Shape(scaleShape), ge::FORMAT_NCHW, ge::DT_FLOAT);
         ge::TensorPtr sTensor = std::make_shared<ge::Tensor>();
         sTensor->SetTensorDesc(sdesc);
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        sTensor->SetData(reinterpret_cast<const uint8_t *>(&mScaleData), sizeof(float));
+#else
         sTensor->SetData(reinterpret_cast<const uint8_t *>(&scale), sizeof(float));
+#endif
         mScaleConst.set_attr_value(sTensor);
     }
     shared_ptr<hiai::op::Mul> qScaled(new hiai::op::Mul(opName + "_q_scale"));
     (*qScaled).set_input_x1(*qPerm.get()).set_input_x2(mScaleConst);
 
-    // 3) QK^T: BatchMatMul with adj_x2=true produces [B, H, S_q, S_kv].
+    // 3) QK^T: BatchMatMul produces [B, H, S_q, S_kv].
     shared_ptr<hiai::op::BatchMatMul> qk(new hiai::op::BatchMatMul(opName + "_qk"));
     (*qk).set_input_x1(*qScaled.get()).set_input_x2(*kPerm.get())
-         .set_attr_adj_x1(false).set_attr_adj_x2(true);
+         .set_attr_adj_x1(false)
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+         .set_attr_adj_x2(false);
+#else
+         .set_attr_adj_x2(true);
+#endif
 
     shared_ptr<ge::Operator> preSoftmax = qk;
     shared_ptr<hiai::op::Add> masked;
@@ -127,14 +165,24 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
         // to 4D [B, 1, S_q, S_kv] so both Add operands have matching rank=4.
         int maskDims = mask->buffer().dimensions;
         if (maskDims == 3) {
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+            mMaskShapeData = {batch, 1, mask->length(1), mask->length(2)};
+            vector<int64_t> shapeShape{static_cast<int64_t>(mMaskShapeData.size())};
+#else
             vector<int32_t> maskShape = {batch, 1, mask->length(1), mask->length(2)};
             vector<int64_t> shapeShape{static_cast<int64_t>(maskShape.size())};
+#endif
             mMaskShapeConst = hiai::op::Const(opName + "_mask_shape");
             ge::TensorDesc sdesc(ge::Shape(shapeShape), ge::FORMAT_NCHW, ge::DT_INT32);
             ge::TensorPtr sTensor = std::make_shared<ge::Tensor>();
             sTensor->SetTensorDesc(sdesc);
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+            sTensor->SetData(reinterpret_cast<const uint8_t *>(mMaskShapeData.data()),
+                             mMaskShapeData.size() * sizeof(int32_t));
+#else
             sTensor->SetData(reinterpret_cast<const uint8_t *>(maskShape.data()),
                              maskShape.size() * sizeof(int32_t));
+#endif
             mMaskShapeConst.set_attr_value(sTensor);
 
             maskReshape.reset(new hiai::op::Reshape(opName + "_mask_reshape"));
@@ -167,12 +215,21 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     // 7) Reshape to [B, S_q, H*D].
     mOutShapeConst = hiai::op::Const(opName + "_out_shape");
     {
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        mOutShapeData = {batch, seqLen, numHead * headDim};
+        vector<int64_t> shapeShape{static_cast<int64_t>(mOutShapeData.size())};
+#else
         vector<int32_t> outShape = {batch, seqLen, numHead * headDim};
         vector<int64_t> shapeShape{static_cast<int64_t>(outShape.size())};
+#endif
         ge::TensorDesc sdesc(ge::Shape(shapeShape), ge::FORMAT_NCHW, ge::DT_INT32);
         ge::TensorPtr sTensor = std::make_shared<ge::Tensor>();
         sTensor->SetTensorDesc(sdesc);
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        sTensor->SetData(reinterpret_cast<const uint8_t *>(mOutShapeData.data()), mOutShapeData.size() * sizeof(int32_t));
+#else
         sTensor->SetData(reinterpret_cast<const uint8_t *>(outShape.data()), outShape.size() * sizeof(int32_t));
+#endif
         mOutShapeConst.set_attr_value(sTensor);
     }
     shared_ptr<hiai::op::Reshape> reshape(new hiai::op::Reshape(opName + "_reshape"));

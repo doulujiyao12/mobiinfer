@@ -10,6 +10,9 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 #include <core/Macro.h>
 #include <core/TensorUtils.hpp>
 #include <stdlib.h>
@@ -21,6 +24,67 @@
     #include <sys/time.h>
 #endif
 namespace MNN {
+    static const char* usageName(Tensor::InsideDescribe::Usage usage) {
+        switch (usage) {
+            case Tensor::InsideDescribe::Usage::INPUT: return "INPUT";
+            case Tensor::InsideDescribe::Usage::OUTPUT: return "OUTPUT";
+            case Tensor::InsideDescribe::Usage::CONSTANT: return "CONST";
+            default: return "OTHER";
+        }
+    }
+
+    static std::string tensorShapeString(const Tensor* t) {
+        if (t == nullptr) return "<null>";
+        std::ostringstream oss;
+        int nd = t->buffer().dimensions;
+        for (int i = 0; i < nd; i++) {
+            oss << t->buffer().dim[i].extent;
+            if (i + 1 < nd) oss << "x";
+        }
+        return oss.str();
+    }
+
+    static bool fileExists(const std::string& path) {
+        struct stat st;
+        return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    }
+
+    static bool ensureDirRecursive(const std::string& path) {
+        if (path.empty()) {
+            return false;
+        }
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0) {
+            return S_ISDIR(st.st_mode);
+        }
+        size_t pos = path.find_last_of('/');
+        if (pos != std::string::npos && pos > 0) {
+            auto parent = path.substr(0, pos);
+            if (!parent.empty() && !ensureDirRecursive(parent)) {
+                return false;
+            }
+        }
+        return ::mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+    }
+
+    static bool readFileToVector(const std::string& path, std::vector<uint8_t>& out) {
+        std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+        if (!ifs.good()) {
+            return false;
+        }
+        auto endPos = ifs.tellg();
+        if (endPos <= 0) {
+            return false;
+        }
+        size_t size = static_cast<size_t>(endPos);
+        out.resize(size);
+        ifs.seekg(0, std::ios::beg);
+        if (!ifs.read(reinterpret_cast<char*>(out.data()), size)) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
 
     void MNNPackC4Uint8(uint8_t* dst, const uint8_t* src, size_t area, size_t depth) {
         int z, x;
@@ -201,7 +265,7 @@ namespace MNN {
         fclose(fp);
         return true;
     }
-
+#endif
     bool WriteToOMFile(domi::ModelBufferData om_model_buff, std::string om_file_path)
     {
         FILE *fp;
@@ -220,7 +284,7 @@ namespace MNN {
         fclose(fp);
         return true;
     }
-#endif
+// #endif
 
     shared_ptr<hiai::AiModelMngerClient> LoadModelSync(domi::ModelBufferData modelBufferData, string model_name)
     {
@@ -301,7 +365,7 @@ namespace MNN {
 
     void NPUBackend::setNetworkInput(const std::vector<Tensor *> &inputs, const Op* op) {
        const char* opName = (op && op->name()) ? op->name()->c_str() : "<anon>";
-       MNN_HIAI_LOG("setNetworkInput: op_ptr=%p op=%s type=%d inputCnt=%zu",
+       MNN_HIAI_LOGV2("setNetworkInput: op_ptr=%p op=%s type=%d inputCnt=%zu",
                     (const void*)op, opName, op ? (int)op->type() : -1, inputs.size());
 #if HIAI_VERBOSE
        // Log every input tensor's shape + rank so we can locate any tensor
@@ -318,7 +382,7 @@ namespace MNN {
                if (d + 1 < nd) dimStr += "x";
            }
            bool bad = (nd > 4);
-           MNN_HIAI_LOG("  in[%zu] rank=%d dims=[%s]%s",
+           MNN_HIAI_LOGV2("  in[%zu] rank=%d dims=[%s]%s",
                         i, nd, dimStr.c_str(), bad ? "  <<<<< 5D+  HiAI rejects" : "");
        }
 #endif
@@ -353,6 +417,7 @@ namespace MNN {
                 for(int32_t i = 0; i < inputTensor->buffer().dimensions; i++) {
                     dims.push_back(inputTensor->buffer().dim[i].extent);
                 }
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
                 // HiAI DDK rejects Data ops with rank > 4. For network inputs that
                 // come in as 5D (e.g. Qwen3VL rotary_pos_emb [2, 1, S, 1, D] carrying
                 // stacked cos/sin over seq/head), squeeze leading/middle unit dims
@@ -382,6 +447,7 @@ namespace MNN {
                                  sqStr.c_str(), inputIndex);
 #endif
                 }
+#endif
                 ge::TensorDesc desc(ge::Shape(dims), ge::FORMAT_NCHW, ge::DT_FLOAT);
                 if (TensorUtils::getDescribe(inputTensor)->dimensionFormat == MNN_DATA_FORMAT::MNN_DATA_FORMAT_NHWC) {
                     desc.SetFormat(ge::FORMAT_NHWC);
@@ -397,8 +463,22 @@ namespace MNN {
                 vector<pair<shared_ptr<ge::Operator>, string>> ops;
                 ops.emplace_back(make_pair(data, ""));
                 mGrapMap.insert(make_pair(inputIndex, ops));
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+                // Key by inputIndex (always unique) so every network input gets
+                // an entry — previously keyed by outputIndex which caused all
+                // inputs with i >= op->outputIndexes()->size() to collide at -1.
+                std::pair<int, std::vector<ge::Operator>> item(inputIndex, {*data.get()});
+                mInputOps.insert(item);
+                // Record for size-based mInputMap rebuild after model load.
+                size_t elemBytes = (size_t)inputTensor->elementSize()
+                                   * inputTensor->buffer().type.bytes();
+                mInputOrder.push_back({inputIndex,
+                                       (unsigned long)(const_cast<Tensor*>(inputTensor)),
+                                       elemBytes});
+#else
                 std::pair<int, std::vector<ge::Operator>> item(outputIndex, {*data.get()});
                 mInputOps.insert(item);
+#endif
 #if HIAI_VERBOSE
                 {
                     std::string dimStr;
@@ -446,7 +526,7 @@ namespace MNN {
                             dimStr += std::to_string(dims[d]);
                             if (d + 1 < dims.size()) dimStr += "x";
                         }
-                        MNN_HIAI_LOG("  +Const op name=%s idx=%d dims=[%s] elemCnt=%d",
+                        MNN_HIAI_LOGV2("  +Const op name=%s idx=%d dims=[%s] elemCnt=%d",
                                      opName.c_str(), inputIndex, dimStr.c_str(),
                                      inputTensor->elementSize());
                     }
@@ -503,7 +583,7 @@ namespace MNN {
             return nullptr;
         }
 
-        MNN_HIAI_LOG("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
+        MNN_HIAI_LOGV2("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
                      (const void*)op, (int)op->type(), opName, inputs.size(), outputs.size());
 
 #if defined(MNN_HIAI_FREE_CONST_HOST) && (MNN_HIAI_FREE_CONST_HOST + 0)
@@ -544,11 +624,9 @@ namespace MNN {
 
     Backend::MemObj* NPUBackend::onAcquire(const Tensor* tensor, StorageType storageType) {
         bool isInputCopy = TensorUtils::getDescribe(tensor)->usage==Tensor::InsideDescribe::Usage::INPUT;
-        bool isOutputCopy = TensorUtils::getDescribe(tensor)->usage==Tensor::InsideDescribe::Usage::OUTPUT;
         if(isInputCopy){
             mInputMap.insert(make_pair((unsigned long)tensor, mInputMap.size()));
         }
-        // Don't need extra release
         return new Backend::MemObj;
     }
 
@@ -574,17 +652,101 @@ namespace MNN {
             auto index = mInputMap.find((unsigned long)(const_cast<Tensor*>(dstTensor)));
             MNN_ASSERT(index != mInputMap.end());
             shared_ptr<hiai::AiTensor> input = mInputTensors[index->second];
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
             if (srcTensor->host<void>() == nullptr) {
                 // Upstream (usually an earlier NPU chunk) did not materialize its
                 // output to host before this input-copy; without this guard we would
                 // memcpy(npu_buf, NULL, size) and crash. Caller should readMap the
                 // producer VARP between chunks.
-                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, skip memcpy\n",
+                MNN_ERROR("[NPU] onCopyBuffer: src host is NULL (size=%d). "
+                          "Zero-filling input buffer to avoid stale data.\n",
                           (int)input->GetSize());
+                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, zero fill\n",
+                             (int)input->GetSize());
+                MNN_HIAI_LOG("[NPU] null-src detail: src=%p dst=%p hiaiSlot=%d srcUsage=%s dstUsage=%s srcShape=[%s] dstShape=[%s] srcElem=%d dstElem=%d srcFmt=%d dstFmt=%d",
+                             srcTensor, dstTensor, index->second,
+                             usageName(TensorUtils::getDescribe(srcTensor)->usage),
+                             usageName(TensorUtils::getDescribe(dstTensor)->usage),
+                             tensorShapeString(srcTensor).c_str(), tensorShapeString(dstTensor).c_str(),
+                             srcTensor->elementSize(), dstTensor->elementSize(),
+                             (int)TensorUtils::getDescribe(srcTensor)->dimensionFormat,
+                             (int)TensorUtils::getDescribe(dstTensor)->dimensionFormat);
+                
+                return;
+            }
+            // Use MNNCPUCopyBuffer to securely handle potential NC4HW4 -> NCHW unpack
+            Tensor nchwView(dstTensor, Tensor::CAFFE, false);
+            nchwView.buffer().host = (uint8_t*)input->GetBuffer();
+            MNNCPUCopyBuffer(srcTensor, &nchwView);
+#else
+            if (srcTensor->host<void>() == nullptr) {
+                // Upstream (usually an earlier NPU chunk) did not materialize its
+                // output to host before this input-copy; without this guard we would
+                // memcpy(npu_buf, NULL, size) and crash. Caller should readMap the
+                // producer VARP between chunks.
+                MNN_ERROR("[NPU] onCopyBuffer: src host is NULL (size=%d). "
+                          "Zero-filling input buffer to avoid stale data.\n",
+                          (int)input->GetSize());
+                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, zero fill\n",
+                             (int)input->GetSize());
+                MNN_HIAI_LOG("[NPU] null-src detail: src=%p dst=%p hiaiSlot=%d srcUsage=%s dstUsage=%s srcShape=[%s] dstShape=[%s] srcElem=%d dstElem=%d srcFmt=%d dstFmt=%d",
+                             srcTensor, dstTensor, index->second,
+                             usageName(TensorUtils::getDescribe(srcTensor)->usage),
+                             usageName(TensorUtils::getDescribe(dstTensor)->usage),
+                             tensorShapeString(srcTensor).c_str(), tensorShapeString(dstTensor).c_str(),
+                             srcTensor->elementSize(), dstTensor->elementSize(),
+                             (int)TensorUtils::getDescribe(srcTensor)->dimensionFormat,
+                             (int)TensorUtils::getDescribe(dstTensor)->dimensionFormat);
+                
+            
                 return;
             }
             memcpy(input->GetBuffer(), srcTensor->host<void>(), (size_t)input->GetSize());
+#endif
         } else if(isOutputCopy){
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+            int matchIndex = -1;
+            for(int i = 0; i < mMNNOutTensors.size(); i++) {
+                if(mMNNOutTensors[i] == srcTensor) {
+                    matchIndex = i;
+                    break;
+                }
+            }
+            
+            // Fallback: MNN dynamic graph changes pointers. Try to recover by topology/size.
+            if(matchIndex == -1) {
+                if (mMNNOutTensors.size() == 1) {
+                    matchIndex = 0;
+                } else {
+                    for(int i = 0; i < mMNNOutTensors.size(); i++) {
+                        if(mMNNOutTensors[i]->elementSize() == srcTensor->elementSize()) {
+                            matchIndex = i;
+                            break;
+                        }
+                    }
+                }
+                
+                if(matchIndex == -1) {
+                    MNN_HIAI_LOG("  -> Cannot recover output mapping! Aborting copy.");
+                    return;
+                }
+            }
+
+            shared_ptr<hiai::AiTensor> output = mOutputTensors[matchIndex];
+            Tensor* tmpTensor = const_cast<Tensor*>(dstTensor);
+            if (tmpTensor->buffer().host == nullptr) {
+                MNN_HIAI_LOG("[NPU] onCopyBuffer isOutputCopy: dst host is NULL, size=%d, skip memcpy\n",
+                          (int)output->GetSize());
+                return;
+            }
+            
+            if (output->GetBuffer() != nullptr) {
+                // Use MNNCPUCopyBuffer to securely handle NCHW -> NC4HW4 repack if requested by MNN
+                Tensor nchwView(srcTensor, Tensor::CAFFE, false);
+                nchwView.buffer().host = (uint8_t*)const_cast<void*>(output->GetBuffer());
+                MNNCPUCopyBuffer(&nchwView, tmpTensor);
+            }
+#else
             int index;
             bool flag = false;
             for(index = 0; index < mMNNOutTensors.size(); index++) {
@@ -610,6 +772,7 @@ namespace MNN {
                 return;
             }
             memcpy(tmpTensor->buffer().host, output->GetBuffer(), (size_t)output->GetSize());
+#endif
         }
 #ifdef HIAI_DEBUG
         ATrace_endSection();
@@ -630,6 +793,10 @@ namespace MNN {
         mMNNOutTensors.clear();
         mSclipMap.clear();
         mInputSqueezedAxes.clear();
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        mInputOrder.clear();
+        mInputMap.clear();
+#endif
         mConstRefCounts.clear();
         mKeepConsts.clear();
         if (mMgrClient != nullptr) {
@@ -669,7 +836,7 @@ namespace MNN {
         }
 
         MNN_PRINT("mInputDimension : %lu , mOutputDimension : %lu \n", mInputDimension.size(), mOutputDimension.size());
-        MNN_HIAI_LOG("getInOutTensorInfo: npuInputs=%zu npuOutputs=%zu",
+        MNN_HIAI_LOGV2("getInOutTensorInfo: npuInputs=%zu npuOutputs=%zu",
                      mInputDimension.size(), mOutputDimension.size());
 
         int idx = 0;
@@ -683,6 +850,66 @@ namespace MNN {
                          in_dim.GetHeight(), in_dim.GetWidth());
             idx++;
         }
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        // Rebuild mInputMap so that each MNN input tensor ptr maps to the
+        // correct HiAI input slot index. We match by byte size; for the common
+        // case where multiple inputs share the same size (e.g. Q/K/V in
+        // attention), we assign in the order they appear in mInputOrder (i.e.
+        // the op's inputIndexes order) to the sorted list of HiAI positions with
+        // matching size. This heuristic is exact when only one input per size is
+        // present (e.g. mask), and "best-effort" when multiple share a size —
+        // which is expected because the attention computation is sensitive to K/V
+        // order. mInputOrder is empty for old code paths that didn't populate it,
+        // in which case we fall back to the legacy allocation-order mInputMap.
+        if (!mInputOrder.empty() && !mInputTensors.empty()) {
+            // Build HiAI slot byte sizes.
+            std::vector<size_t> hiaiBytes(mInputTensors.size());
+            for (size_t hi = 0; hi < mInputTensors.size(); hi++) {
+                hiaiBytes[hi] = (size_t)mInputTensors[hi]->GetSize();
+            }
+            // For each unique MNN byte size, collect (a) the MNN entry indices
+            // and (b) the HiAI slot indices that match, then zip them in order.
+            // mInputOrder entries are already sorted by inputIndex (insertion order).
+            std::vector<bool> hiaiAssigned(mInputTensors.size(), false);
+            std::vector<bool> mnnAssigned(mInputOrder.size(), false);
+            // First pass: assign entries with a unique size (no ambiguity).
+            for (size_t mi = 0; mi < mInputOrder.size(); mi++) {
+                size_t mnnSz = mInputOrder[mi].byteSize;
+                int matchHiai = -1;
+                int matchCount = 0;
+                for (size_t hi = 0; hi < hiaiBytes.size(); hi++) {
+                    if (!hiaiAssigned[hi] && hiaiBytes[hi] == mnnSz) {
+                        matchHiai = (int)hi;
+                        matchCount++;
+                    }
+                }
+                if (matchCount == 1) {
+                    mInputMap[mInputOrder[mi].tensorPtr] = matchHiai;
+                    hiaiAssigned[matchHiai] = true;
+                    mnnAssigned[mi] = true;
+                    MNN_HIAI_LOG("  mInputMap[unique]: mnnIdx=%d ptr=%lu -> hiaiSlot=%d (size=%zu)",
+                                 mInputOrder[mi].inputIndex, mInputOrder[mi].tensorPtr,
+                                 matchHiai, mnnSz);
+                }
+            }
+            // Second pass: assign remaining by order of appearance.
+            for (size_t mi = 0; mi < mInputOrder.size(); mi++) {
+                if (mnnAssigned[mi]) continue;
+                size_t mnnSz = mInputOrder[mi].byteSize;
+                for (size_t hi = 0; hi < hiaiBytes.size(); hi++) {
+                    if (!hiaiAssigned[hi] && hiaiBytes[hi] == mnnSz) {
+                        mInputMap[mInputOrder[mi].tensorPtr] = (int)hi;
+                        hiaiAssigned[hi] = true;
+                        mnnAssigned[mi] = true;
+                        MNN_HIAI_LOG("  mInputMap[order ]: mnnIdx=%d ptr=%lu -> hiaiSlot=%d (size=%zu)",
+                                     mInputOrder[mi].inputIndex, mInputOrder[mi].tensorPtr,
+                                     (int)hi, mnnSz);
+                        break;
+                    }
+                }
+            }
+        }
+#endif
         auto index = 0;
         for (auto out_dim : mOutputDimension)
         {
@@ -724,7 +951,26 @@ namespace MNN {
 
         string graphName = string("Graph1");
         string version = string("model_v000011");
-        string modelName = to_string(0);
+        std::string modelName = "0";
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        std::string omCachePath;
+        if (!pNPUModelDirPath.empty() && pNPUModelDirPath != ".") {
+            if (ensureDirRecursive(pNPUModelDirPath)) {
+                omCachePath = pNPUModelDirPath + "/vision.om";
+                // Use chunk suffix as model name to avoid potential name collision.
+                auto slashPos = pNPUModelDirPath.find_last_of('/');
+                std::string suffix = (slashPos == std::string::npos)
+                                       ? pNPUModelDirPath
+                                       : pNPUModelDirPath.substr(slashPos + 1);
+                if (!suffix.empty()) {
+                    modelName = "vision_" + suffix;
+                }
+            } else {
+                MNN_HIAI_LOG("bulidIRModelAndLoad: ensureDirRecursive failed for npu dir: %s",
+                             pNPUModelDirPath.c_str());
+            }
+        }
+#endif
         mModelName.push_back(modelName);
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 1] ge::Graph(%s) ctor", graphName.c_str());
         ge::Graph graph(graphName);
@@ -740,6 +986,31 @@ namespace MNN {
 
         domi::HiaiIrBuild ir_build;
         domi::ModelBufferData om_model_buff;
+
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        // Fast path: load prebuilt OM from chunk cache and skip IR build.
+        if (!omCachePath.empty() && fileExists(omCachePath)) {
+            std::vector<uint8_t> omBytes;
+            if (readFileToVector(omCachePath, omBytes)) {
+                domi::ModelBufferData cachedBuff;
+                cachedBuff.data = omBytes.data();
+                cachedBuff.length = (uint32_t)omBytes.size();
+                MNN_HIAI_LOG("bulidIRModelAndLoad: cache HIT, loading OM: %s (%u bytes)",
+                             omCachePath.c_str(), (unsigned)cachedBuff.length);
+                mMgrClient = LoadModelSync(cachedBuff, modelName);
+                if (mMgrClient != nullptr) {
+                    int result = getInOutTensorInfo(modelName);
+                    MNN_HIAI_LOG("bulidIRModelAndLoad: cache LoadModelSync OK, getInOutTensorInfo %s",
+                                 result == 0 ? "OK" : "FAILED");
+                    return (result == 0) ? NO_ERROR : INVALID_VALUE;
+                }
+                MNN_HIAI_LOG("bulidIRModelAndLoad: cache LoadModelSync FAILED, fallback to BuildIRModel");
+            } else {
+                MNN_HIAI_LOG("bulidIRModelAndLoad: cache read FAILED for %s, fallback to BuildIRModel",
+                             omCachePath.c_str());
+            }
+        }
+#endif
 
         // model.Save(buffer) serializes the entire Graph (including every Const weight)
         // into a single FlatBuffer. For a 24-block ViT that's hundreds of MB — the peak
@@ -779,8 +1050,18 @@ namespace MNN {
             return INVALID_VALUE;
         }
         MNN_HIAI_LOG("bulidIRModelAndLoad: BuildIRModel OK out_length=%u", (unsigned)om_model_buff.length);
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        if (!omCachePath.empty()) {
+            if (WriteToOMFile(om_model_buff, omCachePath)) {
+                MNN_HIAI_LOG("bulidIRModelAndLoad: cache SAVE OK -> %s", omCachePath.c_str());
+            } else {
+                MNN_HIAI_LOG("bulidIRModelAndLoad: cache SAVE FAILED -> %s", omCachePath.c_str());
+            }
+        }
+#else
 #ifdef HIAI_DEBUG
         WriteToOMFile(om_model_buff, "/data/local/tmp/test.om");
+#endif
 #endif
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 9] LoadModelSync() START ...");
         mMgrClient = LoadModelSync(om_model_buff, modelName);
@@ -882,7 +1163,7 @@ namespace MNN {
     void NPUBackend::setOutputOps(const Op *op, vector<shared_ptr<ge::Operator>>&& HIAI_op,
                                   const std::vector<Tensor *> &outputs){
         const char* opNameStr = (op && op->name()) ? op->name()->c_str() : "<anon>";
-        MNN_HIAI_LOG("setOutputOps: op=%s type=%d hiaiChain=%zu outputs=%zu",
+        MNN_HIAI_LOGV2("setOutputOps: op=%s type=%d hiaiChain=%zu outputs=%zu",
                      opNameStr, op ? (int)op->type() : -1, HIAI_op.size(), outputs.size());
 #if HIAI_VERBOSE
         // Log each output tensor's shape; same reason as setNetworkInput.
@@ -896,7 +1177,7 @@ namespace MNN {
                 if (d + 1 < nd) dimStr += "x";
             }
             bool bad = (nd > 4);
-            MNN_HIAI_LOG("  out[%zu] rank=%d dims=[%s]%s",
+            MNN_HIAI_LOGV2("  out[%zu] rank=%d dims=[%s]%s",
                          i, nd, dimStr.c_str(), bad ? "  <<<<< 5D+  HiAI rejects" : "");
         }
 #endif

@@ -9,6 +9,18 @@
 #ifndef MNN_NPUBACKEND_H
 #define MNN_NPUBACKEND_H
 
+#ifndef MNN_HIAI_USE_LOCAL_NPU_FIXES
+#define MNN_HIAI_USE_LOCAL_NPU_FIXES 1
+#endif
+
+// Enable chunk-aware OM cache:
+//   - Save/read OM as "<npu_model_dir>/chunk_i/vision.om" when runtime passes
+//     per-chunk EXTERNAL_NPU_FILE_DIR.
+//   - Set to 0 to keep legacy behavior.
+#ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#endif
+
 // Enable freeing the host-side memory of CONSTANT input tensors (weights / biases)
 // after they have been copied into HiAI Const ops during graph build. This shrinks
 // peak RAM during multi-chunk NPU model load, at the cost of requiring every
@@ -55,11 +67,22 @@
 #define HIAI_VERBOSE 1
 #endif
 
+#ifndef HIAI_VERBOSE_V2
+#define HIAI_VERBOSE_V2 0
+#endif
+
 #if HIAI_VERBOSE
 #define MNN_HIAI_LOG(fmt, ...) \
     do { printf("[HIAI_V] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
 #else
 #define MNN_HIAI_LOG(fmt, ...) do {} while (0)
+#endif
+
+#if HIAI_VERBOSE_V2
+#define MNN_HIAI_LOGV2(fmt, ...) \
+    do { printf("[HIAI_V] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
+#else
+#define MNN_HIAI_LOGV2(fmt, ...) do {} while (0)
 #endif
 
 #ifdef HIAI_DEBUG
@@ -362,6 +385,15 @@ namespace MNN {
         map<int, int> mSclipMap;
         map<unsigned long, int> mInputMap;
 
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        // Tracks (inputIndex, MNN tensor ptr, byte size) for each network-input
+        // Data op created in setNetworkInput. Used in getInOutTensorInfo to
+        // rebuild mInputMap by matching MNN input sizes to HiAI's actual input
+        // ordering (which may differ from allocation order for multi-input ops).
+        struct InputOrderEntry { int inputIndex; unsigned long tensorPtr; size_t byteSize; };
+        std::vector<InputOrderEntry> mInputOrder;
+#endif
+
         // Added for Memory Optimization
         std::map<const Tensor*, int> mConstRefCounts;
         std::set<const Tensor*> mKeepConsts;
@@ -374,6 +406,9 @@ namespace MNN {
         // to a squeezed rotary_pos_emb) look here to translate axes/shapes from
         // the MNN view back to the squeezed HiAI view.
         map<int, std::vector<int>> mInputSqueezedAxes;
+        int attentionOptionHint() const {
+            return (mNPURuntime != nullptr) ? mNPURuntime->hint().attentionOption : -1;
+        }
     public:
         class Creator {
         public:

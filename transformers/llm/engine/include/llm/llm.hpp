@@ -188,7 +188,11 @@ public:
 protected:
     void setChatTemplate();
     void initRuntime();
-    void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg);
+    // `enable_kv_hints` controls whether KV-cache-related runtime hints
+    // (e.g. KVCACHE_INFO and reuse_kv attention fallback) are injected.
+    // Useful for A/B on vision-only runtimes where decoder KV semantics
+    // should not be consumed.
+    void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg, bool enable_kv_hints = true);
     std::shared_ptr<LlmContext> mContext;
     std::shared_ptr<KVMeta> mMeta;
     std::shared_ptr<LlmConfig> mConfig;

@@ -338,6 +338,26 @@ class LlmExporter(torch.nn.Module):
                     config['visual_blocks_chunks'] = [
                         f'visual_blocks_npu_{ci}.mnn' for ci in range(npu_chunks)
                     ]
+                    # Optional per-chunk backend routing for runtime mixed execution.
+                    # Example: --visual_chunk_backends "npu,cpu,npu,cpu"
+                    # Defaults to all-NPU if absent.
+                    chunk_backends = str(getattr(self.args, 'visual_chunk_backends', '') or '').strip()
+                    if chunk_backends:
+                        tokens = [t.strip().lower() for t in chunk_backends.split(',') if t.strip()]
+                        if len(tokens) != npu_chunks:
+                            raise ValueError(
+                                f"--visual_chunk_backends length ({len(tokens)}) must equal "
+                                f"--visual_npu_chunks ({npu_chunks})")
+                        normalized = []
+                        for t in tokens:
+                            if t in ('npu', 'hiai'):
+                                normalized.append('npu')
+                            elif t == 'cpu':
+                                normalized.append('cpu')
+                            else:
+                                raise ValueError(
+                                    f"--visual_chunk_backends only supports cpu/npu (got '{t}')")
+                        config['visual_blocks_chunk_backends'] = normalized
                 # Optional NPU/CPU sub-split for the blocks module (legacy 2-chunk).
                 # Only added when the user opts in via --visual_npu_layers N > 0
                 # AND --visual_npu_chunks is not set. Absent fields mean "use the
@@ -1181,6 +1201,7 @@ def build_args(parser):
     parser.add_argument('--visual_split', action='store_true', help='Export visual model as 3 separate .mnn files (visual_pre.mnn / visual_blocks.mnn / visual_post.mnn) so blocks can run on NPU while pre/post run on CPU. Uses the same quant flags as the non-split path.')
     parser.add_argument('--visual_npu_layers', type=int, default=0, help='[TEMPORARY NPU TEST] With --visual_split, put the first N transformer blocks into visual_blocks_npu.mnn (for NPU) and the remaining into visual_blocks_cpu.mnn (for CPU). Default 0 = disabled, existing --visual_split behaviour preserved. Non-invasive: pre/post and DeepStack merging are unchanged; merely shards the blocks wrapper so the NPU build phase is cheap to test.')
     parser.add_argument('--visual_npu_chunks', type=int, default=0, help='With --visual_split, split the visual transformer blocks into K roughly equal NPU chunks (visual_blocks_npu_0.mnn ... visual_blocks_npu_{K-1}.mnn) so each HiAI IR-build processes only 1/K of the weights. Recommended when the monolithic build OOMs. Overrides --visual_npu_layers when > 0. Default 0 = disabled. Example: --visual_npu_chunks 4 on a 24-block ViT produces 4 chunks of 6 blocks each.')
+    parser.add_argument('--visual_chunk_backends', type=str, default='', help='Optional per-chunk backend routing for --visual_npu_chunks. Comma-separated list with length == K. Allowed tokens: cpu,npu (or hiai). Example: --visual_npu_chunks 6 --visual_chunk_backends "npu,npu,cpu,cpu,npu,cpu".')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
