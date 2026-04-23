@@ -23,6 +23,8 @@ public:
 private:
     hiai::op::Const mConst_w;
     hiai::op::Const mConst_b;
+    hiai::op::Const mMatMul_in_shape;
+    hiai::op::Const mMatMul_out_shape;
 
     shared_ptr<hiai::op::Activation> mRelu_conv;
 };
