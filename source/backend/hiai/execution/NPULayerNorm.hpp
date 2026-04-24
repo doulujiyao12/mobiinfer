@@ -24,6 +24,8 @@ public:
 private:
     hiai::op::Const constw;
     hiai::op::Const constb;
+    hiai::op::Const mPreShapeConst;
+    hiai::op::Const mPostShapeConst;
 };
 } // namespace MNN
 
