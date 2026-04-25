@@ -26,6 +26,9 @@ private:
     hiai::op::Const constb;
     hiai::op::Const mPreShapeConst;
     hiai::op::Const mPostShapeConst;
+    // Used only by the decomposed (primitives) path.
+    hiai::op::Const mAxesConst;
+    hiai::op::Const mEpsConst;
 };
 } // namespace MNN
 

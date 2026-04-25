@@ -1758,6 +1758,26 @@ VARP _Attention(VARP, VARP, VARP, VARP, bool) {
 }
 #endif
 
+VARP _LayerNorm(VARP x, std::vector<int32_t> axis, float epsilon,
+                std::vector<float> gamma, std::vector<float> beta,
+                int group, bool useRMSNorm) {
+    std::unique_ptr<OpT> op(new OpT);
+    op->type       = OpType_LayerNorm;
+    op->main.type  = OpParameter_LayerNorm;
+    op->main.value = new LayerNormT;
+    op->main.AsLayerNorm()->axis       = std::move(axis);
+    op->main.AsLayerNorm()->epsilon    = epsilon;
+    op->main.AsLayerNorm()->group      = group;
+    op->main.AsLayerNorm()->useRMSNorm = useRMSNorm;
+    if (!gamma.empty()) {
+        op->main.AsLayerNorm()->gamma = std::move(gamma);
+    }
+    if (!beta.empty()) {
+        op->main.AsLayerNorm()->beta = std::move(beta);
+    }
+    return Variable::create(Expr::create(std::move(op), {x}));
+}
+
 VARP _GridSample(VARP input, VARP grid, InterpolationMethod mode, GridSamplePaddingMode paddingMode, bool alignCorners) {
     std::unique_ptr<OpT> op(new OpT);
     op->type                                       = OpType_GridSample;

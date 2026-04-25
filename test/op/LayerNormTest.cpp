@@ -14,24 +14,6 @@
 using namespace MNN;
 using namespace MNN::Express;
 
-static VARP _LayerNorm(VARP x, std::vector<int32_t> axis, float epsilon, std::vector<float> gamma, std::vector<float> beta, int group = 1, bool useRMS = false) {
-    std::unique_ptr<OpT> op(new OpT);
-    op->main.type                         = OpParameter_LayerNorm;
-    op->type                              = OpType_LayerNorm;
-    op->main.value                        = new LayerNormT;
-    if(gamma.size() != 0){
-        op->main.AsLayerNorm()->gamma         = gamma;
-    }
-    if(beta.size() != 0){
-        op->main.AsLayerNorm()->beta          = beta;
-    }
-    op->main.AsLayerNorm()->epsilon       = epsilon;
-    op->main.AsLayerNorm()->axis          = axis;
-    op->main.AsLayerNorm()->group         = group;
-    op->main.AsLayerNorm()->useRMSNorm    = useRMS;
-    return (Variable::create(Expr::create(std::move(op), {x})));
-}
-
 std::vector<float> inputdata_0 = {0.6, 1.6, 2.6, 3.6, 4.6, 5.6, 6.6, 7.6, 8.6, 9.6, 0.6, 1.6, 2.6, 3.6, 4.6, 5.6, 6.6, 7.6,
                                 8.6, 9.6, 0.6, 1.6, 2.6, 3.6, 4.6, 5.6, 6.6, 7.6, 8.6, 9.6, 0.6, 1.6, 2.6, 3.6, 4.6, 5.6,
                                 6.6, 7.6, 8.6, 9.6, 0.6, 1.6, 2.6, 3.6, 4.6, 5.6, 6.6, 7.6, 8.6, 9.6, 0.6, 1.6, 2.6, 3.6,
