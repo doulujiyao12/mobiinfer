@@ -29,6 +29,18 @@ private:
     // Used only by the decomposed (primitives) path.
     hiai::op::Const mAxesConst;
     hiai::op::Const mEpsConst;
+    // Tile multiples const ([1, normSize, 1, 1]) used by hiai::op::Tile to
+    // expand reduced-shape mean/invStd ([M,1,1,1]) to full [M,normSize,1,1],
+    // so the downstream Sub/Mul are pure same-shape elementwise (no broadcast
+    // tiling). We use Tile (HiAI 100.310.010.013) instead of BroadcastTo
+    // (100.500.010.010): older op = wider DDK support, and NPUTile.cpp shows
+    // it's already exercised in this codebase.
+    hiai::op::Const mTileMultConst;
+    // Used only by the paddle-lite-style path. Target shape const
+    // [1, normSize, 1, 1] consumed by the gamma/beta hiai::op::Reshape ops.
+    // Numerically same as mTileMultConst but kept separate for semantic
+    // clarity (one is "Tile multiples" and one is "Reshape target shape").
+    hiai::op::Const mAffineShapeConst;
 };
 } // namespace MNN
 
