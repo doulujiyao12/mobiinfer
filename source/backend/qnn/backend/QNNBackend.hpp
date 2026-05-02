@@ -20,6 +20,8 @@
 #include "QNNWrapper.hpp"
 #include "backend/cpu/CPUTensorConvert.hpp"
 #include "QNNPerf.hpp"
+#include <cstdarg>
+#include <cstdio>
 #include <memory>
 #ifdef ENABLE_QNN_CONVERT_MODE
 #include "QNNConvertorInterface.hpp"
@@ -34,6 +36,14 @@
 namespace MNN {
 namespace QNN {
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
+
+inline void qnnDebugLog(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ::vprintf(fmt, args);
+    ::fflush(stdout);
+    va_end(args);
+}
 
 class QnnRuntime;
 

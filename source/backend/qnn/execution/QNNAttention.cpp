@@ -4,6 +4,7 @@ namespace QNN {
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
 
 // #define GQA_USE_GATHER
+// #define QNN_DEBUG_LOG
 /*
 seqLenQ == seqLenKV
 query : [Batch, seqLenQ,  headNum, headDim] -> (real layout) [Batch, headNum, headDim, seqLenQ]
@@ -47,6 +48,17 @@ ErrorCode QNNAttention::onEncode(const std::vector<Tensor *> &inputs, const std:
     int seqLenKV = inputs[1]->length(1);
     float scale = 1.0 / sqrt(headDim);
     Qnn_DataType_t dataType = mBackend->getNativeTensor(inputs[0])->v1.dataType;
+#ifdef QNN_DEBUG_LOG
+    size_t qkElements = (size_t)batch * headNum * seqLenQ * seqLenKV;
+    size_t qkBytes = qkElements * (dataType == QNN_DATATYPE_FLOAT_32 ? 4 : 2);
+    size_t softmaxSeq = needState ? (size_t)(seqLenKV + kvMaxSize) : (size_t)seqLenKV;
+    size_t softmaxElements = (size_t)batch * headNum * seqLenQ * softmaxSeq;
+    size_t softmaxBytes = softmaxElements * (dataType == QNN_DATATYPE_FLOAT_32 ? 4 : 2);
+    qnnDebugLog("QNN_DEBUG: attention node=%s batch=%d seqQ=%d seqKV=%d headNum=%d kvHeadNum=%d headDim=%d needState=%d kvMax=%d dtype=%d\n",
+                mNodeName.c_str(), batch, seqLenQ, seqLenKV, headNum, kvHeadNum, headDim, needState ? 1 : 0, kvMaxSize, (int)dataType);
+    qnnDebugLog("QNN_DEBUG: attention node=%s qk_elements=%zu qk_bytes=%zu softmax_elements=%zu softmax_bytes=%zu\n",
+                mNodeName.c_str(), qkElements, qkBytes, softmaxElements, softmaxBytes);
+#endif
     auto Query_perm = this->createStageTensor("Query_perm", dataType, std::vector<int>({batch, headNum, seqLenQ, headDim})); // [0], stage query
     Qnn_Tensor_t* keyperm;
     Qnn_Tensor_t* valueperm;

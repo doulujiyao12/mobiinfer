@@ -12,6 +12,7 @@ namespace QNN {
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
 
 // #define QNN_VERBOSE
+// #define QNN_DEBUG_LOG
 QNNCommonExecution::QNNCommonExecution(Backend *backend, const Op *op) : Execution(backend), mOp(op) {
     mBackend = (QnnBackend *)backend;
 }
@@ -23,6 +24,32 @@ ErrorCode QNNCommonExecution::onResize(const std::vector<Tensor *> &inputs, cons
     #ifdef QNN_VERBOSE
     MNN_PRINT("%s encoding start\n", nodeNameBase.c_str());
     #endif
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: encode begin op=%s node=%s inputs=%zu outputs=%zu\n",
+                nodeNameBase.c_str(), mNodeName.c_str(), inputs.size(), outputs.size());
+    for (int i = 0; i < inputs.size(); ++i) {
+        auto shape = inputs[i]->shape();
+        qnnDebugLog("QNN_DEBUG:   input[%d] dims=[", i);
+        for (int j = 0; j < shape.size(); ++j) {
+            qnnDebugLog("%d%s", shape[j], (j + 1 == shape.size() ? "" : ","));
+        }
+        qnnDebugLog("] format=%d type_code=%d bits=%d quant=%d\n",
+                    (int)TensorUtils::getDescribe(inputs[i])->dimensionFormat,
+                    inputs[i]->getType().code, inputs[i]->getType().bits,
+                    TensorUtils::getDescribe(inputs[i])->applyQuant ? 1 : 0);
+    }
+    for (int i = 0; i < outputs.size(); ++i) {
+        auto shape = outputs[i]->shape();
+        qnnDebugLog("QNN_DEBUG:   output[%d] dims=[", i);
+        for (int j = 0; j < shape.size(); ++j) {
+            qnnDebugLog("%d%s", shape[j], (j + 1 == shape.size() ? "" : ","));
+        }
+        qnnDebugLog("] format=%d type_code=%d bits=%d quant=%d\n",
+                    (int)TensorUtils::getDescribe(outputs[i])->dimensionFormat,
+                    outputs[i]->getType().code, outputs[i]->getType().bits,
+                    TensorUtils::getDescribe(outputs[i])->applyQuant ? 1 : 0);
+    }
+#endif
     ErrorCode result = this->onEncode(inputs, outputs);
     if (result != NO_ERROR) {
         MNN_ERROR("Error %s encoding\n", nodeNameBase.c_str());
@@ -32,6 +59,9 @@ ErrorCode QNNCommonExecution::onResize(const std::vector<Tensor *> &inputs, cons
     #ifdef QNN_VERBOSE
     MNN_PRINT("%s encoding end\n", nodeNameBase.c_str());
     #endif
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: encode end op=%s node=%s\n", nodeNameBase.c_str(), mNodeName.c_str());
+#endif
     this->clean();
 
     return NO_ERROR;

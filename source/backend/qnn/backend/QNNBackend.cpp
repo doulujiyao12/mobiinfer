@@ -11,10 +11,12 @@
 #include "QnnTypeMacros.hpp"
 // #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
+#include <chrono>
 #include "core/FileLoader.hpp"
 // #define QNN_PROFILE_OP
 // #define QNN_PROFILE_SUMMARIZE
 // #define QNN_VERBOSE
+// #define QNN_DEBUG_LOG
 #ifdef ENABLE_QNN_CONVERT_MODE
 #define QNN_FORWARD_TYPE MNN_CONVERT_QNN
 #else
@@ -24,6 +26,25 @@
 namespace MNN {
 static std::string gExtraIoPrefix = "_mnn";
 namespace QNN {
+#ifdef QNN_DEBUG_LOG
+static inline long long qnnNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+static inline void qnnDebugPrintShape(const char* prefix, const Qnn_Tensor_t& tensor) {
+    qnnDebugLog("%s name=%s dtype=%d rank=%u dims=[", prefix, QNN_TENSOR_GET_NAME(&tensor),
+                (int)QNN_TENSOR_GET_DATA_TYPE(&tensor), (unsigned)QNN_TENSOR_GET_RANK(&tensor));
+    auto rank = QNN_TENSOR_GET_RANK(&tensor);
+    auto dims = QNN_TENSOR_GET_DIMENSIONS(&tensor);
+    for (uint32_t i = 0; i < rank; ++i) {
+        qnnDebugLog("%u%s", dims[i], (i + 1 == rank ? "" : ","));
+    }
+    qnnDebugLog("]\n");
+}
+#endif
+
 struct QnnContext {
     QNN_INTERFACE_VER_TYPE interface{};
     QNN_SYSTEM_INTERFACE_VER_TYPE systemInterface{};
@@ -1383,6 +1404,11 @@ ErrorCode QnnBackend::onResizeEnd() {
     #ifdef QNN_VERBOSE
     MNN_PRINT("start finalize\n");
     #endif
+#ifdef QNN_DEBUG_LOG
+    auto beginMs = qnnNowMs();
+    qnnDebugLog("QNN_DEBUG: onResizeEnd start graph=%s tensors=%d inputs=%zu outputs=%zu\n",
+                mQnnGraphName.c_str(), mTensorCounter, mInputTensorIndexes.size(), mOutputTensorIndexes.size());
+#endif
     buildOutputCast();
     buildOutputDequant();
     finalizeGraph();
@@ -1393,6 +1419,10 @@ ErrorCode QnnBackend::onResizeEnd() {
     #ifdef QNN_VERBOSE
     MNN_PRINT("end finalize\n");
     #endif
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: onResizeEnd done graph=%s cost=%lld ms\n",
+                mQnnGraphName.c_str(), qnnNowMs() - beginMs);
+#endif
     return NO_ERROR;
 }
 
@@ -1680,8 +1710,16 @@ void QnnBackend::finalizeGraph() {
 
     // Create Prefile Handle
     MNN::QNN::createProfileHandle(mRuntime->mQnnInterface, mRuntime->mQnnBackendHandle, &mQnnProfileHandle);
-
+#ifdef QNN_DEBUG_LOG
+    auto beginMs = qnnNowMs();
+    qnnDebugLog("QNN_DEBUG: graphFinalize begin graph=%s tensors=%d inputs=%zu outputs=%zu\n",
+                mQnnGraphName.c_str(), mTensorCounter, mInputTensorIndexes.size(), mOutputTensorIndexes.size());
+#endif
     CALL_QNN(mRuntime->mQnnInterface.graphFinalize(mQnnGraphHandle, mQnnProfileHandle, mQnnSignalHandle));
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: graphFinalize done graph=%s cost=%lld ms\n",
+                mQnnGraphName.c_str(), qnnNowMs() - beginMs);
+#endif
 }
 
 void QnnBackend::executeGraph() const {
@@ -1693,8 +1731,22 @@ void QnnBackend::executeGraph() const {
     for (int j = 0 ; j < mOutputTensorIndexes.size(); j++) {
         outputs.push_back(*(mQNNTensorWrappers[mOutputTensorIndexes[j]]->getNativeTensor()));
     }
-
+#ifdef QNN_DEBUG_LOG
+    auto beginMs = qnnNowMs();
+    qnnDebugLog("QNN_DEBUG: graphExecute begin graph=%s inputs=%zu outputs=%zu\n",
+                mQnnGraphName.c_str(), inputs.size(), outputs.size());
+    for (int i = 0; i < inputs.size(); ++i) {
+        qnnDebugPrintShape("QNN_DEBUG: execute input", inputs[i]);
+    }
+    for (int i = 0; i < outputs.size(); ++i) {
+        qnnDebugPrintShape("QNN_DEBUG: execute output", outputs[i]);
+    }
+#endif
     CALL_QNN(mRuntime->mQnnInterface.graphExecute(mQnnGraphHandle, inputs.data(), mInputTensorIndexes.size(), outputs.data(), mOutputTensorIndexes.size(), mQnnProfileHandle, mQnnSignalHandle));
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: graphExecute done graph=%s cost=%lld ms\n",
+                mQnnGraphName.c_str(), qnnNowMs() - beginMs);
+#endif
 }
 
 void QnnBackend::freeContextAndGraph() {
@@ -1706,6 +1758,10 @@ void QnnBackend::freeContextAndGraph() {
 
 void QnnBackend::addNodeToGraph(Qnn_OpConfigVersion_t version, const char* nodeName, const char* packageName, const char* nodeType, std::vector<Qnn_Param_t> & params, std::vector<Qnn_Tensor_t> & inputs, std::vector<Qnn_Tensor_t> & outputs) {
     MNN_ASSERT(nodeName != nullptr && packageName != nullptr && nodeType != nullptr && !(inputs.empty()) && !(outputs.empty()));
+#ifdef QNN_DEBUG_LOG
+    qnnDebugLog("QNN_DEBUG: addNode name=%s type=%s inputs=%zu outputs=%zu params=%zu\n",
+                nodeName, nodeType, inputs.size(), outputs.size(), params.size());
+#endif
 
     Qnn_OpConfig_t opConfig = QNN_OPCONFIG_INIT;
     opConfig.version = version;
