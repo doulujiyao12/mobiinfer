@@ -8,6 +8,7 @@
 
 #include "NPULayerNorm.hpp"
 #include "NPUBackend.hpp"
+#include "../custom/LayerNormCustomOp.hpp"
 #include "core/FileLoader.hpp"
 #include <sstream>
 
@@ -18,6 +19,14 @@
 // Set this to 0 only if you need to A/B against the broken HiAI LayerNorm op.
 #ifndef MNN_HIAI_LN_USE_PRIMITIVES
 #define MNN_HIAI_LN_USE_PRIMITIVES 0
+#endif
+
+// Preferred Kirin9030 custom LayerNorm path. This keeps MNN's current
+// flatten-to-[M, normSize, 1, 1] convention and feeds gamma/beta/epsilon with
+// the same semantics as the original hiai::op::LayerNorm bridge, while adding
+// norm_size for the custom kernel's row-wise reduction.
+#ifndef MNN_HIAI_LN_USE_CUSTOM
+#define MNN_HIAI_LN_USE_CUSTOM 0
 #endif
 
 // Paddle-Lite Kirin NPU style path. When enabled (default), feeds gamma/beta
@@ -56,7 +65,7 @@
 // (100.500.010.010): older op = wider DDK support, and NPUTile.cpp shows
 // it's already exercised in this codebase.
 #ifndef MNN_HIAI_LN_DEBUG_STAGE
-#define MNN_HIAI_LN_DEBUG_STAGE 1
+#define MNN_HIAI_LN_DEBUG_STAGE 0
 #endif
 
 using namespace std;
@@ -197,6 +206,73 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     normSize = static_cast<int32_t>(gammaData.size());
     float eps = param->epsilon();
 
+#if MNN_HIAI_LN_USE_CUSTOM
+    // ===== Kirin9030 custom LayerNorm path =====
+    vector<int64_t> gammaShape{1, static_cast<int64_t>(gammaData.size()), 1, 1};
+    ge::TensorDesc gdesc(ge::Shape(gammaShape), ge::FORMAT_NCHW, ge::DT_FLOAT);
+    ge::TensorPtr gtensor = std::make_shared<ge::Tensor>();
+    gtensor->SetTensorDesc(gdesc);
+    gtensor->SetData(reinterpret_cast<uint8_t*>(gammaData.data()), gammaData.size() * sizeof(float));
+    constw.set_attr_value(gtensor);
+
+    vector<int64_t> betaShape{1, static_cast<int64_t>(betaData.size()), 1, 1};
+    ge::TensorDesc bdesc(ge::Shape(betaShape), ge::FORMAT_NCHW, ge::DT_FLOAT);
+    ge::TensorPtr btensor = std::make_shared<ge::Tensor>();
+    btensor->SetTensorDesc(bdesc);
+    btensor->SetData(reinterpret_cast<uint8_t*>(betaData.data()), betaData.size() * sizeof(float));
+    constb.set_attr_value(btensor);
+
+    int64_t totalElems = 1;
+    for (auto d : shape) totalElems *= d;
+    int64_t mLong = (normSize > 0) ? (totalElems / normSize) : 0;
+    if (normSize <= 0 || mLong <= 0 || mLong * normSize != totalElems) {
+        MNN_HIAI_LOG("NPULayerNorm(%s): cannot flatten shape for LayerNormCustom "
+                     "(total=%lld normSize=%d)",
+                     opName.c_str(), (long long)totalElems, normSize);
+        return NOT_SUPPORT;
+    }
+    int32_t M = static_cast<int32_t>(mLong);
+
+    mPreShapeConst = hiai::op::Const(opName + "_pre_shape");
+    {
+        std::vector<int32_t> preShape = {M, normSize, 1, 1};
+        ge::TensorDesc pdesc(ge::Shape({static_cast<int64_t>(preShape.size())}),
+                             ge::FORMAT_NCHW, ge::DT_INT32);
+        ge::TensorPtr ptensor = std::make_shared<ge::Tensor>();
+        ptensor->SetTensorDesc(pdesc);
+        ptensor->SetData(reinterpret_cast<uint8_t*>(preShape.data()),
+                         preShape.size() * sizeof(int32_t));
+        mPreShapeConst.set_attr_value(ptensor);
+    }
+    auto preReshape = std::make_shared<hiai::op::Reshape>(opName + "_pre_reshape");
+    (*preReshape).set_input_x(*xOp.get()).set_input_shape(mPreShapeConst);
+
+    auto layerNorm = std::make_shared<hiai::op::LayerNormCustom>(opName + "_custom_ln");
+    (*layerNorm).set_input_x(*preReshape.get())
+                .set_input_gamma(constw)
+                .set_input_beta(constb)
+                .set_attr_epsilon(eps)
+                .set_attr_norm_size(normSize);
+
+    mPostShapeConst = hiai::op::Const(opName + "_post_shape");
+    {
+        std::vector<int32_t> postShape(shape.begin(), shape.end());
+        ge::TensorDesc pdesc(ge::Shape({static_cast<int64_t>(postShape.size())}),
+                             ge::FORMAT_NCHW, ge::DT_INT32);
+        ge::TensorPtr ptensor = std::make_shared<ge::Tensor>();
+        ptensor->SetTensorDesc(pdesc);
+        ptensor->SetData(reinterpret_cast<uint8_t*>(postShape.data()),
+                         postShape.size() * sizeof(int32_t));
+        mPostShapeConst.set_attr_value(ptensor);
+    }
+    auto postReshape = std::make_shared<hiai::op::Reshape>(opName + "_post_reshape");
+    (*postReshape).set_input_x(*layerNorm.get()).set_input_shape(mPostShapeConst);
+
+    mNpuBackend->setOutputOps(mOp, {preReshape, layerNorm, postReshape}, outputs);
+    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (LayerNormCustom) name=%s normSize=%d M=%d",
+                 opName.c_str(), normSize, M);
+    return NO_ERROR;
+#else
 #if MNN_HIAI_LN_USE_PADDLELITE
     // ===== Paddle-Lite Kirin NPU style path =====
     // Reference: paddle-lite/.../huawei_kirin_npu/converter/layer_normalization.cc
@@ -297,8 +373,8 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     // hiai::op::LayerNorm
     auto layerNorm = std::make_shared<hiai::op::LayerNorm>(opName + "_ln");
     (*layerNorm).set_input_x(*preReshape.get())
-                .set_input_gamma(*betaReshape.get())
-                .set_input_beta(*gammaReshape.get())
+                .set_input_gamma(*gammaReshape.get())
+                .set_input_beta(*betaReshape.get())
                 .set_attr_begin_norm_axis(1)
                 .set_attr_begin_params_axis(1)
                 .set_attr_epsilon(eps);
@@ -691,6 +767,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     return NO_ERROR;
 #endif // MNN_HIAI_LN_USE_PRIMITIVES
 #endif // MNN_HIAI_LN_USE_PADDLELITE
+#endif // MNN_HIAI_LN_USE_CUSTOM
 }
 
 NPUCreatorRegister<TypedCreator<NPULayerNorm>> __LayerNorm_op(OpType_LayerNorm);
