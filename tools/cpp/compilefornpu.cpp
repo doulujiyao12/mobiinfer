@@ -1036,7 +1036,18 @@ int main(int argc, const char* argv[]) {
         for (auto index : inputIndexes) {
             newInputNames.emplace_back(net->tensorName()->GetAsString(index)->str());
         }
-        std::shared_ptr<MNN::Express::Module> m(MNN::Express::Module::load(inputNames, firstOutputNames, (const uint8_t*)bufferPair.first, bufferPair.second), MNN::Express::Module::destroy);
+        // Buffer-load Module needs a runtime manager that knows where the
+        // external weight file lives, otherwise FileLoader gets called with
+        // an empty path and segfaults during weight load. This code path is
+        // only hit when "skips" is non-empty.
+        MNN::ScheduleConfig _splitConfig;
+        std::shared_ptr<MNN::Express::Executor::RuntimeManager> _splitRtmgr(MNN::Express::Executor::RuntimeManager::createRuntimeManager(_splitConfig));
+        _splitRtmgr->setExternalFile((std::string(srcMNN) + ".weight").c_str());
+        std::shared_ptr<MNN::Express::Module> m(MNN::Express::Module::load(inputNames, firstOutputNames, (const uint8_t*)bufferPair.first, bufferPair.second, _splitRtmgr), MNN::Express::Module::destroy);
+        if (nullptr == m.get()) {
+            MNN_ERROR("[skips] Failed to reload module with new outputs %s. Check that the op names in 'skips' match exactly (e.g. /blocks.13/Add_1_output_0).\n", firstOutputNames.empty() ? "(none)" : firstOutputNames[0].c_str());
+            return 1;
+        }
         for (int i=0; i<inputs.size(); ++i) {
             std::map<std::string, MNN::Express::VARP> vars;
             for (int v=0; v<inputNames.size(); ++v) {

@@ -1,0 +1,46 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    coreutils \
+    curl \
+    file \
+    git \
+    g++-11 \
+    gcc-11 \
+    make \
+    cmake \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    rsync \
+    tar \
+    unzip \
+    xz-utils \
+    libunwind8 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /root/bin/qnn-shim /usr/local/bin
+
+COPY qnn-shim-clangpp.sh /root/bin/qnn-shim/clang++
+RUN chmod +x /root/bin/qnn-shim/clang++ && ln -sf /root/bin/qnn-shim/clang++ /root/bin/qnn-shim/clang
+
+COPY build_qnn_mirror.sh /usr/local/bin/build_qnn_mirror.sh
+RUN chmod +x /usr/local/bin/build_qnn_mirror.sh
+
+COPY mnn-qnn-entrypoint.sh /usr/local/bin/mnn-qnn-entrypoint.sh
+RUN chmod +x /usr/local/bin/mnn-qnn-entrypoint.sh
+
+ENV QNN_SDK_ROOT=/opt/qnn
+ENV PATH=/root/bin/qnn-shim:${PATH}
+
+WORKDIR /workspace/MNN
+
+ENTRYPOINT ["/usr/local/bin/mnn-qnn-entrypoint.sh"]
+CMD ["bash"]

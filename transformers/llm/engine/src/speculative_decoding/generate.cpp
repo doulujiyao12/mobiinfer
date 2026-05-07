@@ -5,6 +5,7 @@
 //
 
 #include "generate.hpp"
+#include <cstdio>
 #include <MNN/AutoTime.hpp>
 #include "llm/llm.hpp"
 #include "../llmconfig.hpp"
@@ -42,6 +43,13 @@ ArGeneration::ArGeneration(Llm* llm, std::shared_ptr<LlmContext> context, std::s
 void ArGeneration::generate(GenerationParams& param) {
     int max_token = param.max_new_tokens;
     int len = 0;
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] ArGeneration::generate: enter max_token=%d outputs.size=%zu validLogitStart=%d validLogitSize=%d outputs[0]=%p\n",
+           max_token, param.outputs.size(),
+           param.validLogitStart, param.validLogitSize,
+           param.outputs.empty() ? nullptr : (void*)param.outputs[0].get());
+    fflush(stdout);
+#endif
     while (len < max_token) {
         if(mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
             break;
@@ -51,6 +59,11 @@ void ArGeneration::generate(GenerationParams& param) {
             break;
         }
         AUTOTIME;
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] ArGeneration::generate: iter=%d before sample, outputs[0]=%p\n",
+               len, param.outputs.empty() ? nullptr : (void*)param.outputs[0].get());
+        fflush(stdout);
+#endif
         // Update gen seq
         mContext->current_token = mLlm->sample(param.outputs[0], param.validLogitStart, param.validLogitSize);
         mContext->history_tokens.push_back(mContext->current_token);

@@ -35,6 +35,8 @@
 #ifdef LLM_SUPPORT_AUDIO
 #include <audio/audio.hpp>
 #endif
+
+// #define DBG_DEEPSTACK
 namespace MNN {
 using namespace Express;
 namespace Transformer {
@@ -255,7 +257,17 @@ bool Omni::load() {
         return false;
     }
     if (mConfig->has_deepstack()) {
-        mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0)));
+        // Decode-shape baked deepstack_embeds is [3, 1, hidden_size]. Use a
+        // zero placeholder of the same shape so QNN Plugin Op shape inference
+        // matches the decode variant directly. Old code used [3,1,1] which
+        // relied on broadcast (works on CPU, breaks QNN's static-shape check).
+        const int H = mConfig->hidden_size();
+        mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, H}, {3}), _Scalar<float>(0.0)));
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] INIT mExtraArgs[0] shape=%s (omni.cpp:258)\n",
+               varShapeString(mExtraArgs[0]).c_str());
+        fflush(stdout);
+#endif
     }
     Module::Config module_config;
     if(config.type == MNN_FORWARD_NN || config.type == MNN_FORWARD_USER_1) {
@@ -674,6 +686,22 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                       varShapeString(attention_mask).c_str());
         }
         VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
+        
+        // printf("\n----- VISUAL_BLOCKS_MODEL REAL INPUT SHAPES -----\n");
+        // for (int i = 0; i < blocksIn.size(); ++i) {
+        //     auto info = blocksIn[i]->getInfo();
+        //     if (info) {
+        //         printf("Input %d shape: ", i);
+        //         for (int d = 0; d < info->dim.size(); ++d) {
+        //             printf("%d ", info->dim[d]);
+        //         }
+        //         printf("\n");
+        //     } else {
+        //         printf("Input %d shape: UNKNOWN\n", i);
+        //     }
+        // }
+        // printf("--------------------------------------------------\n\n");
+
         VARPS blocksOut;
         if (!mVisionBlocksChunkModules.empty()) {
             // K-chunk NPU split: chain each chunk's hidden_states output into the
@@ -1399,7 +1427,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     MNN::Express::ExecutorScope s(mExecutor);
     if (input_ids.size() == 1) {
         if (mConfig->has_deepstack() && mExtraArgs.size() == 1) {
-            mExtraArgs[0] = Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0));
+            // Match baked decode shape [3, 1, hidden_size] -- see omni.cpp:258.
+            const int H = mConfig->hidden_size();
+            mExtraArgs[0] = Express::_Fill(_var<int>({3, 1, H}, {3}), _Scalar<float>(0.0));
+#ifdef DBG_DEEPSTACK
+            printf("[DBG_DEEPSTACK] RESET (text decode) mExtraArgs[0] shape=%s (omni.cpp:1418)\n",
+                   varShapeString(mExtraArgs[0]).c_str());
+            fflush(stdout);
+#endif
         }
         auto single_embedding = Llm::embedding(input_ids);
         if (shouldDumpX86Log(mConfig)) {
@@ -1513,6 +1548,16 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     // Qwen3-VL
     if (hasDeepStack) {
         mExtraArgs[0] = Express::_Concat(deepstacks, 1);
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] MULTIMODAL mExtraArgs[0] shape=%s, source segments=%zu (omni.cpp:1531)\n",
+               varShapeString(mExtraArgs[0]).c_str(), deepstacks.size());
+        fflush(stdout);
+        for (size_t i = 0; i < deepstacks.size(); ++i) {
+            printf("[DBG_DEEPSTACK]   segment[%zu] shape=%s\n",
+                   i, varShapeString(deepstacks[i]).c_str());
+            fflush(stdout);
+        }
+#endif
     }
     return embedding;
 }
@@ -1570,7 +1615,74 @@ VARP Omni::gen_position_ids(int seq_len) {
 
 std::vector<Express::VARP> Omni::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
     MNN::Express::ExecutorScope s(mExecutor);
-    extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+#ifdef DBG_DEEPSTACK
+    // Per-forward shape dump so we can correlate runtime shapes with baked QNN
+    // graph shapes when a Plugin Op shape check fails.
+    printf("[DBG_DEEPSTACK] forwardRaw: hidden=%s mask=%s pos=%s extraArgs=%zu mExtraArgs=%zu chunkStart=%d chunkSize=%d\n",
+           varShapeString(hiddenState).c_str(),
+           varShapeString(mask).c_str(),
+           varShapeString(inputPos).c_str(),
+           extraArgs.size(), mExtraArgs.size(),
+           mChunkStart, mChunkSize);
+    fflush(stdout);
+    for (size_t i = 0; i < mExtraArgs.size(); ++i) {
+        printf("[DBG_DEEPSTACK]   mExtraArgs[%zu] shape=%s\n",
+               i, varShapeString(mExtraArgs[i]).c_str());
+        fflush(stdout);
+    }
+#endif
+    // If we are in chunked-prefill (mChunkStart >= 0), reshape mExtraArgs[0]
+    // (deepstack_embeds) to exactly [N, mChunkSize, H] so it matches the QNN
+    // graph baked for this chunk size. Three sub-cases:
+    //   total >= chunkEnd            -> slice [chunkStart : chunkEnd]
+    //   chunkStart < total < chunkEnd -> slice valid + zero pad tail
+    //   chunkStart >= total          -> all zeros [N, mChunkSize, H]
+    // For text-only with placeholder [3,1,H], total==1 < chunkEnd so the pad
+    // branch fires and we expand to a full-zero [3, mChunkSize, H].
+    if (mChunkStart >= 0 && mChunkSize > 0 && !mExtraArgs.empty()) {
+        auto ds = mExtraArgs[0];
+        auto info = ds->getInfo();
+        if (info != nullptr && info->dim.size() == 3) {
+            const int N = info->dim[0];
+            const int total = info->dim[1];
+            const int H = info->dim[2];
+            const int chunkEnd = mChunkStart + mChunkSize;
+            VARP shaped;
+            if (total >= chunkEnd) {
+                shaped = Express::_Slice(ds,
+                    _var<int>({0, mChunkStart, 0}, {3}),
+                    _var<int>({N, mChunkSize, H},  {3}));
+            } else if (mChunkStart < total) {
+                auto valid = Express::_Slice(ds,
+                    _var<int>({0, mChunkStart, 0}, {3}),
+                    _var<int>({N, total - mChunkStart, H}, {3}));
+                auto pad = Express::_Fill(
+                    _var<int>({N, chunkEnd - total, H}, {3}),
+                    _Scalar<float>(0.0));
+                shaped = Express::_Concat({valid, pad}, 1);
+            } else {
+                shaped = Express::_Fill(
+                    _var<int>({N, mChunkSize, H}, {3}),
+                    _Scalar<float>(0.0));
+            }
+#ifdef DBG_DEEPSTACK
+            printf("[DBG_DEEPSTACK]   reshaped mExtraArgs[0] -> %s for chunk[%d:%d]\n",
+                   varShapeString(shaped).c_str(), mChunkStart, mChunkStart + mChunkSize);
+            fflush(stdout);
+#endif
+            extraArgs.push_back(shaped);
+            // Skip index 0 of mExtraArgs since we already pushed its reshaped
+            // form; copy the rest as-is (currently mExtraArgs only has the
+            // deepstack tensor at index 0, so the tail loop is a no-op).
+            for (size_t i = 1; i < mExtraArgs.size(); ++i) {
+                extraArgs.push_back(mExtraArgs[i]);
+            }
+        } else {
+            extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+        }
+    } else {
+        extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+    }
     auto outputs = Llm::forwardRaw(hiddenState, mask, inputPos, extraArgs);
     if (mTalker && outputs.size() > 1) {
         mTalker->addTalkerEmbeds(outputs[1]);

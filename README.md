@@ -1,216 +1,151 @@
-![MNN](doc/banner.png)
+# Qwen3-VL 在高通 NPU / 麒麟 NPU 上运行说明
+
+本文档说明如何在 MNN 中准备并运行 Qwen3-VL。
+
+- 第 1 部分：高通 NPU（已给出完整编译命令）
+- 第 2 部分：麒麟 NPU（预留章节，后续补充具体命令）
+
 ---
-[![License](https://img.shields.io/github/license/alibaba/MNN)](LICENSE.txt)
-[![Documentation](https://img.shields.io/badge/Documentation-Read-green)](https://mnn-docs.readthedocs.io/en/latest/)
-[![中文版本](https://img.shields.io/badge/Language-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-green)](README_CN.md)
-[![日本語バージョン](https://img.shields.io/badge/Language-%E6%97%A5%E6%9C%AC%E8%AA%9E-green)](README_JP.md)
-[![MNN Homepage](https://img.shields.io/badge/Homepage-Visit-green)](http://www.mnn.zone)
 
-[![MNN Chat App](https://img.shields.io/badge/Apps-MNN_Chat-blue)](./apps/Android/MnnLlmChat/README.md)
-[![TaoAvatar](https://img.shields.io/badge/Apps-MNN_TaoAvatar-blue)](./apps/Android/Mnn3dAvatar/README.md)
-[![Sana](https://img.shields.io/badge/Apps-Sana_Image_Edit-blue)](./apps/sana/README.md)
+## 1. 高通 NPU（Qualcomm）
 
-## News 🔥
-- [2026/03/05] Support Qwen3.5 Series.
-<p align="center">
-  <img width="15%" alt="Icon"  src="https://meta.alicdn.com/data/mnn/assets/qwen35_1.jpg" style="margin: 0 10px;">
-  <img width="15%" alt="Icon" src="https://meta.alicdn.com/data/mnn/assets/qwen35_2.jpg" style="margin: 0 10px;">
-  <img width="15%" alt="Icon" src="https://meta.alicdn.com/data/mnn/assets/qwen35_3.jpg" style="margin: 0 10px;">
-</p>
+### 1.0 Qualcomm NPU 依赖获取
 
-- [2026/02/13] MNN-Sana-Edit-V2 is now available at [apps](./apps/sana/README.md), offering cartoon-style photo editing based on Sana.
-<p align="center">
-  <img width="80%" alt="Icon"  src="https://meta.alicdn.com/data/mnn/assets/sana_show_case.jpg" style="margin: 0 10px;">
-</p>
+如果你要在宿主机或开发机上准备 Qualcomm NPU 相关环境，可以按下面步骤获取依赖：
 
-<details>
-<summary> History News </summary>
+1. 注册高通账号：<https://myaccount.qualcomm.com/signup>
+2. 访问 Qualcomm AI Engine Direct SDK（QNN SDK），下载 SDK 并解压到本地目录。
+  - 示例路径：`/home/xiaying/third/qnn/qairt/2.38.0.250901`
+3. 修改 `~/.bashrc`，把 SDK 路径加入环境变量，然后执行 `source ~/.bashrc`，或者重新打开终端。
 
-- [2025/10/16] Support Qwen3-VL Series.
-- [2025/06/11] New App MNN TaoAvatar released, you can talk with 3DAvatar offline with LLM, ASR, TTS, A2BS and NNR models all run local on your device!! [MNN TaoAvatar](./apps/Android/Mnn3dAvatar/README.md)
-<p align="center">
-  <img width="20%" alt="Icon"  src="https://meta.alicdn.com/data/mnn/avatar/avatar_demo.gif" style="margin: 0 10px;">
-</p>
+示例配置：
 
-- [2025/05/12] android app support qwen2.5 omni 3b and 7b [MNN Chat App](./apps/Android/MnnLlmChat/README.md#releases).
-<p align="center">
-  <img width="20%" alt="Icon"  src="./apps/Android/MnnLlmChat/assets/image_home_new.jpg" style="margin: 0 10px;">
-  <img width="20%" alt="Icon" src="./apps/Android/MnnLlmChat/assets/image_sound_new.jpg" style="margin: 0 10px;">
-  <img width="20%" alt="Icon" src="./apps/Android/MnnLlmChat/assets/image_image_new.jpg" style="margin: 0 10px;">
-</p>
+```bash
+export QNN_SDK_ROOT=/home/xiaying/third/qnn/qairt/2.38.0.250901
+export QNN_ROOT=/home/xiaying/third/qnn/qairt/2.38.0.250901
+export HEXAGON_SDK_ROOT=/home/xiaying/third/qnn/qairt/2.38.0.250901
+```
 
-- [2025/04/30] android app support qwen3 and dark mode [MNN Chat App](./apps/Android/MnnLlmChat/README.md#releases).
-<p align="center">
-  <img width="20%" alt="Icon"  src="https://meta.alicdn.com/data/mnn/qwen_3.gif" style="margin: 0 10px;">
-</p>
+### 1.1 在 Ubuntu x86 上编译 QNN 交叉编译中间工具
 
-- [2025/02/18] iOS multimodal LLM App is released [MNN LLM iOS](./apps/iOS/MNNLLMChat/README.md).
-<p align="center">
-  <img width="20%" alt="Icon"  src="./apps/iOS/MNNLLMChat/assets/introduction.gif" style="margin: 0 10px;">
-</p>
+> 这一步用于产出 QNN SDK 交叉编译流程需要的中间工具，**不会**产出可直接在手机侧运行的二进制文件。
 
-- [2025/02/11] android app support for [deepseek r1 1.5b](./project/android/apps/MnnLlmApp/README.md#version-021).
-<p align="center">
-  <img width="20%" alt="Icon"  src="./apps/Android/MnnLlmChat/assets/deepseek_support.gif" style="margin: 0 10px;">
-</p>
+```bash
+cd ./MNN
+mkdir build_qnn_x86
+cd build_qnn_x86
+cmake .. \
+  -DMNN_BUILD_LLM=true \
+  -DMNN_LOW_MEMORY=true \
+  -DMNN_BUILD_LLM_OMNI=ON \
+  -DMNN_BUILD_TEST=ON \
+  -DMNN_QNN=ON \
+  -DMNN_QNN_CONVERT_MODE=ON \
+  -DMNN_WITH_PLUGIN=OFF \
+  -DMNN_BUILD_TOOLS=ON \
+  -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+```
 
-- [2025/01/23] We released our full multimodal LLM Android App:[MNN-LLM-Android](./apps/Android/MnnLlmChat/README.md). including text-to-text, image-to-text, audio-to-text, and text-to-image generation.
-<p align="center">
-  <img width="20%" alt="Icon"  src="./apps/Android/MnnLlmChat/assets/image_home_new.jpg" style="margin: 0 10px;">
-  <img width="20%" alt="Icon" src="./apps/Android/MnnLlmChat/assets/image_diffusion_new.jpg" style="margin: 0 10px;">
-  <img width="20%" alt="Icon" src="./apps/Android/MnnLlmChat/assets/image_sound_new.jpg" style="margin: 0 10px;">
-  <img width="20%" alt="Icon" src="./apps/Android/MnnLlmChat/assets/image_image_new.jpg" style="margin: 0 10px;">
-</p>
-</details>
+### 1.2 编译 Android 侧可执行文件（llm_demo）
 
-## Intro
-MNN is a highly efficient and lightweight deep learning framework. It supports inference and training of deep learning models and has industry-leading performance for inference and training on-device. At present, MNN has been integrated into more than 30 apps of Alibaba Inc, such as Taobao, Tmall, Youku, DingTalk, Xianyu, etc., covering more than 70 usage scenarios such as live broadcast, short video capture, search recommendation, product searching by image, interactive marketing, equity distribution, security risk control. In addition, MNN is also used on embedded devices, such as IoT.
+> 这一步用于编译可在高通手机上运行的可执行文件，例如 `llm_demo`。
 
-[MNN-LLM](./transformers/README.md) is a large language model runtime solution developed based on the MNN engine. The mission of this project is to deploy LLM models locally on everyone's platforms(Mobile Phone/PC/IOT). It supports popular large language models such as Qianwen, Baichuan, Zhipu, LLAMA, and others. [MNN-LLM User guide](https://mnn-docs.readthedocs.io/en/latest/transformers/llm.html)
+```bash
+cd ./project/android
+mkdir build
+cd build
+../build_64.sh \
+  -DMNN_SUPPORT_BF16=true \
+  -DMNN_BUILD_LLM=true \
+  -DMNN_ARM82=true \
+  -DMNN_OPENCL=true \
+  -DMNN_USE_LOGCAT=true \
+  -DMNN_BUILD_LLM_OMNI=ON \
+  -DMNN_LOW_MEMORY=true \
+  -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true \
+  -DMNN_IMGCODECS=true \
+  -DMNN_QNN=ON \
+  -DMNN_WITH_PLUGIN=ON \
+  -DMNN_QNN_CONVERT_MODE=OFF
+```
 
-[MNN-Diffusion](https://github.com/alibaba/MNN/tree/master/transformers/diffusion) is a stable diffusion model runtime solution developed based on the MNN engine. The mission of this project is to deploy stable diffusion models locally on everyone's platforms. [MNN-Diffusion User guide](https://mnn-docs.readthedocs.io/en/latest/transformers/diffusion.html)
+### 1.3 构建 qnn_docker（生成 QNN 模型离线转换的 bin 权重与执行图）
 
-![architecture](doc/architecture.png)
+> 该步骤用于构建 `qnn_docker` 环境，离线生成 QNN 模型转换所需的 `bin` 权重文件与执行图。
 
-Inside Alibaba, [MNN](https://mp.weixin.qq.com/s/5I1ISpx8lQqvCS8tGd6EJw) works as the basic module of the compute container in the [Walle](https://mp.weixin.qq.com/s/qpeCETty0BqqNJV9CMJafA) System, the first end-to-end, general-purpose, and large-scale production system for device-cloud collaborative machine learning, which has been published in the top system conference OSDI’22. The key design principles of MNN and the extensive benchmark testing results (vs. TensorFlow, TensorFlow Lite, PyTorch, PyTorch Mobile, TVM) can be found in the OSDI paper. The scripts and instructions for benchmark testing are put in the path “/benchmark”. If MNN or the design of Walle helps your research or production use, please cite our OSDI paper as follows:
+- 参考文档：[qnn_docker/README.md](qnn_docker/README.md)
 
-    @inproceedings {proc:osdi22:walle,
-        author = {Chengfei Lv and Chaoyue Niu and Renjie Gu and Xiaotang Jiang and Zhaode Wang and Bin Liu and Ziqi Wu and Qiulin Yao and Congyu Huang and Panos Huang and Tao Huang and Hui Shu and Jinde Song and Bin Zou and Peng Lan and Guohuan Xu and Fei Wu and Shaojie Tang and Fan Wu and Guihai Chen},
-        title = {Walle: An {End-to-End}, {General-Purpose}, and {Large-Scale} Production System for {Device-Cloud} Collaborative Machine Learning},
-        booktitle = {16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22)},
-        year = {2022},
-        isbn = {978-1-939133-28-1},
-        address = {Carlsbad, CA},
-        pages = {249--265},
-        url = {https://www.usenix.org/conference/osdi22/presentation/lv},
-        publisher = {USENIX Association},
-        month = jul,
-    }
+### 1.4 结果说明
 
+- `build_qnn_x86` 阶段：提供 QNN 相关中间工具（用于转换/交叉编译流程）
+- `project/android/build` 阶段：产出手机侧可运行程序（含 `llm_demo`）
 
-## Documentation and Workbench
-MNN's docs are in place in [Read the docs](https://mnn-docs.readthedocs.io/en/latest).
+---
 
-You can also read docs/README to build docs's html.
+## 2. 麒麟 NPU（Kirin）
 
-MNN Workbench could be downloaded from [MNN's homepage](http://www.mnn.zone), which provides pretrained models, visualized training tools, and one-click deployment of models to devices.
+下面给出在本仓库中准备并在麒麟 NPU（HiAI/Huawei）上构建运行的建议流程与示例命令。
 
-## Key Features
-### Lightweight
-- Optimized for devices, no dependencies, can be easily deployed to mobile devices and a variety of embedded devices.
-- iOS platform: static library size will full option for armv7+arm64 platforms is about 12MB, size increase of linked executables is about 2M.
-- Android platform: core so size is about 800KB (armv7a - c++_shared).
-- Using MNN_BUILD_MINI can reduce package size by about 25%, with a limit of fixed model input size
-- Support FP16 / Int8 quantize, can reduce model size 50%-70%
+### 2.1 下载并准备 CANN Kit
 
-### Versatility
-- Supports `Tensorflow`, `Caffe`, `ONNX`,`Torchscripts` and supports common neural networks such as `CNN`, `RNN`, `GAN`, `Transformer`.
-- Supports AI model with multi-inputs or multi-outputs, every kind of dimension format, dynamic inputs, controlflow.
-- MNN supports approximate full OPs used for the AI Model. The converter supports 178 `Tensorflow` OPs, 52 `Caffe` OPs, 163 `Torchscripts` OPs, 158 `ONNX` OPs.
-- Supports iOS 8.0+, Android 4.3+, and embedded devices with POSIX interface.
-- Supports hybrid computing on multiple devices. Currently supports CPU and GPU.
+1. 从华为开发者网站下载 CANN-Kit-next-6.0.1.0：
 
+  https://developer.huawei.com/consumer/cn/doc/hiai-Library/ddk-download-0000001053590180
 
-### High performance
-- Implements core computing with lots of optimized assembly code to make full use of the ARM / x64 CPU.
-- Use Metal / OpenCL / Vulkan to support GPU inference on mobile.
-- Use CUDA and tensorcore to support NVIDIA GPU for better performance
-- Convolution and transposition convolution algorithms are efficient and stable. The Winograd convolution algorithm is widely used to better symmetric convolutions such as 3x3,4x4,5x5,6x6,7x7.
-- Twice speed increase for the new architecture ARM v8.2 with FP16 half-precision calculation support. 2.5 faster to use sdot for ARM v8.2 and VNNI.
+2. 解压后，将其中的 `arm64-v8a` 与 `include` 两个目录拷贝到仓库的第三方路径：
 
-### Ease of use
-- Support use MNN's OP to do numerical calculating like numpy.
-- Support lightweight image process module like OpenCV, which is only 100k.
-- Support build model and train it on PC / mobile.
-- MNN Python API helps ML engineers to easily use MNN to infer, train, and process images, without dipping their toes in C++ code.
+```bash
+# 假设已将包解压到 ~/downloads/CANN-Kit-next-6.0.1.0
+cp -r ~/downloads/CANN-Kit-next-6.0.1.0/ddk/ai_ddk_lib/lib64/* ./source/backend/hiai/3rdParty/arm64-v8a
+cp -r ~/downloads/CANN-Kit-next-6.0.1.0/ddk/ai_ddk_lib/include/* ./source/backend/hiai/3rdParty/include
+```
 
-The Architecture / Precision MNN supported is shown below:
+（目标位置：`source/backend/hiai/3rdParty/arm64-v8a` 和 `source/backend/hiai/3rdParty/include`）
 
-- S ：Support and work well, deeply optimized, recommend to use
-- A ：Support and work well, can use
-- B ：Support but has bug or not optimized, no recommend to use
-- C ：Not Support
+### 2.2 下载 Huawei Command Line Tools
 
-| Architecture / Precision |  | Normal | FP16 | BF16 | Int8 |
-| --- | --- | --- | --- | --- | --- |
-| CPU | Native | B | C | B | B |
-|  | x86/x64-SSE4.1 | A | C | C | A |
-|  | x86/x64-AVX2 | S | C | C | A |
-|  | x86/x64-AVX512 | S | C | C | S |
-|  | ARMv7a | S | S (ARMv8.2) | S | S |
-|  | ARMv8 | S | S (ARMv8.2) | S(ARMv8.6) | S |
-| GPU | OpenCL | A | S | C | S |
-|  | Vulkan | A | A | C | A |
-|  | Metal | A | S | C | S |
-|  | CUDA | A | S | C | A |
-| NPU | CoreML | A | C | C | C |
-|  | HIAI | A | C | C | C |
-|  | NNAPI | B | B | C | B |
-|  | QNN | C | B | C | C |
+1. 从华为开发者官网下载 Command Line Tools（用于 HarmonyOS/鸿蒙 构建工具链）：
 
+  https://developer.huawei.com/consumer/cn/download/command-line-tools-for-hmos?ha_source=sousuo&ha_sourceId=89000251
 
-## Tools
+2. 解压或放置到合适位置，并设置环境变量 `HARMONY_HOME` 指向解压后的 OpenHarmony SDK 路径，例如：
 
-Base on MNN (Tensor compute engine), we provided a series of tools for inference, train and general computation.
+```bash
+# 假设解压后 sdk 在 commandline-tools/command-line-tools/sdk/default/openharmony/
+export HARMONY_HOME=/path/to/commandline-tools/command-line-tools/sdk/default/openharmony/
+```
 
-- MNN-Converter: Convert other models to MNN models for inference, such as Tensorflow(lite), Caffe, ONNX, Torchscripts. And do graph optimization to reduce computation.
-- MNN-Compress: Compress model to reduce size and increase performance / speed
-- MNN-Express: Support model with controlflow, use MNN's OP to do general-purpose computing.
-- MNN-CV: An OpenCV-like library, but based on MNN and then much more lightweight.
-- MNN-Train: Support train MNN model.
+（请根据实际解压路径替换 `/path/to/...`）
 
-## How to Discuss and Get Help From the MNN Community
+### 2.3 编译仓库中的 Harmony/鸿蒙 端库（生成 `libMNN.so`）
 
-The group discussions are predominantly Chinese. But we welcome and will help English speakers.
+进入构建目录并运行仓内提供的构建脚本：
 
-Dingtalk discussion groups:
+```bash
+cd ./project/harmony
+mkdir -p build
+cd build
+../build_64.sh
+```
 
-Group #4 (Available): 160170007549
+运行成功后，会在相应输出目录生成 `libMNN.so`（或位于 `build/output` / `build/lib` 等子目录，视 `build_64.sh` 脚本实现而定）。
 
-Group #3 (Full)
+### 2.4 说明与注意事项
 
-Group #2 (Full): 23350225
+- 请确保 `source/backend/hiai/3rdParty/arm64-v8a` 和 `.../include` 已存在且内容完整。缺少头文件或库会导致编译失败。
+- `HARMONY_HOME` 必须指向命令行工具提供的 OpenHarmony SDK 根目录，否则构建脚本找不到工具链。
+- 若构建失败，请查阅 `project/harmony/build_64.sh` 中的日志与输出路径，按错误提示补充依赖。
+- 本节假定你已经在机器上安装并配置好对应的交叉编译工具链以及必要的 Android/Harmony 环境变量。
 
-Group #1 (Full): 23329087
+---
 
-## Historical Paper
+---
 
-The preliminary version of MNN, as mobile inference engine and with the focus on manual optimization, has also been published in MLSys 2020. Please cite the paper, if MNN previously helped your research:
+## 3. 建议
 
-
-    @inproceedings{alibaba2020mnn,
-      author = {Jiang, Xiaotang and Wang, Huan and Chen, Yiliu and Wu, Ziqi and Wang, Lichuan and Zou, Bin and Yang, Yafeng and Cui, Zongyang and Cai, Yu and Yu, Tianhang and Lv, Chengfei and Wu, Zhihua},
-      title = {MNN: A Universal and Efficient Inference Engine},
-      booktitle = {MLSys},
-      year = {2020}
-    }
-
-
-## License
-Apache 2.0
-
-## Acknowledgement
-MNN participants: Taobao Technology Department, Search Engineering Team, DAMO Team, Youku and other Alibaba Group employees.
-
-MNN refers to the following projects:
-- [Caffe](https://github.com/BVLC/caffe)
-- [flatbuffer](https://github.com/google/flatbuffers)
-- [gemmlowp](https://github.com/google/gemmlowp)
-- [Google Vulkan demo](http://www.github.com/googlesamples/android-vulkan-tutorials)
-- [Halide](https://github.com/halide/Halide)
-- [Mace](https://github.com/XiaoMi/mace)
-- [ONNX](https://github.com/onnx/onnx)
-- [protobuffer](https://github.com/protocolbuffers/protobuf)
-- [skia](https://github.com/google/skia)
-- [Tensorflow](https://github.com/tensorflow/tensorflow)
-- [ncnn](https://github.com/Tencent/ncnn)
-- [paddle-mobile](https://github.com/PaddlePaddle/paddle-mobile)
-- [stb](https://github.com/nothings/stb)
-- [rapidjson](https://github.com/Tencent/rapidjson)
-- [pybind11](https://github.com/pybind/pybind11)
-- [pytorch](https://github.com/pytorch/pytorch)
-- [bolt](https://github.com/huawei-noah/bolt)
-- [libyuv](https://chromium.googlesource.com/libyuv/libyuv)
-- [libjpeg](https://github.com/libjpeg-turbo/libjpeg-turbo)
-- [opencv](https://github.com/opencv/opencv)
-- [onnxruntime](https://github.com/microsoft/onnxruntime)
+- 若要保证复现一致性，建议固定：
+  - MNN commit 版本
+  - QNN SDK 版本
+  - Android NDK 版本
+  - 目标机型与系统版本
+- 可在本 README 后续追加“常见报错与排查”章节（如库依赖缺失、符号冲突、模型转换失败）。
