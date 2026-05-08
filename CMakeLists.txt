@@ -81,6 +81,8 @@ option(MNN_CPU_WEIGHT_DEQUANT_GEMM "Build MNN CPU weight dequant related gemm ke
 option(MNN_BUILD_AUDIO "Build audio api in MNN." OFF)
 option(MNN_SME2 "Use Arm sme2 instructions" ON)
 option(MNN_METAL_TENSOR "Use Metal4 tensor instructions" ON)
+option(MNN_HIAI_CACHE_OM_BY_CHUNK "Enable chunk-aware OM cache path for HiAI backend" OFF)
+option(HIAI_VERBOSE "Enable HiAI verbose log" OFF )
 
 if (MNN_BUILD_MINI)
     set(MNN_SKIPBUILD_GEOMETRY ON CACHE BOOL "<docstring>" FORCE)
@@ -240,6 +242,14 @@ endif()
 if(MNN_SUPPORT_TRANSFORMER_FUSE)
     add_definitions(-DMNN_SUPPORT_TRANSFORMER_FUSE)
 endif()
+if(MNN_HIAI_CACHE_OM_BY_CHUNK)
+    add_definitions(-DMNN_HIAI_CACHE_OM_BY_CHUNK=1)
+endif()
+
+if(HIAI_VERBOSE)
+    add_definitions(-DHIAI_VERBOSE=1)
+endif()
+
 # debug options
 if(MNN_DEBUG_MEMORY)
     add_definitions(-DMNN_DEBUG_MEMORY)

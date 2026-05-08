@@ -64,7 +64,7 @@
 //   (e) IO dimension mismatch  -> GetModelIOTensorDim failed or shape mismatch
 //   (f) execute failure        -> Process returned non-zero
 #ifndef HIAI_VERBOSE
-#define HIAI_VERBOSE 1
+#define HIAI_VERBOSE 0
 #endif
 
 #ifndef HIAI_VERBOSE_V2

@@ -39,12 +39,12 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setNetworkInput(inputs, mOp);
     std::string opName = (mOp && mOp->name()) ? mOp->name()->str()
                                               : ("NPUAttention_anon_" + std::to_string((uintptr_t)mOp));
-    MNN_HIAI_LOG("NPUAttention.onResize: ENTER op=%s type=%d inputCnt=%zu outputCnt=%zu",
+    MNN_HIAI_LOGV2("NPUAttention.onResize: ENTER op=%s type=%d inputCnt=%zu outputCnt=%zu",
                  opName.c_str(), mOp ? (int)mOp->type() : -1, inputs.size(), outputs.size());
 
     if (inputs.size() < 3) {
         MNN_ERROR("NPUAttention expects at least 3 inputs (Q,K,V), got %d\n", (int)inputs.size());
-        MNN_HIAI_LOG("NPUAttention.onResize: FAIL not enough inputs (need>=3)");
+        MNN_HIAI_LOGV2("NPUAttention.onResize: FAIL not enough inputs (need>=3)");
         return INPUT_DATA_ERROR;
     }
     auto query = inputs[0];
@@ -52,7 +52,7 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     auto value = inputs[2];
     if (query->buffer().dimensions != 4) {
         MNN_ERROR("NPUAttention requires 4D Q/K/V, got %d\n", query->buffer().dimensions);
-        MNN_HIAI_LOG("NPUAttention.onResize: FAIL Q is %dD (need 4D)", query->buffer().dimensions);
+        MNN_HIAI_LOGV2("NPUAttention.onResize: FAIL Q is %dD (need 4D)", query->buffer().dimensions);
         return NOT_SUPPORT;
     }
     const int batch    = query->length(0);
@@ -65,15 +65,15 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     const int pastLen = isDecoder ? std::max(0, kvLen - seqLen) : 0;
     const bool hasKvCacheInfo = (mNpuBackend->getMetaPtr() != nullptr);
     const int attentionOption = mNpuBackend->attentionOptionHint();
-    MNN_HIAI_LOG("  Q[B=%d,Sq=%d,H=%d,D=%d] K[%d,%d,%d,%d] V[%d,%d,%d,%d] mask=%s",
+    MNN_HIAI_LOGV2("  Q[B=%d,Sq=%d,H=%d,D=%d] K[%d,%d,%d,%d] V[%d,%d,%d,%d] mask=%s",
                  batch, seqLen, numHead, headDim,
                  key->length(0), key->length(1), key->length(2), key->length(3),
                  value->length(0), value->length(1), value->length(2), value->length(3),
                  inputs.size() >= 4 ? "yes" : "no");
-    MNN_HIAI_LOG("  attn_debug: is_decoder=%d q_len=%d kv_len=%d past_len=%d has_kvcache_info=%d attention_option=%d",
+    MNN_HIAI_LOGV2("  attn_debug: is_decoder=%d q_len=%d kv_len=%d past_len=%d has_kvcache_info=%d attention_option=%d",
                  isDecoder ? 1 : 0, seqLen, kvLen, pastLen, hasKvCacheInfo ? 1 : 0, attentionOption);
     if (!isDecoder && (pastLen != 0 || hasKvCacheInfo)) {
-        MNN_HIAI_LOG("  attn_warn: encoder attention sees decoder-ish signals (past_len=%d, has_kvcache_info=%d)",
+        MNN_HIAI_LOGV2("  attn_warn: encoder attention sees decoder-ish signals (past_len=%d, has_kvcache_info=%d)",
                      pastLen, hasKvCacheInfo ? 1 : 0);
     }
 
@@ -84,7 +84,7 @@ ErrorCode NPUAttention::onResize(const std::vector<Tensor *> &inputs, const std:
     if (mNpuBackend->mGrapMap.find(qIndex) == mNpuBackend->mGrapMap.end() ||
         mNpuBackend->mGrapMap.find(kIndex) == mNpuBackend->mGrapMap.end() ||
         mNpuBackend->mGrapMap.find(vIndex) == mNpuBackend->mGrapMap.end()) {
-        MNN_HIAI_LOG("NPUAttention.onResize: FAIL Q/K/V producer op not found in mGrapMap "
+        MNN_HIAI_LOGV2("NPUAttention.onResize: FAIL Q/K/V producer op not found in mGrapMap "
                      "(qIdx=%d %s, kIdx=%d %s, vIdx=%d %s)",
                      qIndex, mNpuBackend->mGrapMap.count(qIndex) ? "ok" : "MISS",
                      kIndex, mNpuBackend->mGrapMap.count(kIndex) ? "ok" : "MISS",

@@ -2,8 +2,13 @@
 
 本文档说明如何在 MNN 中准备并运行 Qwen3-VL。
 
-- 第 1 部分：高通 NPU（已给出完整编译命令）
-- 第 2 部分：麒麟 NPU（预留章节，后续补充具体命令）
+- 第 1 部分：高通 NPU（支持离线交叉编译，分 chunk 主干text 网络 + fix-shape visual 网络）
+- 第 2 部分：麒麟 NPU（fix-shape visual 网络）
+
+## 0. 量化与校准工具（mobi-autoround）
+
+- 项目地址：<https://github.com/doulujiyao12/mobi-autoround>
+- 该仓库支持自定义图片校准数据集，并导出 GPTQ 格式量化结果；导出的 GPTQ 格式可通过本仓库的 `llmexport` 进一步转换成 MNN 推理所需的文件格式。
 
 ---
 
@@ -69,13 +74,25 @@ cd build
   -DMNN_QNN_CONVERT_MODE=OFF
 ```
 
-### 1.3 构建 qnn_docker（生成 QNN 模型离线转换的 bin 权重与执行图）
+### 1.3 量化模型准备
+
+如果采用 `mobi-autoround` 产出的 GPTQ 量化结果，请在导出时添加 `--gptq_path` 指向对应的 GPTQ 模型目录：
+
+```bash
+cd ./transformers/llm/export
+python llmexport.py --path /origin/fp/model/path \
+    --export mnn --gptq_path /gptq/model/path --quant_bit 4 --quant_block 128 \
+    --visual_quant_bit 4 --visual_quant_block 128 --lm_quant_bit 16 \
+    --seperate_embed --visual_split
+```
+
+### 1.4 构建 qnn_docker（生成 QNN 模型离线转换的 bin 权重与执行图）
 
 > 该步骤用于构建 `qnn_docker` 环境，离线生成 QNN 模型转换所需的 `bin` 权重文件与执行图。
 
 - 参考文档：[qnn_docker/README.md](qnn_docker/README.md)
 
-### 1.4 结果说明
+### 1.5 结果说明
 
 - `build_qnn_x86` 阶段：提供 QNN 相关中间工具（用于转换/交叉编译流程）
 - `project/android/build` 阶段：产出手机侧可运行程序（含 `llm_demo`）
@@ -117,7 +134,28 @@ export HARMONY_HOME=/path/to/commandline-tools/command-line-tools/sdk/default/op
 
 （请根据实际解压路径替换 `/path/to/...`）
 
-### 2.3 编译仓库中的 Harmony/鸿蒙 端库（生成 `libMNN.so`）
+### 2.3 导出适配 Kirin NPU 的 MNN 模型
+
+如果采用 `mobi-autoround` 产出的 GPTQ 量化结果，请在导出时添加 `--gptq_path` 指向对应的 GPTQ 模型目录：
+
+在导出 Qwen3-VL 的 MNN 模型时，可以通过下面命令对视觉分支进行切分，降低 Kirin NPU 在线编图时的内存压力：
+
+```bash
+cd ./transformers/llm/export
+python llmexport.py --path /origin_fp/model_path \
+    --export mnn --gptq_path /gptq/model/path --quant_bit 4 --quant_block 128 \
+    --visual_quant_bit 4 --visual_quant_block 128 --lm_quant_bit 16 \
+    --seperate_embed --visual_split --visual_npu_chunk 6 \
+    --visual_chunk_backends "npu,npu,npu,npu,cpu,cpu"
+```
+
+参数说明：
+
+- `--visual_npu_chunk 6` 表示把视觉头切分成 6 份。Kirin NPU 在线编译时，如果单个 graph 过大，容易报 `Low memory` 错误，因此将视觉部分拆成 6 份来减少单次编图压力。
+- `--visual_chunk_backends "npu,npu,npu,npu,cpu,cpu"` 表示这 6 份分别使用哪些后端执行。上面的配置表示前 4 份跑在 NPU，后 2 份跑在 CPU。
+- 不建议 6 份全部都配置为 `npu`，否则在部分机型或大模型场景下，应用可能会直接 crash。
+
+### 2.4 编译仓库中的 Harmony/鸿蒙 端库（生成 `libMNN.so`）
 
 进入构建目录并运行仓内提供的构建脚本：
 
@@ -130,7 +168,13 @@ cd build
 
 运行成功后，会在相应输出目录生成 `libMNN.so`（或位于 `build/output` / `build/lib` 等子目录，视 `build_64.sh` 脚本实现而定）。
 
-### 2.4 说明与注意事项
+### 2.5 使用鸿蒙 App 进行测试
+
+由于鸿蒙系统不支持命令行开发，我们开发了鸿蒙 App 进行测试。编译得到的 `libMNN.so` 需要替换到 [mobiinfra-oh](https://github.com/doulujiyao12/mobiinfra-oh) 仓库中对应位置：
+
+- https://github.com/doulujiyao12/mobiinfra-oh/blob/dev/entry/libs/arm64-v8a/libMNN.so
+
+### 2.6 说明与注意事项
 
 - 请确保 `source/backend/hiai/3rdParty/arm64-v8a` 和 `.../include` 已存在且内容完整。缺少头文件或库会导致编译失败。
 - `HARMONY_HOME` 必须指向命令行工具提供的 OpenHarmony SDK 根目录，否则构建脚本找不到工具链。
@@ -140,12 +184,3 @@ cd build
 ---
 
 ---
-
-## 3. 建议
-
-- 若要保证复现一致性，建议固定：
-  - MNN commit 版本
-  - QNN SDK 版本
-  - Android NDK 版本
-  - 目标机型与系统版本
-- 可在本 README 后续追加“常见报错与排查”章节（如库依赖缺失、符号冲突、模型转换失败）。

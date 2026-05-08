@@ -108,7 +108,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
         } else {
             shapeOs << "?";
         }
-        MNN_HIAI_LOG("[NPU_LN_BUILD_TAG=v3-bcast-2026-04-25] NPULayerNorm::onResize ENTER name=%s in_shape=%s",
+        MNN_HIAI_LOGV2("[NPU_LN_BUILD_TAG=v3-bcast-2026-04-25] NPULayerNorm::onResize ENTER name=%s in_shape=%s",
                      opName.c_str(), shapeOs.str().c_str());
     }
     auto param = mOp->main_as_LayerNorm();
@@ -140,7 +140,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
         bool bAllZero = tensorLooksAllZero(betaData, &bmin, &bmax);
         embeddedSuspiciousAllZero = gAllZero && bAllZero;
         loadedGammaBeta = !embeddedSuspiciousAllZero;
-        MNN_HIAI_LOG("NPULayerNorm(%s): embedded gamma/beta count=%d g[min=%g max=%g] b[min=%g max=%g]%s",
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): embedded gamma/beta count=%d g[min=%g max=%g] b[min=%g max=%g]%s",
                      opName.c_str(), count, gmin, gmax, bmin, bmax,
                      embeddedSuspiciousAllZero ? " (suspicious all-zero, will try external)" : "");
     }
@@ -164,23 +164,23 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
                     ok = ok && loader.read(reinterpret_cast<char*>(betaData.data()), betaBytes);
                     loadedGammaBeta = ok;
                     if (!ok) {
-                        MNN_HIAI_LOG("NPULayerNorm(%s): read external gamma/beta failed, file=%s off=%lld gb=%lld bb=%lld",
+                        MNN_HIAI_LOGV2("NPULayerNorm(%s): read external gamma/beta failed, file=%s off=%lld gb=%lld bb=%lld",
                                      opName.c_str(), mOp->externalPath()->c_str(),
                                      (long long)offset, (long long)gammaBytes, (long long)betaBytes);
                     } else {
                         float gmin = 0.0f, gmax = 0.0f, bmin = 0.0f, bmax = 0.0f;
                         bool gAllZero = tensorLooksAllZero(gammaData, &gmin, &gmax);
                         bool bAllZero = tensorLooksAllZero(betaData, &bmin, &bmax);
-                        MNN_HIAI_LOG("NPULayerNorm(%s): loaded gamma/beta from external, count=%d g[min=%g max=%g] b[min=%g max=%g]%s",
+                        MNN_HIAI_LOGV2("NPULayerNorm(%s): loaded gamma/beta from external, count=%d g[min=%g max=%g] b[min=%g max=%g]%s",
                                      opName.c_str(), count, gmin, gmax, bmin, bmax,
                                      (gAllZero && bAllZero) ? " (WARNING: both all-zero)" : "");
                     }
                 } else {
-                    MNN_HIAI_LOG("NPULayerNorm(%s): externalPath invalid: %s",
+                    MNN_HIAI_LOGV2("NPULayerNorm(%s): externalPath invalid: %s",
                                  opName.c_str(), mOp->externalPath()->c_str());
                 }
             } else {
-                MNN_HIAI_LOG("NPULayerNorm(%s): gamma/beta absent and externalPath is null", opName.c_str());
+                MNN_HIAI_LOGV2("NPULayerNorm(%s): gamma/beta absent and externalPath is null", opName.c_str());
             }
         }
     }
@@ -188,19 +188,19 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     if (!loadedGammaBeta && embeddedSuspiciousAllZero) {
         // Keep suspicious embedded data as a weaker fallback before identity.
         loadedGammaBeta = true;
-        MNN_HIAI_LOG("NPULayerNorm(%s): external unavailable, fallback to embedded all-zero gamma/beta",
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): external unavailable, fallback to embedded all-zero gamma/beta",
                      opName.c_str());
     }
 
     // 3) Last fallback: identity LN affine.
     if (!loadedGammaBeta) {
         if (normSize <= 0) {
-            MNN_HIAI_LOG("NPULayerNorm(%s): invalid normSize=%d", opName.c_str(), normSize);
+            MNN_HIAI_LOGV2("NPULayerNorm(%s): invalid normSize=%d", opName.c_str(), normSize);
             return INPUT_DATA_ERROR;
         }
         gammaData.assign(normSize, 1.0f);
         betaData.assign(normSize, 0.0f);
-        MNN_HIAI_LOG("NPULayerNorm(%s): fallback to identity gamma/beta, size=%d", opName.c_str(), normSize);
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): fallback to identity gamma/beta, size=%d", opName.c_str(), normSize);
     }
 
     normSize = static_cast<int32_t>(gammaData.size());
@@ -226,7 +226,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     for (auto d : shape) totalElems *= d;
     int64_t mLong = (normSize > 0) ? (totalElems / normSize) : 0;
     if (normSize <= 0 || mLong <= 0 || mLong * normSize != totalElems) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): cannot flatten shape for LayerNormCustom "
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): cannot flatten shape for LayerNormCustom "
                      "(total=%lld normSize=%d)",
                      opName.c_str(), (long long)totalElems, normSize);
         return NOT_SUPPORT;
@@ -269,7 +269,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     (*postReshape).set_input_x(*layerNorm.get()).set_input_shape(mPostShapeConst);
 
     mNpuBackend->setOutputOps(mOp, {preReshape, layerNorm, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (LayerNormCustom) name=%s normSize=%d M=%d",
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (LayerNormCustom) name=%s normSize=%d M=%d",
                  opName.c_str(), normSize, M);
     return NO_ERROR;
 #else
@@ -298,7 +298,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
 
     int32_t rank = static_cast<int32_t>(shape.size());
     if (rank <= 0 || normSize <= 0) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): invalid rank=%d normSize=%d",
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): invalid rank=%d normSize=%d",
                      opName.c_str(), rank, normSize);
         return INPUT_DATA_ERROR;
     }
@@ -306,7 +306,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     for (auto d : shape) totalElems *= d;
     int64_t mLong = totalElems / normSize;
     if (mLong <= 0 || mLong * normSize != totalElems) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): cannot flatten shape (total=%lld normSize=%d)",
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): cannot flatten shape (total=%lld normSize=%d)",
                      opName.c_str(), (long long)totalElems, normSize);
         return NOT_SUPPORT;
     }
@@ -397,7 +397,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setOutputOps(mOp,
         {preReshape, gammaReshape, betaReshape, layerNorm, postReshape},
         outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (paddlelite) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (paddlelite) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
     return NO_ERROR;
@@ -423,14 +423,14 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     // hiai::op::LayerNorm consumes them — proven supported on this DDK.
     int32_t rank = static_cast<int32_t>(shape.size());
     if (rank <= 0 || normSize <= 0) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): invalid rank=%d normSize=%d", opName.c_str(), rank, normSize);
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): invalid rank=%d normSize=%d", opName.c_str(), rank, normSize);
         return INPUT_DATA_ERROR;
     }
     int64_t totalElems = 1;
     for (auto d : shape) totalElems *= d;
     int64_t mLong = (normSize > 0) ? (totalElems / normSize) : 0;
     if (mLong <= 0 || mLong * normSize != totalElems) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): cannot flatten shape for 4D wrap "
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): cannot flatten shape for 4D wrap "
                      "(total=%lld normSize=%d)",
                      opName.c_str(), (long long)totalElems, normSize);
         return NOT_SUPPORT;
@@ -631,7 +631,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varEps, invStd,
          invStdFull, normalized, scaled, y, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=0 production) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=0 production) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 1
@@ -639,35 +639,35 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     (*postReshape).set_input_x(*meanFull.get()).set_input_shape(mPostShapeConst);
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=1 mean) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=1 mean) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 2
     (*postReshape).set_input_x(*centered.get()).set_input_shape(mPostShapeConst);
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=2 centered) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=2 centered) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 3
     (*postReshape).set_input_x(*sq.get()).set_input_shape(mPostShapeConst);
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=3 sq) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=3 sq) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 4
     (*postReshape).set_input_x(*varFull.get()).set_input_shape(mPostShapeConst);
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varFull, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=4 var) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=4 var) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 5
     (*postReshape).set_input_x(*varEpsFull.get()).set_input_shape(mPostShapeConst);
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varEps, varEpsFull, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=5 var_eps) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=5 var_eps) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 6
@@ -675,7 +675,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varEps, invStd,
          invStdFull, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=6 invStd) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=6 invStd) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 7
@@ -683,7 +683,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varEps, invStd,
          invStdFull, normalized, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=7 normalized) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=7 normalized) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #elif MNN_HIAI_LN_DEBUG_STAGE == 8
@@ -691,7 +691,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     mNpuBackend->setOutputOps(mOp,
         {preReshape, mean, meanFull, centered, sq, var, varEps, invStd,
          invStdFull, normalized, scaled, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=8 scaled) "
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (decomposed-Tile, stage=8 scaled) "
                  "name=%s rank=%d normSize=%d M=%d eps=%g",
                  opName.c_str(), rank, normSize, M, eps);
 #else
@@ -719,7 +719,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     for (auto d : shape) totalElems *= d;
     int64_t mLong = (normSize > 0) ? (totalElems / normSize) : 0;
     if (normSize <= 0 || mLong <= 0 || mLong * normSize != totalElems) {
-        MNN_HIAI_LOG("NPULayerNorm(%s): cannot flatten shape for HiAI begin_norm_axis=1 convention "
+        MNN_HIAI_LOGV2("NPULayerNorm(%s): cannot flatten shape for HiAI begin_norm_axis=1 convention "
                      "(total=%lld normSize=%d)",
                      opName.c_str(), (long long)totalElems, normSize);
         return NOT_SUPPORT;
@@ -762,7 +762,7 @@ ErrorCode NPULayerNorm::onResize(const std::vector<Tensor *> &inputs, const std:
     (*postReshape).set_input_x(*layerNorm.get()).set_input_shape(mPostShapeConst);
 
     mNpuBackend->setOutputOps(mOp, {preReshape, layerNorm, postReshape}, outputs);
-    MNN_HIAI_LOG("NPULayerNorm::onResize EXIT (hiai::LayerNorm) name=%s normSize=%d M=%d",
+    MNN_HIAI_LOGV2("NPULayerNorm::onResize EXIT (hiai::LayerNorm) name=%s normSize=%d M=%d",
                  opName.c_str(), normSize, M);
     return NO_ERROR;
 #endif // MNN_HIAI_LN_USE_PRIMITIVES
