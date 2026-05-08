@@ -1,6 +1,6 @@
 # Qwen3-VL 在高通 NPU / 麒麟 NPU 上运行说明
 
-本文档说明如何在 MNN 中准备并运行 Qwen3-VL。
+本文档说明如何在 mobiinfer 中准备并运行 Qwen3-VL。
 
 - 第 1 部分：高通 NPU（支持离线交叉编译，分 chunk 主干text 网络 + fix-shape visual 网络）
 - 第 2 部分：麒麟 NPU（fix-shape visual 网络）
@@ -36,7 +36,7 @@ export HEXAGON_SDK_ROOT=/home/xiaying/third/qnn/qairt/2.38.0.250901
 > 这一步用于产出 QNN SDK 交叉编译流程需要的中间工具，**不会**产出可直接在手机侧运行的二进制文件。
 
 ```bash
-cd ./MNN
+cd ./mobiinfer
 mkdir build_qnn_x86
 cd build_qnn_x86
 cmake .. \
@@ -92,7 +92,40 @@ python llmexport.py --path /origin/fp/model/path \
 
 - 参考文档：[qnn_docker/README.md](qnn_docker/README.md)
 
-### 1.5 结果说明
+### 1.5 推送 QNN 运行时依赖与模型并执行（Android）
+
+首先将生成的./project/android/build 中的 llm_demo文件和so文件（包括tools/cv/libMNNOpenCV.so 和audio/libMNNAudio.so，中间编译产出不需要）推送到手机的指定目录 (PHONEDIR = /data/local/tmp/mobiinfer 可以指定任何可执行权限的目录下)：
+
+将 QNN 相关运行时库推送到 Android 侧测试目录：
+
+```bash
+ANDROID_WORKING_DIR=/data/local/tmp/mobiinfer/qnn_sdk
+HEXAGON_ARCH=75
+adb push ${QNN_SDK_ROOT}/lib/aarch64-android/libQnnHtp.so ${ANDROID_WORKING_DIR}
+adb push ${QNN_SDK_ROOT}/lib/aarch64-android/libQnnHtpV${HEXAGON_ARCH}Stub.so ${ANDROID_WORKING_DIR}
+adb push ${QNN_SDK_ROOT}/lib/hexagon-v${HEXAGON_ARCH}/unsigned/libQnnHtpV${HEXAGON_ARCH}Skel.so ${ANDROID_WORKING_DIR}
+adb push ${QNN_SDK_ROOT}/lib/aarch64-android/libQnnSystem.so ${ANDROID_WORKING_DIR}
+```
+
+推送模型：
+
+```bash
+
+cd transformers/llm/export
+adb push model /data/local/tmp/mobiinfer/model
+```
+
+手机上运行：
+
+```bash
+export ADSP_LIBRARY_PATH=/qnn/sdk:$ADSP_LIBRARY_PATH
+export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:{ANDROID_WORKING_DIR}:{PHONEDIR}:$LD_LIBRARY_PATH
+
+cd ${PHONEDIR}
+./llm_demo model/config_qnn.json
+```
+
+### 1.6 结果说明
 
 - `build_qnn_x86` 阶段：提供 QNN 相关中间工具（用于转换/交叉编译流程）
 - `project/android/build` 阶段：产出手机侧可运行程序（含 `llm_demo`）
