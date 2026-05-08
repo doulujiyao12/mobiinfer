@@ -184,3 +184,7 @@ cd build
 ---
 
 ---
+
+## 致谢
+
+- 感谢 [alibaba/MNN](https://github.com/alibaba/MNN) 开源仓库提供的基础能力与工程实现。
