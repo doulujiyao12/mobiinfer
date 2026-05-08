@@ -2,7 +2,7 @@
 
 本文档说明如何在 mobiinfer 中准备并运行 Qwen3-VL。
 
-- 第 1 部分：高通 NPU（支持离线交叉编译，分 chunk 主干text 网络 + fix-shape visual 网络）
+- 第 1 部分：高通 NPU（支持离线交叉编译，分 chunk 主干text 网络 + fix-shape visual 网络 图片输入样例\<img\>test.jpg\<hw\>600,270\</hw\>\</img\>） 如果要改变图片输入尺寸，在下面docker_qnn编译阶段改变输入张量尺寸，现在 visual blocks 输入seqlen = 608 对应height = 600, weight = 270
 - 第 2 部分：麒麟 NPU（fix-shape visual 网络）
 
 ## 0. 量化与校准工具（mobi-autoround）
@@ -124,6 +124,49 @@ export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:{ANDROID_WORKING_DIR}:{PHONED
 cd ${PHONEDIR}
 ./llm_demo model/config_qnn.json
 ```
+
+一个典型的 `config_qnn.json` 示例：
+
+```json
+{
+  "llm_model": "qnn/llm.mnn",
+  "chunk_limits": [128, 1],
+  "backend_type": "cpu",
+  "thread_num": 4,
+  "precision": "low",
+  "memory": "low",
+  "sampler_type": "mixed",
+  "temperature": 0.8,
+  "top_k": 40,
+  "top_p": 0.9,
+  "min_p": 0.05,
+  "tfs_z": 1.0,
+  "typical": 0.95,
+  "repetition_penalty": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "penalty_window": 0,
+  "n_gram": 8,
+  "ngram_factor": 1.0,
+  "tokenizer_file": "tokenizer.mtok",
+  "mllm": {
+    "backend_type": "cpu",
+    "thread_num": 4,
+    "precision": "normal",
+    "memory": "low"
+  },
+  "visual_split": true,
+  "visual_pre_model": "visual_pre.mnn",
+  "visual_blocks_model": "visual_blocks_69_79.mnn",
+  "visual_post_model": "visual_post.mnn",
+  "visual_blocks_backend_type": "npu"
+}
+```
+
+其中：
+
+- `qnn/llm.mnn` 是主干 text 网络转化后的 QNN bin 和 MNN 文件（同名 `.mnn` 对应 QNN 的权重与执行图产物）。
+- `visual_blocks_69_79.mnn` 是图片 visual 网络（blocks）转化后的 QNN bin 和 MNN 文件。
 
 ### 1.6 结果说明
 
