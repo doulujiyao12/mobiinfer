@@ -489,3 +489,5 @@ transformers/llm/export/model_sanduan_conv_bit4_visual_bak2/
 
 transformers/llm/export/model_6chunk_nor_kirinnpu_visual4/
 transformers/llm/export/model_nor_kirin_visualw8a8/
+# ignore temp scripts
+/extract_llm_*.py
