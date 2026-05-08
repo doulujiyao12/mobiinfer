@@ -7,7 +7,7 @@
 
 ## Demo（手机 GUI Agent 功能展示）
 
-<video src="./doc/demo.mp4" controls></video>
+Demo 视频（MP4）：[doc/demo.mp4](doc/demo.mp4)（GitHub README 不支持内嵌播放，点击链接后在新页面可直接播放）
 
 以上demo仓库可以详见[mobiinfra-oh](https://github.com/doulujiyao12/mobiinfra-oh)
 
