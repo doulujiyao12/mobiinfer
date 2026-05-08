@@ -5,6 +5,12 @@
 - 第 1 部分：高通 NPU（支持离线交叉编译，分 chunk 主干text 网络 + fix-shape visual 网络 图片输入样例\<img\>test.jpg\<hw\>600,270\</hw\>\</img\>） 如果要改变图片输入尺寸，在下面docker_qnn编译阶段改变输入张量尺寸，现在 visual blocks 输入seqlen = 608 对应height = 600, weight = 270
 - 第 2 部分：麒麟 NPU（fix-shape visual 网络）
 
+## Demo（手机 GUI Agent 功能展示）
+
+<video src="./doc/demo.mp4" controls></video>
+
+以上demo仓库可以详见[mobiinfra-oh](https://github.com/doulujiyao12/mobiinfra-oh)
+
 ## 0. 量化与校准工具（mobi-autoround）
 
 - 项目地址：<https://github.com/doulujiyao12/mobi-autoround>
