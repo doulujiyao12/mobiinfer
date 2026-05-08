@@ -491,3 +491,4 @@ transformers/llm/export/model_6chunk_nor_kirinnpu_visual4/
 transformers/llm/export/model_nor_kirin_visualw8a8/
 # ignore temp scripts
 /extract_llm_*.py
+test_analyze_nonlinear.py
