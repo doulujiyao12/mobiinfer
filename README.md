@@ -57,6 +57,8 @@ cmake .. \
   -DMNN_WITH_PLUGIN=OFF \
   -DMNN_BUILD_TOOLS=ON \
   -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+
+make -j64
 ```
 
 ### 1.2 编译 Android 侧可执行文件（llm_demo）
