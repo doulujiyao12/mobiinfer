@@ -394,13 +394,8 @@ apps/Android/.qoder/settings.json
 apps/Android/MnnLlmChatOld
 
 transformers/llm/export/tmp/
-transformers/llm/export/model_em8/
-transformers/llm/export/model_em_bf16/
-transformers/llm/export/model_fp16/
-transformers/llm/export/model_mobilenet/
-transformers/llm/export/model_qwen3_0.6/
-transformers/llm/export/modelfp16_visual8
-transformers/llm/export/modelfp16hqq/
+transformers/llm/export/model*
+
 tools/script/make_llm_test_old.py
 tools/script/make_llm_test.py
 tools/logits_diff*
@@ -415,21 +410,14 @@ logits.txt
 logits_comparison.png
 transformers/llm/export/logits.txt
 transformers/llm/export/logits_comparison.png
-transformers/llm/export/model-2B
 
-transformers/llm/export/model_npu
 pipelinemodule.md
 dequant_gemm.md
 w4a8_degemm.md
 yuque
-transformers/llm/export/model_half/
-transformers/llm/export/model2B_w8a8/
-transformers/llm/export/model_2ep_n128_s1024/
-transformers/llm/export/model_2ep_n256_s1024/
 check_gptq.py
 check_gptq_visuasl.txt
-transformers/llm/export/model_rl_n128_s1024/
-transformers/llm/export/model_visual8_test/
+
 
 # iOS
 apps/iOS/MNNLLMChat/Chat/
@@ -449,46 +437,29 @@ hdc_server.py
 screen.jpeg
 source/backend/hiai/3rdParty/
 transformers/llm/engine/demo/prefix.txt
-transformers/llm/export/model_duiqi_visualw8_s64/
 
 check_gptq_visuasl_perchannel.txt
-transformers/llm/export/model_visual_w4_duiqi/
+
 kirin9030/
-transformers/llm/export/model_visual8mat_json/
-transformers/llm/export/model_visual_8perchannel/
-transformers/llm/export/model_visualmatmul/
+
 
 
 
 hiai-log.txt
-transformers/llm/export/model_1visualblockfp16/
-transformers/llm/export/model_sangevisual_fp16/
-transformers/llm/export/visual_blocks.mnn
-transformers/llm/export/visual_blocks.mnn.weight
-transformers/llm/export/model_allnpuvisualfp16/
-transformers/llm/export/model_chunk6_npufp16/
-transformers/llm/export/model_12chunk_4bit/
+
 test_qwen3vl_op.txt
 
 
 opbuild_out/
 source/backend/hiai/custom/
-transformers/llm/export/model_nor_sanvisual_npu_kirin_sft/
-transformers/llm/export/model_sanduan_conv_bit4_visual/
-transformers/llm/export/model_visualint4conv_chunk6/
+
 
 ascendc_layernorm_custom/
 DDK-tools-next-6.0.1.0/
 
 
 claude_chat.txt
-transformers/llm/export/model_nor_kirin_visualw4a16/
-transformers/llm/export/model_sanduan_conv_bit4_visual_bak/
-transformers/llm/export/model_sanduan_conv_bit4_visual_bak2/
 
-
-transformers/llm/export/model_6chunk_nor_kirinnpu_visual4/
-transformers/llm/export/model_nor_kirin_visualw8a8/
 # ignore temp scripts
 /extract_llm_*.py
 test_analyze_nonlinear.py
