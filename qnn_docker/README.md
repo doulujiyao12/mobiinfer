@@ -82,7 +82,7 @@ cd /workspace/mobiinfer/build_qnn_x86
 ./MNN2QNNModel /opt/qnn 69 79 \
   /workspace/mobiinfer/transformers/llm/export/model/visual_blocks.mnn \
   /workspace/mobiinfer/transformers/llm/export/model/qnn_visual \
-  1 608x1024_2x1x608x1x64_1x608x60
+  1 608x1024_2x1x608x1x64_1x608x608
 ```
 
 这一步用于生成固定图片 shape 的 QNN bin。
