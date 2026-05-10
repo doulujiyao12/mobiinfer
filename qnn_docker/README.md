@@ -79,6 +79,7 @@ python3 generate_llm_qnn.py \
 
 ```bash
 cd /workspace/mobiinfer/build_qnn_x86
+mkdir -p /workspace/mobiinfer/transformers/llm/export/model/qnn_visual
 ./MNN2QNNModel /opt/qnn 69 79 \
   /workspace/mobiinfer/transformers/llm/export/model/visual_blocks.mnn \
   /workspace/mobiinfer/transformers/llm/export/model/qnn_visual \

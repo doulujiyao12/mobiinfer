@@ -169,7 +169,7 @@ cd ${PHONEDIR}
   "visual_pre_model": "visual_pre.mnn",
   "visual_blocks_model": "visual_blocks_69_79.mnn",
   "visual_post_model": "visual_post.mnn",
-  "visual_blocks_backend_type": "npu"
+  "visual_blocks_backend_type": "cpu"
 }
 ```
 
