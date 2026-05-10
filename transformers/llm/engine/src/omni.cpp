@@ -614,7 +614,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                 idx_ptr[0 * num_patches + idx] = h_idx_floor * num_grid + w_idx_floor;
                 idx_ptr[1 * num_patches + idx] = h_idx_floor * num_grid + w_idx_ceil;
                 idx_ptr[2 * num_patches + idx] = h_idx_ceil * num_grid + w_idx_floor;
-                idx_ptr[3 * num_patches + idx] = h_idx_ceil * num_grid + w_idx_floor;
+                idx_ptr[3 * num_patches + idx] = h_idx_ceil * num_grid + w_idx_ceil;
                 weight_ptr[0 * num_patches + idx] = (1.0f - dh) * (1.0f - dw);
                 weight_ptr[1 * num_patches + idx] = (1.0f - dh) * dw;
                 weight_ptr[2 * num_patches + idx] = dh * (1.0f - dw);
