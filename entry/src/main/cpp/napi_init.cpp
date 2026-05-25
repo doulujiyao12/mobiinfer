@@ -38,6 +38,10 @@
 #include <cmath>
 #include <chrono>
 
+// NNRT header for OMC test (HarmonyOS SDK)
+#include "HIAIModelManager.h"
+#include <fstream>
+
 #ifdef LOG_TAG
 #undef LOG_TAG
 #endif
@@ -1072,6 +1076,164 @@ static napi_value SetInt8XScale(napi_env env, napi_callback_info info) {
     napi_value ret;
     napi_create_string_utf8(env, "ok", 2, &ret);
     return ret;
+}
+
+// ========== 10d. OMC Visual Block NPU Test (HarmonyOS NNRT API) ==========
+
+struct OmcTestAsyncData {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string modelDir;
+    std::string result;
+};
+
+static void OmcTestExecute(napi_env env, void* data) {
+    auto* d = static_cast<OmcTestAsyncData*>(data);
+
+    // 1. Find .omc file in modelDir and read into memory buffer
+    std::string omcPath;
+    DIR* dir = opendir(d->modelDir.c_str());
+    if (!dir) { d->result = "{\"ok\":false,\"error\":\"cannot open modelDir\"}"; return; }
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.find(".om") != std::string::npos) {
+            omcPath = d->modelDir + "/" + name;
+            break;
+        }
+    }
+    closedir(dir);
+    if (omcPath.empty()) { d->result = "{\"ok\":false,\"error\":\"no .omc file found\"}"; return; }
+    LOGI("OMC file: %{public}s", omcPath.c_str());
+
+    // Read OMC file into buffer
+    std::ifstream file(omcPath, std::ios::binary | std::ios::ate);
+    if (!file) { d->result = "{\"ok\":false,\"error\":\"cannot open omc file\"}"; return; }
+    size_t modelSize = file.tellg();
+    file.seekg(0);
+    std::vector<uint8_t> modelBuf(modelSize);
+    file.read(reinterpret_cast<char*>(modelBuf.data()), modelSize);
+    file.close();
+    LOGI("OMC model size: %{public}zu bytes", modelSize);
+
+    // 2. Load model via NNRT
+    OH_NN_ReturnCode ret = HIAIModelManager::GetInstance().LoadModelFromBuffer(modelBuf.data(), modelSize);
+    if (ret != OH_NN_SUCCESS) {
+        LOGE("OMC LoadModelFromBuffer failed: %{public}d", (int)ret);
+        d->result = "{\"ok\":false,\"error\":\"LoadModelFromBuffer failed, ret=" + std::to_string(ret) + "\"}";
+        return;
+    }
+    LOGI("OMC LoadModel OK");
+
+    // 3. Init I/O tensors (shapes auto-detected from model)
+    ret = HIAIModelManager::GetInstance().InitIOTensors();
+    if (ret != OH_NN_SUCCESS) {
+        LOGE("OMC InitIOTensors failed: %{public}d", (int)ret);
+        d->result = "{\"ok\":false,\"error\":\"InitIOTensors failed, ret=" + std::to_string(ret) + "\"}";
+        return;
+    }
+
+    // 4. Fill input data (dummy 0.1) with exact sizes
+    int S = 608;
+    struct {
+        std::vector<float> buf;
+        const char* name;
+    } bufs[3] = {
+        {std::vector<float>(1 * S * 1024, 0.1f), "hidden_states_in"},
+        {std::vector<float>(2 * S * 64, 0.1f),   "rotary_pos_emb"},
+        {std::vector<float>(1 * S * S, 0.1f),    "attention_mask"},
+    };
+    int nIn = HIAIModelManager::GetInstance().GetInputCount();
+    for (int i = 0; i < nIn; i++) {
+        size_t inSize = HIAIModelManager::GetInstance().GetInputSize(i) / sizeof(float);
+        bool matched = false;
+        for (int j = 0; j < 3; j++) {
+            if (inSize == bufs[j].buf.size()) {
+                ret = HIAIModelManager::GetInstance().SetInputData(i, bufs[j].buf.data(), bufs[j].buf.size());
+                if (ret != OH_NN_SUCCESS) {
+                    LOGE("OMC SetInputData[%d](%s) failed", i, bufs[j].name);
+                    d->result = "{\"ok\":false,\"error\":\"SetInputData failed\"}";
+                    return;
+                }
+                LOGI("OMC input[%d] size=%zu floats -> %s", i, inSize, bufs[j].name);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            LOGE("OMC input[%d] size=%zu floats, expected %zu/%zu/%zu",
+                 i, inSize, bufs[0].buf.size(), bufs[1].buf.size(), bufs[2].buf.size());
+            d->result = "{\"ok\":false,\"error\":\"input size mismatch\"}";
+            return;
+        }
+    }
+
+    // 5. Run
+    auto t0 = std::chrono::high_resolution_clock::now();
+    ret = HIAIModelManager::GetInstance().RunModel();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double latencyMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Read output (tensor is still valid right after RunSync)
+    std::ostringstream json;
+    json << "{\"ok\":" << (ret == OH_NN_SUCCESS ? "true" : "false");
+    json << ",\"runRet\":" << (int)ret;
+    json << ",\"latencyMs\":" << latencyMs;
+
+    if (ret == OH_NN_SUCCESS) {
+        int nOut = HIAIModelManager::GetInstance().GetOutputCount();
+        json << ",\"outputCount\":" << nOut;
+        json << ",\"outputs\":{";
+        for (int oi = 0; oi < nOut; oi++) {
+            if (oi) json << ",";
+            LOGI("OMC step_get_data out=%{public}d", oi);
+            auto outData = HIAIModelManager::GetInstance().GetOutputData(oi);
+            LOGI("OMC data_ok out=%{public}d size=%{public}zu", oi, outData.size());
+            json << "\"out" << oi << "\":{\"size\":" << outData.size();
+            if (!outData.empty()) {
+                json << ",\"sample\":[";
+                for (size_t j = 0; j < std::min(outData.size(), (size_t)5); j++) {
+                    if (j) json << ",";
+                    json << outData[j];
+                }
+                json << "]";
+            }
+            json << "}";
+        }
+        json << "}";
+    }
+    json << "}";
+    LOGI("OMC test done");
+    HIAIModelManager::GetInstance().UnloadModel();
+    d->result = json.str();
+}
+
+static void OmcTestComplete(napi_env env, napi_status status, void* data) {
+    auto* d = static_cast<OmcTestAsyncData*>(data);
+    napi_value result;
+    napi_create_string_utf8(env, d->result.c_str(), d->result.size(), &result);
+    napi_resolve_deferred(env, d->deferred, result);
+    napi_delete_async_work(env, d->work);
+    delete d;
+}
+
+static napi_value OmcTestAsync(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    auto* d = new OmcTestAsyncData();
+    if (argc >= 1) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[0], nullptr, 0, &len);
+        d->modelDir.resize(len);
+        napi_get_value_string_utf8(env, args[0], &d->modelDir[0], len + 1, &len);
+    }
+    napi_value promise, resourceName;
+    napi_create_promise(env, &d->deferred, &promise);
+    napi_create_string_utf8(env, "OmcTest", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName, OmcTestExecute, OmcTestComplete, d, &d->work);
+    napi_queue_async_work(env, d->work);
+    return promise;
 }
 
 // ========== 10. 单算子精度测试 (Convolution on CPU vs HiAI Delegate) ==========
@@ -3277,6 +3439,437 @@ static std::string runQwen3VlChunkModelTest(const std::string& modelRoot,
     return log.str();
 }
 
+// ---- OM offline model helpers ----
+
+static bool runOmChunkOnce(const std::string& omPath,
+                           const std::vector<float>& hiddenData,
+                           const std::vector<float>& rotaryData,
+                           const std::vector<float>& maskData,
+                           double& latencyMs,
+                           std::vector<std::vector<float>>& outputs,
+                           std::string& error) {
+    using Clock = std::chrono::high_resolution_clock;
+    using Ms = std::chrono::duration<double, std::milli>;
+
+    // Read OM file into buffer
+    std::ifstream file(omPath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        error = "cannot open om file: " + omPath;
+        return false;
+    }
+    size_t modelSize = file.tellg();
+    file.seekg(0);
+    std::vector<uint8_t> modelBuf(modelSize);
+    file.read(reinterpret_cast<char*>(modelBuf.data()), modelSize);
+    file.close();
+
+    OH_NN_ReturnCode ret = HIAIModelManager::GetInstance().LoadModelFromBuffer(modelBuf.data(), modelSize);
+    if (ret != OH_NN_SUCCESS) {
+        error = "LoadModelFromBuffer failed, ret=" + std::to_string((int)ret);
+        return false;
+    }
+
+    ret = HIAIModelManager::GetInstance().InitIOTensors();
+    if (ret != OH_NN_SUCCESS) {
+        error = "InitIOTensors failed, ret=" + std::to_string((int)ret);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+
+    int nIn = HIAIModelManager::GetInstance().GetInputCount();
+    if (nIn < 3) {
+        error = "OM model expects >=3 inputs, got " + std::to_string(nIn);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+
+    // Feed real visual_pre outputs into OM model
+    ret = HIAIModelManager::GetInstance().SetInputData(1, hiddenData.data(), hiddenData.size());
+    if (ret != OH_NN_SUCCESS) {
+        error = "SetInputData[0] failed, ret=" + std::to_string((int)ret);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+    ret = HIAIModelManager::GetInstance().SetInputData(0, rotaryData.data(), rotaryData.size());
+    if (ret != OH_NN_SUCCESS) {
+        error = "SetInputData[1] failed, ret=" + std::to_string((int)ret);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+    ret = HIAIModelManager::GetInstance().SetInputData(2, maskData.data(), maskData.size());
+    if (ret != OH_NN_SUCCESS) {
+        error = "SetInputData[2] failed, ret=" + std::to_string((int)ret);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+
+    auto t0 = Clock::now();
+    ret = HIAIModelManager::GetInstance().RunModel();
+    latencyMs = Ms(Clock::now() - t0).count();
+
+    if (ret != OH_NN_SUCCESS) {
+        error = "RunModel failed, ret=" + std::to_string((int)ret);
+        HIAIModelManager::GetInstance().UnloadModel();
+        return false;
+    }
+
+    int nOut = HIAIModelManager::GetInstance().GetOutputCount();
+    outputs.clear();
+    outputs.resize(nOut);
+    for (int oi = 0; oi < nOut; oi++) {
+        outputs[oi] = HIAIModelManager::GetInstance().GetOutputData(oi);
+    }
+
+    HIAIModelManager::GetInstance().UnloadModel();
+    return true;
+}
+
+static std::string findOmChunkFile(const std::string& modelDir, int chunkIndex) {
+    const std::string namePrefix = "visual_blocks_npu_" + std::to_string(chunkIndex);
+    DIR* dir = ::opendir(modelDir.c_str());
+    if (dir == nullptr) return "";
+    struct dirent* ent = nullptr;
+    std::string found;
+    while ((ent = ::readdir(dir)) != nullptr) {
+        std::string name(ent->d_name);
+        if (name.find(namePrefix) == 0 && name.find(".om") != std::string::npos) {
+            found = modelDir + "/" + name;
+            break;
+        }
+    }
+    ::closedir(dir);
+    return found;
+}
+
+// ---- OM vs MNN visual chunk cross-validation test ----
+
+static std::string runOmVsMnnChunkTest(const std::string& modelRoot,
+                                       int seqLen = 608,
+                                       int warmup = 1,
+                                       int repeat = 2) {
+    std::ostringstream log;
+    std::string modelDir = modelRoot;
+    if (!modelDir.empty() && modelDir.size() > 12 &&
+        modelDir.substr(modelDir.size() - 12) == "/config.json") {
+        modelDir = modelDir.substr(0, modelDir.find_last_of('/'));
+    }
+    if (!isDirectory(modelDir)) {
+        log << "ERROR: model directory not found: " << modelDir << "\n";
+        return log.str();
+    }
+
+    const std::string configPath = modelDir + "/config.json";
+    const std::string configText = readTextFile(configPath);
+    const int numGridPerSide = extractJsonInt(configText, "num_grid_per_side", 48);
+    const std::string visualBackend = extractJsonString(configText, "visual_blocks_backend_type", "hiai");
+    const MNNForwardType npuType = visualBackendFromString(visualBackend);
+
+    const std::string prePath = modelDir + "/visual_pre.mnn";
+    if (!fileExists(prePath)) {
+        log << "ERROR: visual_pre.mnn not found: " << prePath << "\n";
+        return log.str();
+    }
+    auto chunkPaths = listVisualChunkModels(modelDir);
+    if (chunkPaths.empty()) {
+        log << "ERROR: no visual_blocks_npu_*.mnn found under: " << modelDir << "\n";
+        return log.str();
+    }
+
+    log << "=== OM vs MNN Visual Chunk Cross-Validation Test ===\n";
+    log << "model_dir=" << modelDir << "\n";
+    log << "chunk_count=" << chunkPaths.size() << "\n";
+    log << "seq_len=" << seqLen << "  num_grid_per_side=" << numGridPerSide
+        << "  visual_backend=" << visualBackend
+        << " (" << forwardTypeName(npuType) << ")\n";
+
+    MNN::BackendConfig cpuCfg = makeCpuBackendConfig();
+    Module::Config cpuModuleCfg;
+    cpuModuleCfg.shapeMutable = true;
+    cpuModuleCfg.rearrange = true;
+
+    MNN::ScheduleConfig preSched;
+    preSched.type = MNN_FORWARD_CPU;
+    preSched.numThread = 1;
+    preSched.backendConfig = &cpuCfg;
+    std::shared_ptr<Executor::RuntimeManager> preRt(
+        Executor::RuntimeManager::createRuntimeManager(preSched));
+    if (preRt.get() == nullptr) {
+        log << "ERROR: create CPU runtime for visual_pre failed\n";
+        return log.str();
+    }
+    std::shared_ptr<Module> preModule(Module::load({}, {}, prePath.c_str(), preRt, &cpuModuleCfg));
+    if (preModule.get() == nullptr || preModule->getInfo() == nullptr) {
+        log << "ERROR: load visual_pre.mnn failed\n";
+        return log.str();
+    }
+    const auto* preInfo = preModule->getInfo();
+    bool hasQwen3Pos = false;
+    for (const auto& name : preInfo->inputNames) {
+        if (name == "idx_tensor") {
+            hasQwen3Pos = true;
+            break;
+        }
+    }
+    if (!hasQwen3Pos) {
+        log << "ERROR: visual_pre.mnn inputs do not contain idx_tensor; "
+            << "this test currently targets Qwen3VL split-export models only.\n";
+        return log.str();
+    }
+    int patchDim = 1536;
+    if (!preInfo->inputs.empty() && preInfo->inputs[0].dim.size() >= 2 && preInfo->inputs[0].dim[1] > 0) {
+        patchDim = preInfo->inputs[0].dim[1];
+    }
+
+    std::string buildErr;
+    auto preInputs = buildQwen3VlPreInputs(seqLen, patchDim, numGridPerSide, buildErr);
+    if (!buildErr.empty()) {
+        log << "ERROR: failed to build visual_pre inputs: " << buildErr << "\n";
+        return log.str();
+    }
+    auto preOut = preModule->onForward(preInputs);
+    if (preOut.size() < 2 || preOut[0].get() == nullptr || preOut[1].get() == nullptr) {
+        log << "ERROR: visual_pre output invalid, expected at least 2 tensors\n";
+        return log.str();
+    }
+    auto hidden0 = cloneToHostInput(preOut[0], "visual_hidden_0");
+    auto rotary = cloneToHostInput(preOut[1], "visual_rotary");
+    if (hidden0.get() == nullptr || rotary.get() == nullptr) {
+        log << "ERROR: failed to materialize visual_pre outputs to host\n";
+        return log.str();
+    }
+    auto hiddenInfo = hidden0->getInfo();
+    if (hiddenInfo == nullptr || hiddenInfo->dim.empty()) {
+        log << "ERROR: hidden_states info missing after visual_pre\n";
+        return log.str();
+    }
+    const int hiddenSeqLen = hiddenInfo->dim[0];
+    auto attentionMask = _Input({1, hiddenSeqLen, hiddenSeqLen}, NCHW);
+    ::memset(attentionMask->writeMap<float>(), 0, (size_t)hiddenSeqLen * hiddenSeqLen * sizeof(float));
+    attentionMask = cloneToHostInput(attentionMask, "visual_mask");
+    if (attentionMask.get() == nullptr) {
+        log << "ERROR: failed to build attention_mask\n";
+        return log.str();
+    }
+
+    log << "visual_pre hidden_states shape=" << varShapeStringLocal(hidden0)
+        << " rotary shape=" << varShapeStringLocal(rotary)
+        << " mask shape=" << varShapeStringLocal(attentionMask) << "\n\n";
+
+    MNN::BackendConfig npuCfg;
+    npuCfg.memory = MNN::BackendConfig::Memory_High;
+    Module::Config npuModuleCfg;
+    npuModuleCfg.shapeMutable = false;
+    npuModuleCfg.rearrange = false;
+
+    VARP currentHidden = hidden0;
+    int totalOmPass = 0;
+    int totalMnnPass = 0;
+    int totalChunksWithOm = 0;
+    int totalComparisons = 0;
+    const int totalChunks = (int)chunkPaths.size();
+
+    for (int i = 0; i < 1; ++i) {
+        const auto& chunkPath = chunkPaths[i];
+        const std::string chunkName = basenameOf(chunkPath);
+
+        log << "[" << (i + 1) << "/" << totalChunks << "] " << chunkName << "\n";
+        log << "input hidden shape=" << varShapeStringLocal(currentHidden)
+            << " rotary shape=" << varShapeStringLocal(rotary)
+            << " mask shape=" << varShapeStringLocal(attentionMask) << "\n";
+
+        // --- Extract float data for OM input ---
+        std::vector<float> hiddenVec, rotaryVec, maskVec;
+        std::string readErr;
+        if (!readVarToFloatVector(currentHidden, hiddenVec, readErr)) {
+            log << "ERROR: read currentHidden failed: " << readErr << "\n\n";
+            break;
+        }
+        if (!readVarToFloatVector(rotary, rotaryVec, readErr)) {
+            log << "ERROR: read rotary failed: " << readErr << "\n\n";
+            break;
+        }
+        if (!readVarToFloatVector(attentionMask, maskVec, readErr)) {
+            log << "ERROR: read attentionMask failed: " << readErr << "\n\n";
+            break;
+        }
+
+        // --- MNN CPU baseline (golden reference) ---
+        const std::vector<VARP> chunkInputs = {currentHidden, rotary, attentionMask};
+        ChunkBenchResult cpuRes;
+        bool cpuOk = runModuleBench(chunkPath, MNN_FORWARD_CPU, cpuCfg, cpuModuleCfg,
+                                     chunkInputs, warmup, repeat, cpuRes);
+        if (!cpuOk) {
+            log << "ERROR: MNN CPU run failed: " << cpuRes.info << "\n\n";
+            break;
+        }
+        log << "MNN-CPU  steady(x" << repeat << ")=" << cpuRes.avgMs << "ms " << cpuRes.info << "\n";
+
+        // --- MNN NPU ---
+        ChunkBenchResult mnnNpuRes;
+        bool mnnNpuOk = runModuleBench(chunkPath, npuType, npuCfg, npuModuleCfg,
+                                        chunkInputs, warmup, repeat, mnnNpuRes);
+        if (mnnNpuOk) {
+            log << "MNN-NPU  steady(x" << repeat << ")=" << mnnNpuRes.avgMs << "ms "
+                << mnnNpuRes.info << "\n";
+        } else {
+            log << "MNN-NPU  run failed: " << mnnNpuRes.info << "\n";
+        }
+
+        // --- OM offline model ---
+        std::string omPath = findOmChunkFile(modelDir, i);
+        std::vector<std::vector<float>> omOutputs;
+        double omLatencyMs = -1.0;
+        bool omOk = false;
+        std::string omErr;
+
+        if (omPath.empty()) {
+            log << "OM       SKIP: no .om file found for chunk " << i
+                << " (expected visual_blocks_npu_" << i << "*.om)\n";
+        } else {
+            log << "OM       file=" << basenameOf(omPath) << "\n";
+            omOk = runOmChunkOnce(omPath, hiddenVec, rotaryVec, maskVec,
+                                  omLatencyMs, omOutputs, omErr);
+            if (omOk) {
+                log << "OM       latency=" << omLatencyMs << "ms"
+                    << "  outputs=" << omOutputs.size() << "\n";
+                totalChunksWithOm++;
+            } else {
+                log << "OM       run failed: " << omErr << "\n";
+            }
+        }
+
+        // --- Cross-validation ---
+        bool chunkOmPass = true;
+        bool chunkMnnPass = true;
+
+        // OM vs MNN-CPU
+        if (omOk && cpuOk) {
+            log << "  --- OM vs MNN-CPU ---\n";
+            size_t nCmp = std::min(omOutputs.size(), cpuRes.outputs.size());
+            for (size_t oi = 0; oi < nCmp; ++oi) {
+                std::vector<float> cpuVec;
+                std::string cpuReadErr;
+                if (!readVarToFloatVector(cpuRes.outputs[oi], cpuVec, cpuReadErr)) {
+                    log << "  [output" << oi << "] MNN-CPU read failed: " << cpuReadErr << "\n";
+                    chunkOmPass = false;
+                    continue;
+                }
+                const std::string label = (oi == 0) ? "hidden_states"
+                    : ("deepstack_hidden_" + std::to_string(oi - 1));
+                if (nCmp == 1){
+                    log << compareOutputVectors(cpuVec, omOutputs[oi], "om_vs_cpu/" + label, chunkOmPass);
+                } else {
+                    log << compareOutputVectors(cpuVec, omOutputs[nCmp - 1 - oi], "om_vs_cpu/" + label, chunkOmPass);
+                }
+            }
+            if (omOutputs.size() != cpuRes.outputs.size()) {
+                chunkOmPass = false;
+                log << "  output_count mismatch OM=" << omOutputs.size()
+                    << " MNN-CPU=" << cpuRes.outputs.size() << "\n";
+            }
+            if (chunkOmPass) totalOmPass++;
+            totalComparisons++;
+        }
+
+        // MNN-CPU vs MNN-NPU (existing comparison)
+        if (mnnNpuOk && cpuOk) {
+            log << "  --- MNN-CPU vs MNN-NPU ---\n";
+            size_t nCmp = std::min(mnnNpuRes.outputs.size(), cpuRes.outputs.size());
+            for (size_t oi = 0; oi < nCmp; ++oi) {
+                std::vector<float> cpuVec, npuVec;
+                std::string cpuReadErr, npuReadErr;
+                if (!readVarToFloatVector(cpuRes.outputs[oi], cpuVec, cpuReadErr)) {
+                    log << "  [output" << oi << "] MNN-CPU read failed: " << cpuReadErr << "\n";
+                    chunkMnnPass = false;
+                    continue;
+                }
+                if (!readVarToFloatVector(mnnNpuRes.outputs[oi], npuVec, npuReadErr)) {
+                    log << "  [output" << oi << "] MNN-NPU read failed: " << npuReadErr << "\n";
+                    chunkMnnPass = false;
+                    continue;
+                }
+                const std::string label = (oi == 0) ? "hidden_states"
+                    : ("deepstack_hidden_" + std::to_string(oi - 1));
+                log << compareOutputVectors(cpuVec, npuVec, "mnn_cpu_vs_npu/" + label, chunkMnnPass);
+            }
+            if (mnnNpuRes.outputs.size() != cpuRes.outputs.size()) {
+                chunkMnnPass = false;
+                log << "  output_count mismatch MNN-NPU=" << mnnNpuRes.outputs.size()
+                    << " MNN-CPU=" << cpuRes.outputs.size() << "\n";
+            }
+            if (chunkMnnPass) totalMnnPass++;
+        }
+
+        // OM vs MNN-NPU (direct comparison between two NPU paths)
+        if (omOk && mnnNpuOk) {
+            log << "  --- OM vs MNN-NPU ---\n";
+            bool omVsNpuPass = true;
+            size_t nCmp = std::min(omOutputs.size(), mnnNpuRes.outputs.size());
+            for (size_t oi = 0; oi < nCmp; ++oi) {
+                std::vector<float> npuVec;
+                std::string npuReadErr;
+                if (!readVarToFloatVector(mnnNpuRes.outputs[oi], npuVec, npuReadErr)) {
+                    log << "  [output" << oi << "] MNN-NPU read failed: " << npuReadErr << "\n";
+                    omVsNpuPass = false;
+                    continue;
+                }
+                const std::string label = (oi == 0) ? "hidden_states"
+                    : ("deepstack_hidden_" + std::to_string(oi - 1));
+                if (nCmp == 1){
+                    log << compareOutputVectors(omOutputs[oi], npuVec,"om_vs_mnn_npu/" + label, omVsNpuPass);
+                } else {
+                    log << compareOutputVectors(omOutputs[nCmp - 1 - oi], npuVec,"om_vs_mnn_npu/" + label, omVsNpuPass);
+                }
+                    // log << compareOutputVectors(omOutputs[oi], npuVec, "om_vs_mnn_npu/" + label, omVsNpuPass);
+            }
+            if (!omVsNpuPass) {
+                log << "  OM vs MNN-NPU: WARN\n";
+            }
+        }
+
+        // Save debug outputs
+        {
+            std::string outDir = modelDir + "/debug_outputs";
+            ensureDirectoryRecursive(outDir);
+            if (omOk && cpuOk) {
+                // Save OM outputs alongside CPU for offline analysis
+                for (size_t oi = 0; oi < omOutputs.size() && oi < cpuRes.outputs.size(); ++oi) {
+                    std::string omPath2 = outDir + "/chunk" + std::to_string(i + 1)
+                                        + "_out" + std::to_string(oi) + "_om.bin";
+                    std::string saveErr;
+                    saveVectorToBin(omPath2, omOutputs[oi], saveErr);
+                }
+            }
+            if (cpuOk && mnnNpuOk) {
+                saveChunkOutputs(outDir, i, chunkName, cpuRes.outputs, mnnNpuRes.outputs);
+            }
+        }
+
+        // Carry CPU hidden forward for next chunk
+        currentHidden = cloneToHostInput(cpuRes.outputs[0], "visual_hidden_next");
+        if (currentHidden.get() == nullptr) {
+            log << "ERROR: failed to carry CPU hidden_states into next chunk\n\n";
+            break;
+        }
+
+        if (omOk && chunkOmPass && chunkMnnPass) {
+            log << "Chunk result: PASS\n\n";
+        } else if (omOk) {
+            log << "Chunk result: WARN (OM comparison mismatch)\n\n";
+        } else {
+            log << "Chunk result: WARN (OM not available)\n\n";
+        }
+    }
+
+    log << "=== OM vs MNN Summary ===\n";
+    log << "  total_chunks=" << totalChunks << "\n";
+    log << "  chunks_with_om=" << totalChunksWithOm << "\n";
+    log << "  om_vs_cpu_pass=" << totalOmPass << "/" << totalComparisons << "\n";
+    log << "  mnn_cpu_vs_npu_pass=" << totalMnnPass << "/" << (int)chunkPaths.size() << "\n";
+    log << "=========================\n";
+    return log.str();
+}
+
 } // namespace
 
 static void OpTestExecute(napi_env env, void* data) {
@@ -3457,6 +4050,19 @@ static void OpTestExecute(napi_env env, void* data) {
             }
         }
         result << runQwen3VlChunkModelTest(modelDir, seqLen, 1, 2);
+    } else if (cfg.rfind("om_vs_mnn_chunks|", 0) == 0) {
+        std::string payload = cfg.substr(std::string("om_vs_mnn_chunks|").size());
+        std::string modelDir = payload;
+        int seqLen = 608;
+        auto splitPos = payload.find('|');
+        if (splitPos != std::string::npos) {
+            modelDir = payload.substr(0, splitPos);
+            auto seqStr = payload.substr(splitPos + 1);
+            if (!seqStr.empty()) {
+                seqLen = std::max(1, std::atoi(seqStr.c_str()));
+            }
+        }
+        result << runOmVsMnnChunkTest(modelDir, seqLen, 1, 2);
     } else {
         // Custom: "N,ic,oc,ih,iw[,kh,kw,sh,sw,group]"
         int N=1, ic=0, oc=0, ih=0, iw=0, kh=1, kw=1, sh=1, sw=1, g=1;
@@ -3518,6 +4124,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"agentStep",    nullptr, AgentStepAsync,     nullptr, nullptr, nullptr, napi_default, nullptr},
         {"agentReset",   nullptr, AgentResetAsync,    nullptr, nullptr, nullptr, napi_default, nullptr},
         {"opTest",       nullptr, OpTestAsync,        nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"omcTest",      nullptr, OmcTestAsync,        nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setConvMode",  nullptr, SetConvMode,        nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setConvQuant", nullptr, SetConvQuant,       nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setInt8XScale",nullptr, SetInt8XScale,      nullptr, nullptr, nullptr, napi_default, nullptr},

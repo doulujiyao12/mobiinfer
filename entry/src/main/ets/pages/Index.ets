@@ -88,7 +88,7 @@ struct Index {
 
   private switchModelVariant(variant: string): void {
     let nextVariant = '';
-    if (variant === 'modelv2' || variant === 'modelv3' || variant === 'modelv4') {
+    if (variant === 'modelv2' || variant === 'modelv3' || variant === 'modelv4' || variant === 'model_omc') {
       nextVariant = variant;
     }
     if (this.selectedModelVariant === nextVariant) {
@@ -270,7 +270,7 @@ struct Index {
   }
 
   deleteDebugOutputs() {
-    let variants = ['model', 'modelv2', 'modelv3', 'modelv4'];
+    let variants = ['model', 'modelv2', 'modelv3', 'modelv4', 'model_omc'];
     let totalDeleted = 0;
     let results: string[] = [];
     for (let variant of variants) {
@@ -893,6 +893,28 @@ struct Index {
                 router.pushUrl({ url: 'pages/OpTest' })
               })
 
+            Button('OMC NPU Test (model_omc)')
+              .width('95%')
+              .height(44)
+              .backgroundColor('#4CAF50')
+              .borderRadius(10)
+              .fontSize(16)
+              .margin({ top: 10 })
+              .onClick(() => {
+                if (this.selectedModelVariant !== 'model_omc') {
+                  this.output = '请先切换到 model_omc 模型变体 (上方 Model Variant)';
+                  return;
+                }
+                if (!fs.accessSync(this.modelDir)) {
+                  this.output = `model_omc 目录不存在: ${this.modelDir}`;
+                  return;
+                }
+                this.output = '正在运行 OMC NPU 测试...';
+                mnnllm.omcTest(this.modelDir)
+                  .then((result: string) => { this.output = result; })
+                  .catch((err: Error) => { this.output = 'OMC Test 异常: ' + JSON.stringify(err); });
+              })
+
             Button('Runtime Logs')
               .width('95%')
               .height(44)
@@ -965,7 +987,17 @@ struct Index {
                 Text('使用 modelv4 文件夹隔离模型').fontSize(15).fontColor('#333')
               }.width('100%').margin({ bottom: 8 })
 
-              Text('modelv2 / modelv3 / modelv4 只能选一个；都不选时使用默认 model 目录')
+              Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
+                Checkbox({ name: 'modelOmc' })
+                  .select(this.selectedModelVariant === 'model_omc')
+                  .selectedColor('#4CAF50')
+                  .onChange((value: boolean) => {
+                    this.switchModelVariant(value ? 'model_omc' : '');
+                  })
+                Text('model_omc - OMC NPU 模型测试').fontSize(15).fontColor('#333')
+              }.width('100%').margin({ bottom: 8 })
+
+              Text('modelv2 / modelv3 / modelv4 / model_omc 只能选一个；都不选时使用默认 model 目录')
                 .fontSize(13)
                 .fontColor('#666')
                 .width('100%')

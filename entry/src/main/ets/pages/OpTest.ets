@@ -387,6 +387,22 @@ struct OpTest {
           )
         })
 
+      Button(this.running ? 'Running...' : 'Run OM vs MNN Cross-Validation (offline .om vs MNN NPU)')
+        .width('90%')
+        .height(52)
+        .backgroundColor(this.running ? '#BBBBBB' : '#FF7043')
+        .borderRadius(10)
+        .fontSize(14)
+        .enabled(!this.running)
+        .margin({ bottom: 10 })
+        .onClick(() => {
+          let seq = this.visualSeqLen.trim().length > 0 ? this.visualSeqLen.trim() : '608'
+          this.runWithMode(
+            'om_vs_mnn_chunks|' + this.modelDir + '|' + seq,
+            'Running OM vs MNN cross-validation from: ' + this.modelDir + '\nseq_len=' + seq + '\n'
+          )
+        })
+
       // Custom test section
       Row() {
         TextInput({ placeholder: 'N,ic,oc,ih,iw,kh,kw,sh,sw,group', text: this.customConfig })
