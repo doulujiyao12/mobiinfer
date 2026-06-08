@@ -14,6 +14,7 @@
 class HIAIModelManager {
 public:
     HIAIModelManager() = default;
+    ~HIAIModelManager() { if (executor_ != nullptr) UnloadModel(); }
     static HIAIModelManager &GetInstance();
 
     HIAIModelManager(const HIAIModelManager &) = delete;
