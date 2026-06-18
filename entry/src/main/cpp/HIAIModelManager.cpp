@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include "neural_network_runtime/neural_network_core.h"
 #include "CANNKit/hiai_options.h"
+#include "CANNKit/hiai_helper.h"
 
 #undef LOG_DOMAIN
 #define LOG_DOMAIN 0x0000
@@ -94,6 +95,14 @@ OH_NN_ReturnCode HIAIModelManager::LoadModelFromBuffer(uint8_t *modelData, size_
         std::vector<HiAI_ExecuteDevice> devices {HiAI_ExecuteDevice::HIAI_EXECUTE_DEVICE_NPU};
         ret = HMS_HiAIOptions_SetModelDeviceOrder(compilation, devices.data(), devices.size());
         OH_LOG_INFO(LOG_APP, "SetModelDeviceOrder(NPU) ret=%{public}d", ret);
+    }
+
+    // Set OM profiling options (standard practice from CANNKit demo)
+    {
+        const char *out_path = "/data/storage/el2/base/haps/entry/files";
+        HiAI_OmType omType = HIAI_OM_TYPE_PROFILING;
+        ret = HMS_HiAIOptions_SetOmOptions(compilation, omType, out_path);
+        OH_LOG_INFO(LOG_APP, "SetOmOptions ret=%{public}d", ret);
     }
 
     ret = OH_NNCompilation_Build(compilation);

@@ -18,6 +18,7 @@
 #include <cctype>
 #include <dirent.h>
 #include <fstream>
+#include <memory>
 #include <limits>
 #include <sys/stat.h>
 #include <vector>
@@ -42,6 +43,7 @@
 
 // NNRT header for OMC test (HarmonyOS SDK)
 #include "HIAIModelManager.h"
+#include "CANNKit/hiai_helper.h"
 #include <fstream>
 
 #ifdef LOG_TAG
@@ -1332,34 +1334,49 @@ struct OmcTestAsyncData {
 static void OmcTestExecute(napi_env env, void* data) {
     auto* d = static_cast<OmcTestAsyncData*>(data);
 
-    // 1. Find .omc file in modelDir and read into memory buffer
+    // 1. Find model file in modelDir by suffix
+    static const std::string kModelSuffix = ".omc";  // change to ".om" for OM models
     std::string omcPath;
     DIR* dir = opendir(d->modelDir.c_str());
     if (!dir) { d->result = "{\"ok\":false,\"error\":\"cannot open modelDir\"}"; return; }
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name(entry->d_name);
-        if (name.find(".om") != std::string::npos) {
+        if (name.size() >= kModelSuffix.size() &&
+            name.compare(name.size() - kModelSuffix.size(), kModelSuffix.size(), kModelSuffix) == 0) {
             omcPath = d->modelDir + "/" + name;
             break;
         }
     }
     closedir(dir);
-    if (omcPath.empty()) { d->result = "{\"ok\":false,\"error\":\"no .omc file found\"}"; return; }
+    if (omcPath.empty()) { d->result = "{\"ok\":false,\"error\":\"no *" + kModelSuffix + " file found\"}"; return; }
     LOGI("OMC file: %{public}s", omcPath.c_str());
 
-    // Read OMC file into buffer
-    std::ifstream file(omcPath, std::ios::binary | std::ios::ate);
-    if (!file) { d->result = "{\"ok\":false,\"error\":\"cannot open omc file\"}"; return; }
-    size_t modelSize = file.tellg();
-    file.seekg(0);
-    std::vector<uint8_t> modelBuf(modelSize);
-    file.read(reinterpret_cast<char*>(modelBuf.data()), modelSize);
-    file.close();
-    LOGI("OMC model size: %{public}zu bytes", modelSize);
+    // Read OMC file into buffer (POSIX)
+    int fd = open(omcPath.c_str(), O_RDONLY);
+    if (fd < 0) {
+        LOGE("OMC open failed: %{public}s (errno=%{public}d)", omcPath.c_str(), errno);
+        d->result = "{\"ok\":false,\"error\":\"cannot open omc file\"}";
+        return;
+    }
+    off_t modelSize = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    std::unique_ptr<uint8_t[]> modelData = std::make_unique<uint8_t[]>(modelSize);
+    ssize_t n = read(fd, modelData.get(), modelSize);
+    close(fd);
+    if (n != (ssize_t)modelSize) {
+        LOGE("OMC read incomplete: %{public}zd / %{public}lld", n, (long long)modelSize);
+        d->result = "{\"ok\":false,\"error\":\"read omc file incomplete\"}";
+        return;
+    }
+    LOGI("OMC model size: %{public}lld bytes", (long long)modelSize);
 
-    // 2. Load model via NNRT
-    OH_NN_ReturnCode ret = HIAIModelManager::GetInstance().LoadModelFromBuffer(modelBuf.data(), modelSize);
+    // 2. Compatibility check
+    HiAI_Compatibility comp = HMS_HiAICompatibility_CheckFromBuffer(modelData.get(), modelSize);
+    LOGI("OMC model compatibility: %{public}d", (int)comp);
+
+    // 3. Load model via NNRT
+    OH_NN_ReturnCode ret = HIAIModelManager::GetInstance().LoadModelFromBuffer(modelData.get(), modelSize);
     if (ret != OH_NN_SUCCESS) {
         LOGE("OMC LoadModelFromBuffer failed: %{public}d", (int)ret);
         d->result = "{\"ok\":false,\"error\":\"LoadModelFromBuffer failed, ret=" + std::to_string(ret) + "\"}";
@@ -1367,7 +1384,7 @@ static void OmcTestExecute(napi_env env, void* data) {
     }
     LOGI("OMC LoadModel OK");
 
-    // 3. Init I/O tensors (shapes auto-detected from model)
+    // 4. Init I/O tensors (shapes auto-detected from model)
     ret = HIAIModelManager::GetInstance().InitIOTensors();
     if (ret != OH_NN_SUCCESS) {
         LOGE("OMC InitIOTensors failed: %{public}d", (int)ret);
@@ -1375,7 +1392,7 @@ static void OmcTestExecute(napi_env env, void* data) {
         return;
     }
 
-    // 4. Fill input data (dummy 0.1) with exact sizes
+    // 5. Fill input data (dummy 0.1) with exact sizes
     int S = 608;
     struct {
         std::vector<float> buf;
@@ -1410,7 +1427,7 @@ static void OmcTestExecute(napi_env env, void* data) {
         }
     }
 
-    // 5. Run
+    // 6. Run
     auto t0 = std::chrono::high_resolution_clock::now();
     ret = HIAIModelManager::GetInstance().RunModel();
     auto t1 = std::chrono::high_resolution_clock::now();
