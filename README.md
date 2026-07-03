@@ -11,7 +11,7 @@
 
 点击上图可打开/播放原始视频：[doc/demo.mp4](doc/demo.mp4)
 
-以上demo仓库可以详见[mobiinfra-oh](https://github.com/doulujiyao12/mobiinfra-oh)
+以上demo仓库可以详见[mobiinfer-oh](https://github.com/doulujiyao12/mobiinfer-oh)
 
 ## 0. 量化与校准工具（mobi-autoround）
 
@@ -258,9 +258,9 @@ cd build
 
 ### 2.5 使用鸿蒙 App 进行测试
 
-由于鸿蒙系统不支持命令行开发，我们开发了鸿蒙 App 进行测试。编译得到的 `libMNN.so` 需要替换到 [mobiinfra-oh](https://github.com/doulujiyao12/mobiinfra-oh) 仓库中对应位置：
+由于鸿蒙系统不支持命令行开发，我们开发了鸿蒙 App 进行测试。编译得到的 `libMNN.so` 需要替换到 [mobiinfer-oh](https://github.com/doulujiyao12/mobiinfer-oh) 仓库中对应位置：
 
-- https://github.com/doulujiyao12/mobiinfra-oh/blob/dev/entry/libs/arm64-v8a/libMNN.so
+- https://github.com/doulujiyao12/mobiinfer-oh/blob/dev/entry/libs/arm64-v8a/libMNN.so
 
 ### 2.6 说明与注意事项
 

@@ -468,3 +468,6 @@ test_analyze_nonlinear.py
 .oneday/
 
 vb*.json
+.playwright-mcp/
+taobao1.jpg
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/
