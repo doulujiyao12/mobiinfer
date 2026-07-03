@@ -463,3 +463,7 @@ claude_chat.txt
 # ignore temp scripts
 /extract_llm_*.py
 test_analyze_nonlinear.py
+
+.playwright-mcp/
+taobao1.jpg
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/
