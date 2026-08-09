@@ -14,8 +14,9 @@
 #endif
 
 // Enable chunk-aware OM cache:
-//   - Save/read OM as "<npu_model_dir>/chunk_i/vision.om" when runtime passes
-//     per-chunk EXTERNAL_NPU_FILE_DIR.
+//   - Save/read OM as
+//     "<npu_model_dir>/chunk_i/om_cache_v2/<shape-key>/vision.om" when runtime
+//     passes per-chunk EXTERNAL_NPU_FILE_DIR.
 //   - Set to 0 to keep legacy behavior.
 #ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
 #define MNN_HIAI_CACHE_OM_BY_CHUNK 0
@@ -374,6 +375,10 @@ namespace MNN {
 
     private:
         int getInOutTensorInfo(string modelName);
+        void resetLoadedTensorInfo();
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        std::string buildOmCacheShapeKey() const;
+#endif
 
     public:
 

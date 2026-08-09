@@ -84,7 +84,7 @@ option(MNN_LOW_MEMORY "Build MNN support low memory for weight quant model." OFF
 option(MNN_BUILD_AUDIO "Build audio api in MNN." OFF)
 option(MNN_SME2 "Use Arm sme2 instructions" ON)
 option(MNN_METAL_TENSOR "Use Metal4 tensor instructions" ON)
-option(MNN_HIAI_CACHE_OM_BY_CHUNK "Enable chunk-aware OM cache path for HiAI backend" OFF)
+option(MNN_HIAI_CACHE_OM_BY_CHUNK "Enable chunk- and shape-aware OM cache for HiAI backend" OFF)
 option(HIAI_VERBOSE "Enable HiAI verbose log" OFF )
 option(MNN_GENERATE_PODSPEC "Generate iOS podspec file from CMake configuration" OFF)
 option(MOBIINFER_MNN "Enable MobiInfer MNN mode" OFF)
