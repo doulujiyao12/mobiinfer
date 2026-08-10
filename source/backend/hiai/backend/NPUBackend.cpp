@@ -816,8 +816,10 @@ namespace MNN {
 #endif
         mConstRefCounts.clear();
         mKeepConsts.clear();
+        mModelName.clear();
         if (mMgrClient != nullptr) {
             mMgrClient->UnLoadModel();
+            mMgrClient.reset();
         }
     }
 
@@ -1101,7 +1103,9 @@ namespace MNN {
             }
         }
 #endif
-        mModelName.push_back(modelName);
+        // Do not publish a model name until its model and I/O metadata are both loaded.
+        // This backend owns only one HiAI model, so a successful load becomes index 0.
+        mModelName.clear();
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 1] ge::Graph(%s) ctor", graphName.c_str());
         ge::Graph graph(graphName);
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 2] graph.SetInputs(%zu).SetOutputs(%zu) ...", inputs.size(), outputOps.size());
@@ -1131,6 +1135,7 @@ namespace MNN {
                 if (mMgrClient != nullptr) {
                     int result = getInOutTensorInfo(modelName);
                     if (result == 0) {
+                        mModelName.push_back(modelName);
                         MNN_PRINT("[NPU_CACHE] validated: %s\n", omCachePath.c_str());
                         return NO_ERROR;
                     }
@@ -1204,6 +1209,7 @@ namespace MNN {
         MNN_HIAI_LOG("bulidIRModelAndLoad: getInOutTensorInfo %s",
                      result == 0 ? "OK" : "FAILED");
         if (result == 0) {
+            mModelName.push_back(modelName);
 #if MNN_HIAI_CACHE_OM_BY_CHUNK
             if (!omCachePath.empty()) {
                 if (WriteToOMFile(om_model_buff, omCachePath)) {
@@ -1229,25 +1235,34 @@ namespace MNN {
     }
 
     int NPUBackend::process(int modelIndex) const {
-#ifdef HIAI_DEBUG
-        ATrace_beginSection("HIAI process");
-#endif
         if (mMgrClient == nullptr) {
             MNN_ERROR("[NPU] Process skipped because model manager is null\n");
             return -1;
         }
+        if (modelIndex < 0 || static_cast<size_t>(modelIndex) >= mModelName.size()) {
+            MNN_ERROR("[NPU] Process skipped because model index %d has no loaded name (count=%zu)\n",
+                      modelIndex, mModelName.size());
+            return -1;
+        }
+        const string& modelName = mModelName[modelIndex];
+        if (modelName.empty()) {
+            MNN_ERROR("[NPU] Process skipped because model index %d has an empty name\n", modelIndex);
+            return -1;
+        }
+#ifdef HIAI_DEBUG
+        ATrace_beginSection("HIAI process");
+#endif
         hiai::AiContext context;
         string key = "model_name";
-        string value = to_string(modelIndex);
-        context.AddPara(key, value);
+        context.AddPara(key, modelName);
 
         int istamp;
 
 #if HIAI_VERBOSE
         auto t0 = std::chrono::steady_clock::now();
 #endif
-        MNN_HIAI_LOG("process: modelIdx=%d inTensors=%zu outTensors=%zu -> Process(..)",
-                     modelIndex, mInputTensors.size(), mOutputTensors.size());
+        MNN_HIAI_LOG("process: modelIdx=%d modelName=%s inTensors=%zu outTensors=%zu -> Process(..)",
+                     modelIndex, modelName.c_str(), mInputTensors.size(), mOutputTensors.size());
         int ret = mMgrClient->Process(context, *(const_cast<vector<shared_ptr<hiai::AiTensor>>*>(&mInputTensors)),
                                       *(const_cast<vector<shared_ptr<hiai::AiTensor>>*>(&mOutputTensors)), 1000,
                                       istamp);
