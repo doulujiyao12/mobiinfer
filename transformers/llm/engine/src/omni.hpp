@@ -177,10 +177,11 @@ public:
     std::vector<int> gemma4VisionProcess(VARP image);
     // Inject an external NPU chunk executor (HarmonyOS OM path).
     // omPaths: per-chunk .om file paths, aligned with visual_blocks_chunks.
-    void setNpuChunkExecutor(std::shared_ptr<INpuChunkExecutor> executor,
-                             const std::vector<std::string>& omPaths) {
+    bool setNpuChunkExecutor(std::shared_ptr<INpuChunkExecutor> executor,
+                             const std::vector<std::string>& omPaths) override {
         mNpuChunkExecutor = std::move(executor);
         mNpuChunkOmPaths = omPaths;
+        return mNpuChunkExecutor != nullptr;
     }
 private:
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
@@ -236,6 +237,9 @@ private:
     // m_rope position ids
     void addPositionIds(int t, int h = -1, int w = -1);
     MropeInfo mPositionIds;
+    // Absolute MRoPE position at the end of the current prefill. Unlike
+    // all_seq_len this follows the compressed multimodal position timeline.
+    int mDecodePositionBase = 0;
 };
 
 }

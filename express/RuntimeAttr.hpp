@@ -23,6 +23,9 @@ struct RuntimeAttr {
     RuntimeInfo mRuntime;
     std::shared_ptr<Runtime> mInfo;
     std::shared_ptr<Cache> mCache;
+    // KVCACHE_INFO belongs to this RuntimeManager. Runtime instances may be
+    // pooled, so push it immediately before constructing/cloning backends.
+    void* mMeta = nullptr;
     // Use for static module to compute flops
     float mFlops;
     mutable int mResizeStatus = 0;

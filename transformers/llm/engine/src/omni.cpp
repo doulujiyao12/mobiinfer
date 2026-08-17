@@ -601,9 +601,9 @@ bool Omni::load() {
             npuCfg.backendConfig = &npuBackendConfig;
             mVisionBlocksRuntimeManager.reset(
                 Executor::RuntimeManager::createRuntimeManager(npuCfg));
-            // A/B switch: vision encoder blocks should not rely on decoder KV
-            // hints. Keep default behavior (true) unless explicitly disabled.
-            bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", true);
+            // Vision self-attention must not consume decoder KV metadata. Keep
+            // an explicit opt-in only for compatibility with experimental models.
+            bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", false);
             setRuntimeHint(mVisionBlocksRuntimeManager, visualBlocksKvHints);
 
             Module::Config npuModuleCfg;
@@ -670,15 +670,20 @@ bool Omni::load() {
                 // mChunkUseOm[i] is true when a .om file exists AND the executor is set.
                 mChunkUseOm.resize(chunkPaths.size(), false);
                 if (mNpuChunkExecutor) {
-                    for (size_t i = 0; i < chunkPaths.size() && i < mNpuChunkOmPaths.size(); i++) {
-                        if (chunkRunOnNpu[i] && !mNpuChunkOmPaths[i].empty()) {
-                            if (!mNpuChunkExecutor->loadChunk((int)i, mNpuChunkOmPaths[i])) {
-                                MNN_ERROR("OM chunk[%zu] load failed: %s\n",
-                                          i, mNpuChunkOmPaths[i].c_str());
-                                return false;
-                            }
-                            mChunkUseOm[i] = true;
+                    for (size_t i = 0; i < chunkPaths.size(); i++) {
+                        if (!chunkRunOnNpu[i]) {
+                            continue;
                         }
+                        if (i >= mNpuChunkOmPaths.size() || mNpuChunkOmPaths[i].empty()) {
+                            MNN_ERROR("Offline OM mode requires a precompiled model for NPU chunk[%zu]\n", i);
+                            return false;
+                        }
+                        if (!mNpuChunkExecutor->loadChunk((int)i, mNpuChunkOmPaths[i])) {
+                            MNN_ERROR("OM chunk[%zu] load failed: %s\n",
+                                      i, mNpuChunkOmPaths[i].c_str());
+                            return false;
+                        }
+                        mChunkUseOm[i] = true;
                     }
                 }
 
@@ -1237,6 +1242,12 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                         MNN_ERROR("[om-chunk] chunk[%zu] input marshal failed\n", i);
                         return std::vector<int>(0);
                     }
+                    const size_t fixedSequenceLength = mNpuChunkExecutor->chunkSequenceLength((int)i);
+                    if (fixedSequenceLength == 0 || maskVec.size() != fixedSequenceLength * fixedSequenceLength) {
+                        MNN_ERROR("[om-chunk] chunk[%zu] fixed shape mismatch: expected_seq=%zu mask_elements=%zu\n",
+                                  i, fixedSequenceLength, maskVec.size());
+                        return std::vector<int>(0);
+                    }
                     std::vector<std::vector<float>> omOutputs;
                     if (!mNpuChunkExecutor->runChunk((int)i, hiddenVec, rotaryVec, maskVec, omOutputs)) {
                         MNN_ERROR("[om-chunk] chunk[%zu] run failed\n", i);
@@ -1248,6 +1259,13 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                     }
                     auto inInfo = curHidden->getInfo();
                     std::vector<int> dims(inInfo->dim.begin(), inInfo->dim.end());
+                    // visual_pre emits the first hidden state as [S, D], while
+                    // every exported OM chunk returns hidden_states as [1, S, D].
+                    // Preserve that output contract so the next OM/CPU chunk and
+                    // visual_post see the same rank as the original MNN pipeline.
+                    if (dims.size() == 2) {
+                        dims.insert(dims.begin(), 1);
+                    }
                     auto nextHidden = floatVectorToVarp(omOutputs[0], dims,
                                                         "vision_chunk_om_hidden_bridge");
                     if (nextHidden.get() == nullptr) {
@@ -2054,6 +2072,11 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
         addPositionIds(txt_ids.size());
         ids.insert(ids.end(), txt_ids.begin(), txt_ids.end());
     }
+    // tokenizer_encode() runs before prefill advances all_seq_len, so this is
+    // the only unambiguous place to combine a retained prefix KV offset with
+    // the current response's compressed multimodal position timeline.
+    // Empty prompts keep the retained prefix endpoint unchanged.
+    mDecodePositionBase = mContext->all_seq_len + (ids.empty() ? -1 : mPositionIds.back());
     return ids;
 }
 
@@ -2283,7 +2306,7 @@ VARP Omni::gen_position_ids(int seq_len) {
     auto ptr = positionIds->writeMap<int>();
     if (mContext->gen_seq_len > 0) {
         for (int i=0; i<seq_len; ++i) {
-            auto pos = mContext->gen_seq_len + mPositionIds.back() + i;
+            auto pos = mDecodePositionBase + mContext->gen_seq_len + i;
             ptr[i + 0] = pos;
             ptr[i + seq_len] = pos;
             ptr[i + seq_len * 2] = pos;

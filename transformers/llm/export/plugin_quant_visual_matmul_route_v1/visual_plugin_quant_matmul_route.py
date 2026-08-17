@@ -56,13 +56,20 @@ def _ensure_yaspin_stub():
 
 _ensure_yaspin_stub()
 
-from dopt.dopt_lm.do_opt import (  # noqa: E402
-    generate_config_file,
-    generate_quant_params,
-    optimize_model,
-    set_calibrate_state,
-    set_quant_state,
-)
+try:
+    from dopt.dopt_lm.do_opt import (  # noqa: E402
+        generate_config_file,
+        generate_quant_params,
+        optimize_model,
+        set_calibrate_state,
+        set_quant_state,
+    )
+    DOPT_IMPORT_ERROR = None
+except ModuleNotFoundError as import_error:
+    # Pure FP16 export does not need DOPT. Keep the quantized commands available
+    # when the caller configures the DDK Python path, but do not make DOPT a
+    # dependency of the raw HuggingFace -> FP16 ONNX route.
+    DOPT_IMPORT_ERROR = import_error
 from packaging.version import Version  # noqa: E402
 from utils.model import LlmModel  # noqa: E402
 from utils.transformers import repeat_kv, rotate_half  # noqa: E402
@@ -82,6 +89,14 @@ DEFAULT_ROUTE_DIR = os.path.join(SCRIPT_DIR, "model_visual_plugin_matmul_chunk0"
 
 class DummyArgs:
     pass
+
+
+def require_dopt():
+    if DOPT_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "This command requires the DDK DOPT Python package; configure "
+            "PYTHONPATH for tools_dopt/dopt_pytorch_py3 first"
+        ) from DOPT_IMPORT_ERROR
 
 
 def make_dummy_args(model_path, dst_path):
@@ -909,6 +924,7 @@ def write_route_config(route_dir: str, onnx_path: str, sample, output_names, met
 
 
 def prepare_config(args):
+    require_dopt()
     ensure_route_layout(args.route_dir)
     chunk, meta = load_visual_chunk(args.model_path, args.route_dir, args.npu_chunks, args.chunk_index)
     cfg_path = config_path(args.route_dir, args.chunk_index)
@@ -941,6 +957,7 @@ def prepare_config(args):
 
 
 def calibrate_and_export_quant(args):
+    require_dopt()
     ensure_route_layout(args.route_dir)
     cfg_path = config_path(args.route_dir, args.chunk_index)
     if not os.path.exists(cfg_path):
@@ -990,13 +1007,8 @@ def calibrate_and_export_quant(args):
     print(json.dumps(report, indent=2, ensure_ascii=False, default=_to_serializable))
 
 
-def export_onnx(args):
+def export_chunk_onnx(args, sample, state, weight_source):
     ensure_route_layout(args.route_dir)
-    fake_quant_path = fake_quant_weight_path(args.route_dir)
-    if not os.path.exists(fake_quant_path):
-        raise FileNotFoundError(
-            f"Missing fake_quant_weight: {fake_quant_path}. Run calibrate first."
-        )
     chunk, meta = load_visual_chunk(
         args.model_path,
         args.route_dir,
@@ -1005,13 +1017,11 @@ def export_onnx(args):
         prepare_export=True,
         use_qwen3_style_rotary=args.use_qwen3_style_rotary,
     )
-    state = torch.load(fake_quant_path, map_location="cpu")
-    state = remap_fake_quant_state_for_export(state)
-    missing, unexpected = chunk.load_state_dict(state, strict=False)
-    samples, _manifest = load_calibration_samples(
-        args.input_dir, args.chunk_index, 1, sample_prefix=args.sample_prefix
-    )
-    sample = samples[0]
+    missing = []
+    unexpected = []
+    if state is not None:
+        state = remap_fake_quant_state_for_export(state)
+        missing, unexpected = chunk.load_state_dict(state, strict=False)
     onnx_path = os.path.join(args.route_dir, "onnx", f"visual_blocks_npu_{args.chunk_index}.onnx")
     out_names = ["hidden_states"]
     local_ds_count = meta["local_deepstack_count"]
@@ -1048,6 +1058,8 @@ def export_onnx(args):
         "missing_keys": sorted(list(missing)),
         "unexpected_keys": sorted(list(unexpected)),
         "output_names": out_names,
+        "weight_source": weight_source,
+        "calibration_used": state is not None,
         "act_bit": args.act_bit,
         "input_unsigned_quant": args.input_unsigned_quant,
         "weight_bit": args.weight_bit,
@@ -1058,6 +1070,40 @@ def export_onnx(args):
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False, default=_to_serializable)
     print(json.dumps(report, indent=2, ensure_ascii=False, default=_to_serializable))
+
+
+def export_onnx(args):
+    fake_quant_path = fake_quant_weight_path(args.route_dir)
+    if not os.path.exists(fake_quant_path):
+        raise FileNotFoundError(
+            f"Missing fake_quant_weight: {fake_quant_path}. Run calibrate first."
+        )
+    state = torch.load(fake_quant_path, map_location="cpu")
+    samples, _manifest = load_calibration_samples(
+        args.input_dir, args.chunk_index, 1, sample_prefix=args.sample_prefix
+    )
+    export_chunk_onnx(args, samples[0], state, "dopt_fake_quant_weight")
+
+
+def export_raw_fp16_onnx(args):
+    if not args.fp16:
+        raise ValueError("export-fp16 requires --fp16 so MatMul/Gemm weights are stored as FLOAT16")
+    if args.sequence_length <= 0 or args.hidden_size <= 0 or args.rotary_size <= 0:
+        raise ValueError("sequence_length, hidden_size, and rotary_size must be positive")
+    # These tensors provide static tracing shapes only. No calibration or
+    # value-dependent control flow is used in the visual block exporter.
+    sample = {
+        "hidden_states_in": torch.zeros(
+            (1, args.sequence_length, args.hidden_size), dtype=torch.float32
+        ),
+        "rotary_pos_emb": torch.zeros(
+            (2, args.sequence_length, 1, args.rotary_size), dtype=torch.float32
+        ),
+        "attention_mask": torch.zeros(
+            (1, args.sequence_length, args.sequence_length), dtype=torch.float32
+        ),
+    }
+    export_chunk_onnx(args, sample, None, "original_huggingface_float")
 
 
 def run_all(args):
@@ -1089,6 +1135,18 @@ def build_parser():
     )
     parser.add_argument("--num_samples", type=int, default=4, help="Calibration sample count")
     parser.add_argument("--fp16", action="store_true", help="Convert large MatMul/Gemm weights to fp16")
+    parser.add_argument(
+        "--sequence_length", type=int, default=608,
+        help="Static visual sequence length for raw FP16 export",
+    )
+    parser.add_argument(
+        "--hidden_size", type=int, default=1024,
+        help="Visual hidden size for raw FP16 export",
+    )
+    parser.add_argument(
+        "--rotary_size", type=int, default=64,
+        help="Per-head rotary size for raw FP16 export",
+    )
     parser.add_argument("--force_regen", action="store_true", help="Regenerate quant config")
     parser.add_argument("--quant_strategy", default="Quant_act_weight_eco", help="Plugin-quant strategy")
     parser.add_argument("--weight_bit", type=int, default=4, help="Weight bit width")
@@ -1139,7 +1197,9 @@ def build_parser():
             "using Qwen3-style [B,H,S,D] / [B,1,S,D] broadcasting"
         ),
     )
-    parser.add_argument("cmd", choices=["prepare", "calibrate", "export-onnx", "all"])
+    parser.add_argument(
+        "cmd", choices=["prepare", "calibrate", "export-onnx", "export-fp16", "all"]
+    )
     return parser
 
 
@@ -1151,6 +1211,8 @@ def main():
         calibrate_and_export_quant(args)
     elif args.cmd == "export-onnx":
         export_onnx(args)
+    elif args.cmd == "export-fp16":
+        export_raw_fp16_onnx(args)
     elif args.cmd == "all":
         run_all(args)
     else:
