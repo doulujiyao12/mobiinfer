@@ -262,12 +262,155 @@ cd build
 
 - https://github.com/doulujiyao12/mobiinfer-oh/blob/dev/entry/libs/arm64-v8a/libMNN.so
 
-### 2.6 说明与注意事项
+### 2.6 Kirin9020 完整离线编译（VIT NPU OMC W8A8 + LLM CPU INT8）
+
+以下是从 HuggingFace 模型 + GPTQ W8G128 量化模型出发，产出 Kirin9020 完整推理模型目录的一键脚本。
+
+> **前提**：机器上已配置 CANN Kit（DDK-tools-next-6.0.1.0）及 Conda `cann` 环境。
+> **校准数据**：W8A8 量化需要 2~4 张真实图片的激活值作为校准输入（.npz 格式）。如果没有现成的校准数据，可以先执行 `llm_demo` 并设置 `MNN_VISUAL_CHUNK_INPUT_DUMP` dump 出各 chunk 的 tensor，再用 `bin_to_chunk_npz.py` 转换为 .npz 格式。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# ============================================================
+# Kirin9020 完整离线编译脚本
+# 输入: HuggingFace 模型 + GPTQ W8G128 量化模型
+# 输出: 编译完成的 MNN 推理目录（VIT 4 chunk OMC + CPU INT8）
+# 用法: bash kirin9020_compile.sh /path/to/hf_model /path/to/gptq_model /path/to/output
+# ============================================================
+HF_MODEL=${1:?missing HF model path}
+GPTQ_MODEL=${2:?missing GPTQ model path}
+OUTPUT_DIR=${3:?missing output dir}
+cd "$(dirname "$0")/transformers/llm/export"
+
+# ---- Step 1: 导出 MNN 模型（LLM CPU INT8 + VIT 6 chunks）----
+# GPTQ W8G128 → MNN INT8, visual_chunk_backends 控制每个 chunk 的目标后端
+python llmexport.py --path "$HF_MODEL" \
+    --export mnn \
+    --gptq_path "$GPTQ_MODEL" \
+    --quant_bit 8 --quant_block 128 \
+    --visual_quant_bit 8 --visual_quant_block 128 \
+    --lm_quant_bit 16 \
+    --seperate_embed \
+    --visual_split \
+    --visual_npu_chunk 6 \
+    --visual_chunk_backends "npu,npu,npu,npu,cpu,cpu" \
+    --dst_path "$OUTPUT_DIR"
+
+# ---- Step 2: W8A8 calibration + ONNX export per NPU chunk (0-3) ----
+# 校准输入: .npz 格式的激活数据（hidden_states_in / rotary_pos_emb / attention_mask）
+# 每个 chunk 对应 ${CALIB_DIR}/chunk_${i:02d}_sample_*.npz
+CALIB_DIR=${CALIB_DIR:-/tmp/calib_inputs}
+NUM_SAMPLES=${NUM_SAMPLES:-2}
+
+for i in 0 1 2 3; do
+    ROUTE_DIR="${OUTPUT_DIR}/route_chunk${i}"
+    python visual_plugin_quant_matmul_route.py \
+        --route_dir "$ROUTE_DIR" \
+        --chunk_index $i \
+        --npu_chunks 6 \
+        --quant_strategy Quant_aigc_ptq \
+        --weight_bit 8 --weight_algo min_max \
+        --act_bit 16 --input_algo min_max \
+        --num_samples "$NUM_SAMPLES" \
+        --group_size 128 \
+        --use_qwen3_style_rotary \
+        --input_dir "$CALIB_DIR" \
+        --force_regen all
+done
+
+# ---- Step 3: OMC 编译 (Kirin9020, compress_conf on) ----
+for i in 0 1 2 3; do
+    ROUTE_DIR="${OUTPUT_DIR}/route_chunk${i}"
+    PLATFORM=kirin9020 \
+    TARGET_MODEL_TYPE=omc \
+    USE_COMPRESS_CONF=true \
+    bash run_visual_plugin_matmul_omc.sh "$ROUTE_DIR" fp16
+done
+
+# ---- Step 4: 装配最终模型目录 ----
+mkdir -p "${OUTPUT_DIR}/om"
+for i in 0 1 2 3; do
+    cp "${OUTPUT_DIR}/route_chunk${i}/omc_output/visual_plugin_matmul_quantized.omc" \
+       "${OUTPUT_DIR}/om/visual_blocks_npu_${i}.om"
+done
+
+cd "$OUTPUT_DIR"
+# 更新 config.json
+python3 -c "
+import json
+cfg = json.load(open('config.json'))
+cfg.setdefault('npu_model_dir', 'om')
+cfg['visual_blocks_offline_om'] = [
+    'om/visual_blocks_npu_0.om',
+    'om/visual_blocks_npu_1.om',
+    'om/visual_blocks_npu_2.om',
+    'om/visual_blocks_npu_3.om',
+    '', ''
+]
+json.dump(cfg, open('config.json', 'w'), indent=2, ensure_ascii=False)
+"
+# 生成 manifest
+cat > offline_om_manifest.json <<EOF
+{
+  "format": "offline_compiled_omc",
+  "platform": "kirin9020",
+  "compression": "dopt_w8a8_compress_conf",
+  "offline_vit": {
+    "precision": "W8A16",
+    "weight_source": "dopt_fake_quant",
+    "compress_conf_used": true
+  }
+}
+EOF
+
+echo "Done: $OUTPUT_DIR"
+```
+
+#### 校准数据格式
+
+Step 2 的 `--input_dir` 下每个 `.npz` 文件包含三个 float16 tensor，命名规则 `chunk_{CI:02d}_sample_{SI:03d}.npz`：
+
+| 键 | 形状 | 说明 |
+|---|---|---|
+| `hidden_states_in` | `(1, 608, 1024)` | chunk 输入 |
+| `rotary_pos_emb` | `(2, 608, 1, 64)` | 位置编码 |
+| `attention_mask` | `(1, 608, 608)` | 因果 mask（-65504 为屏蔽） |
+
+**生成校准数据**（方式一，推荐）：
+
+```bash
+# 先在 MNN 模型上运行图片推理，dump chunk 输入，再转成 .npz
+# 输入: 训练图片（通过 llm_demo input.txt 传入）
+# 输出: $CALIB_DIR/ 下的 chunk_XX_sample_YYY.npz（供 Step 2 使用）
+
+MNN_MODEL_DIR=/path/to/mnn_model          # llmexport 产出的模型目录（含 config.json）
+IMAGE_LIST=/path/to/input_image_list.txt   # llm_demo 输入文件，每行一张图片路径
+CALIB_DIR=/tmp/calib_inputs                # 输出目录（供 Step 2 的 $CALIB_DIR 使用）
+DUMP_DIR=/tmp/chunk_dump                   # dump 中间文件（用完可删）
+
+# 1) dump chunk 输入 tensor
+export MNN_VISUAL_CHUNK_INPUT_DUMP="$DUMP_DIR"
+./llm_demo "$MNN_MODEL_DIR/config.json" "$IMAGE_LIST"
+
+# 2) 转成 .npz 格式
+python bin_to_chunk_npz.py "$DUMP_DIR" "$CALIB_DIR"
+```
+
+方式二：自行编写 Python 脚本加载 HF 模型，用 `visual.patch_embed` 逐 chunk 前向获取 hidden_states_in，按上述格式保存为 `.npz`。
+
+#### 产物校验
+
+编译完成后检查 `om/visual_blocks_npu_0.om` 约 98MB，日志确认含 `partition type NPU:1, CPU:0`、`SaveCompiledModelToFile SUCCESS`、`OMG generate offline model success`。
+
+### 2.7 说明与注意事项
 
 - 请确保 `source/backend/hiai/3rdParty/arm64-v8a` 和 `.../include` 已存在且内容完整。缺少头文件或库会导致编译失败。
 - `HARMONY_HOME` 必须指向命令行工具提供的 OpenHarmony SDK 根目录，否则构建脚本找不到工具链。
 - 若构建失败，请查阅 `project/harmony/build_64.sh` 中的日志与输出路径，按错误提示补充依赖。
 - 本节假定你已经在机器上安装并配置好对应的交叉编译工具链以及必要的 Android/Harmony 环境变量。
+- Kirin9020 OMC 不需要 AscendC 环境，编译脚本会自动跳过。如需在 Kirin9030 上使用 OMC，须先执行 `source set_ascendc_env.sh`。
+- 4 个 NPU chunk（0-3）使用离线 OMC 图 + W8A8 压缩权重，约 98MB/chunk。2 个 CPU chunk（4-5）使用 MNN 格式 + 4bit 量化。
 
 ---
 
