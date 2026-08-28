@@ -899,7 +899,7 @@ def build_input_shape(sample):
     a = sample["attention_mask"].shape
     return (
         f"hidden_states_in:{h[0]},{h[1]},{h[-1]};"
-        f"rotary_pos_emb:{r[0]},{r[1]},{r[2]},{r[3]};"
+        f"rotary_pos_emb:{','.join(str(d) for d in r)};"
         f"attention_mask:{a[0]},{a[1]},{a[2]}"
     )
 
