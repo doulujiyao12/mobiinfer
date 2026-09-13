@@ -107,7 +107,8 @@ mobiinfra-oh 这个目录下面是端侧推理的deveco 的项目代码库，主
 
 - `--target=om` 生成的是可供设备侧在线编译的 HiAI IR 容器，不是已经针对设备编译完成的离线图。
 - 真正的离线 NPU 图必须使用 `--target=omc`。本项目仍使用 `.om` 文件扩展名，以兼容 App/MNN 的 chunk 文件解析逻辑，但必须以 OMG 日志确认其内容来自 OMC 编译。
-- **Kirin9030（V311）**：编译必须加载 DDK 自带的 AscendC 环境。只设置平台参数但未加载 AscendC 时，MatMul 可能全部被拒绝并回退到 CPU；即使生成了文件，也不能视为成功。该平台稳定方案为离线 OMC + visual chunk 的非压缩 FP16 权重。FP16 Route 必须直接从原始 HuggingFace 浮点权重导出，不能先加载 DOPT `fake_quant_weight.pth` 再转成 FP16；后者保存的是伪量化/反量化后的权重，会改变数值和模型精度。不要对该路径启用旧 W8A8 DOPT `compress_conf`：该配置会令 `MatMulV2` 按 FP16 权重大小校验，而压缩 INT8 buffer 只有预期大小的一半，导致编译失败或错误回退。
+- **Kirin9030（V311）**：编译必须加载 DDK 自带的 AscendC 环境。只设置平台参数但未加载 AscendC 时，MatMul 可能全部被拒绝并回退到 CPU；即使生成了文件，也不能视为成功。FP16 Route 必须直接从原始 HuggingFace 浮点权重导出，不能先加载 DOPT `fake_quant_weight.pth` 再转成 FP16；后者保存的是伪量化/反量化后的权重，会改变数值和模型精度。
+- **Kirin9030（V311）W8A8 已可用（DDK 6.1.1.0）**：见下方「Kirin9030 W8A8 OMC（DDK 6.1.1.0）」专节。旧 DDK 6.0.1.0 的 W8A8 `compress_conf` 路径会令 `MatMulV2` 按 FP16 权重大小校验，而压缩 INT8 buffer 只有预期大小的一半，报 `Size check failed. realSrcSize < expectSrcSize` 后 `Trans weight failed` 回退失败；该问题在 DDK 6.1.1.0 + `kirin9030-plugin-next-6.1.1.0` 中已修复。
 - **Kirin9020（V300）**：支持离线 OMC + 旧 DOPT W8A8 权重 + `compress_conf` 的编译路径。该平台上 W8A8 的 MatMulV2 没有 FP16 权重大小校验，压缩后的 INT8 buffer 可以正常编译。编译不需要加载 AscendC 环境（Kirin9020 平台插件自含 tiling 能力）。产出物仍然是 `--target=omc` 生成的离线图，与旧 `--target=om` 在线 IR 有本质区别。**注意**：该产物中的权重来自 DOPT 伪量化压缩，精度路径与 Kirin9030 FP16 OMC 不同，请按目标芯片分别验证。
 
 ### 环境准备
@@ -188,6 +189,39 @@ OMG generate offline model success
 5. 仅重新生成 OM/OMC 产物、未修改 MNN 引擎代码时，不需要重新编译或替换 `libMNN.so`；引擎有改动时才重新构建，并在复制到 App 前后校验哈希。
 
 当前固定输入 shape 只覆盖脚本声明的视觉尺寸。若将来改变图片预处理得到的 token 数或模型 hidden size，需要按新 shape 重新编译对应的离线图，不能直接复用旧 OMC 文件。
+
+### Kirin9030 W8A8 OMC（DDK 6.1.1.0）
+
+Kirin9030 的 W8A8 `compress_conf` 路径在旧 DDK 6.0.1.0 下会失败（`MatMulV2` 按 FP16 权重大小校验，压缩 INT8 buffer 只有预期一半，报 `Size check failed` → `Trans weight failed`）。升级到 **DDK-tools-next-6.1.1.0 + kirin9030-plugin-next-6.1.1.0** 后该问题已修复，W8A8 OMC 可正常编译。
+
+关键组成（详见 `ENV.md`，旧版 6.0.1.0 路径仍保留）：
+
+```bash
+export DDK_PATH=/temp/models/csm/DDK-tools-next-6.1.1.0
+source "$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh"   # Kirin9030 必须加载 AscendC
+```
+
+首次使用新 DDK 前，需要执行一次 `install.sh`（在 `bash -c` 中 source，zsh 下直接 `source` 会因 `$0` 检测失效）：
+
+```bash
+cd "$DDK_PATH/tools/tools_ascendc" && bash -c 'source install.sh'
+```
+
+Kirin9030 W8A8 离线 OMC 单 route 示例（DOPT W8A8、带 compress_conf、加载 AscendC）：
+
+```bash
+PLATFORM=kirin9030 \
+TARGET_MODEL_TYPE=omc \
+USE_COMPRESS_CONF=true \
+LOAD_ASCENDC_ENV=auto \
+OMG_TOOL=$DDK_PATH/tools/tools_omg/omg \
+OMG_MASTER_DIR=$DDK_PATH/tools/tools_omg/master \
+ASCENDC_ENV_SCRIPT=$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh \
+bash transformers/llm/export/plugin_quant_visual_matmul_route_v1/run_visual_plugin_matmul_omc.sh \
+  /path/to/visual_chunk_route fp16
+```
+
+成功判据与通用要求相同（`partition type NPU:1, CPU:0` / `SaveCompiledModelToFile SUCCESS` / `OMG generate offline model success`），并确认 `QuantBatchMatmulV3` 量化 matmul 出现在日志中（否则可能是静默回退 FP16）。已用真实校准输入（608 token、W8A8 act_bit=8）编译 6 个 visual chunk，产物约 52MB/chunk，比 FP16 非压缩（49MB）略大，比 Kirin9020 W8A8（98MB）小。Kirin9030 W8A8 路径仍须加载 AscendC 环境，不能像 Kirin9020 那样省略。
 
 ### 平台差异：Kirin9020 OMC 注意事项
 
