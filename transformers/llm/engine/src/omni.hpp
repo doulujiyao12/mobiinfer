@@ -183,7 +183,21 @@ public:
         mNpuChunkOmPaths = omPaths;
         return mNpuChunkExecutor != nullptr;
     }
+    // Eagerly build/load the visual NPU chunks at load() time (see llm.hpp).
+    // seqLen is the fixed visual sequence length baked into the chunks.
+    void setPrewarmVisualChunks(bool enable, int seqLen) override {
+        mPrewarmVisualChunks = enable;
+        if (seqLen > 0) {
+            mPrewarmSeqLen = seqLen;
+        }
+    }
 private:
+    // Build all visual chunks once with dummy inputs (no image required) so the
+    // HiAI backend compiles/loads them now instead of on the first image turn.
+    void prewarmVisualChunks();
+    bool mPrewarmVisualChunks = false;
+    int mPrewarmSeqLen = 0;
+
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
         mVisionEnd = 151858, mVisionPad = 151859, mAudioPad = 151646,
         mAudioStart = -1, mAudioEnd = -1;

@@ -526,6 +526,115 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
     }
 }
 
+// Eagerly build/load the visual NPU chunks during load() instead of on the
+// first forward.
+//
+// Why: when no external INpuChunkExecutor is injected, the chunks run through
+// the engine's own HiAI backend (NPUBackend). The expensive part -- the HiAI
+// graph compile + model load in NPUBackend::bulidIRModelAndLoad(), reached via
+// Pipeline resize -> onResizeEnd() -- is deferred to the FIRST onForward. For
+// the visual chunks that first forward only happens when the user sends the
+// first image, so the whole compile+load cost lands on the first image turn.
+//
+// Here we feed one dummy activation per chunk with the exact shapes the chunks
+// are exported for and discard the outputs. That forces the build now (and,
+// with MNN_HIAI_CACHE_OM_BY_CHUNK, lets it consume the on-device OM cache), so
+// the first real image finds the chunks already loaded. Contents are
+// irrelevant; only the shapes matter.
+//
+// The shapes are derived from each module's own declared inputs so this stays
+// correct if the export changes: only the sequence length is substituted (the
+// chunks are exported for a fixed visual sequence length).
+void Omni::prewarmVisualChunks() {
+    if (!mPrewarmVisualChunks) {
+        return;
+    }
+    if (mVisionBlocksChunkModules.empty()) {
+        return;
+    }
+    const int S = mPrewarmSeqLen;
+    if (S <= 0) {
+        MNN_PRINT("[prewarm] skipped: visual sequence length unknown\n");
+        return;
+    }
+    Timer _t;
+    size_t built = 0;
+    size_t attempted = 0;
+    for (size_t i = 0; i < mVisionBlocksChunkModules.size(); i++) {
+        // OM chunks are handled by the external executor; nothing to build here.
+        if (i < mChunkUseOm.size() && mChunkUseOm[i]) {
+            continue;
+        }
+        auto mod = mVisionBlocksChunkModules[i].get();
+        if (mod == nullptr || mod->getInfo() == nullptr) {
+            continue;
+        }
+        const auto* info = mod->getInfo();
+        VARPS inputs;
+        bool ok = !info->inputNames.empty();
+        for (size_t k = 0; k < info->inputNames.size() && ok; k++) {
+            const std::string& name = info->inputNames[k];
+            std::vector<int> decl;
+            if (info->inputs.size() > k) {
+                decl.assign(info->inputs[k].dim.begin(), info->inputs[k].dim.end());
+            }
+            // Only the trailing (feature) dimension of the model declaration is
+            // trustworthy: the exported dynamic axes carry stale constants (the
+            // chunks declare a 256-long sequence while the runtime uses 608), so
+            // the sequence length is always substituted from mPrewarmSeqLen and
+            // the remaining shape is rebuilt from the real runtime contract
+            // (see the chunkIn construction in qwen2VisionProcess).
+            const int lastDim = decl.empty() ? 0 : decl.back();
+            std::vector<int> dims;
+            if (name == "hidden_states_in") {
+                // chunk 0 consumes visual_pre's [S, D]; every later chunk consumes
+                // the reshaped [1, S, D] produced by the previous chunk.
+                dims = (decl.size() == 2) ? std::vector<int>{S, lastDim}
+                                          : std::vector<int>{1, S, lastDim};
+            } else if (name == "rotary_pos_emb") {
+                // Rank-5 [2, 1, S, 1, rotary_dim]; the OM/npz form is rank-4
+                // [2, S, 1, rotary_dim] (data order identical).
+                dims = (decl.size() == 4) ? std::vector<int>{2, S, 1, lastDim}
+                                          : std::vector<int>{2, 1, S, 1, lastDim};
+            } else if (name == "attention_mask") {
+                // Qwen2.5-VL uses a windowed rank-4 mask; otherwise rank-3.
+                dims = (decl.size() == 4) ? std::vector<int>{2, 1, S, S}
+                                          : std::vector<int>{1, S, S};
+            } else {
+                ok = false;  // unexpected signature: leave this chunk alone
+                break;
+            }
+            auto var = Express::_Input(dims, NCHW, halide_type_of<float>());
+            auto ptr = var->writeMap<float>();
+            if (ptr == nullptr || var->getInfo() == nullptr) {
+                ok = false;
+                break;
+            }
+            ::memset(ptr, 0, (size_t)var->getInfo()->size * sizeof(float));
+            inputs.emplace_back(var);
+        }
+        if (!ok || inputs.empty()) {
+            MNN_PRINT("[prewarm] chunk[%zu] skipped (unexpected input signature)\n", i);
+            continue;
+        }
+        attempted++;
+        auto out = mod->onForward(inputs);
+        if (out.empty()) {
+            MNN_ERROR("[prewarm] chunk[%zu] dummy forward produced no output\n", i);
+            continue;
+        }
+        // Materialize so the build actually completes before we drop the vars.
+        for (auto& v : out) {
+            if (v.get() != nullptr) {
+                (void)v->readMap<void>();
+            }
+        }
+        built++;
+    }
+    MNN_PRINT("[prewarm] visual chunks built: %zu/%zu (seq=%d) in %.1fms\n",
+              built, attempted, S, _t.durationInUs() / 1000.0f);
+}
+
 bool Omni::load() {
     MNN::Express::ExecutorScope s(mExecutor);
     auto res = Llm::load();
@@ -796,6 +905,9 @@ bool Omni::load() {
             return false;
         }
     }
+    // Optional: warm up the visual NPU chunks now so the first image turn does
+    // not pay the HiAI compile/load cost. No-op unless explicitly enabled.
+    prewarmVisualChunks();
     mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
 }
