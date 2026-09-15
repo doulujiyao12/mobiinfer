@@ -8,8 +8,8 @@ fi
 
 ROUTE_DIR=$(realpath "$1")
 WEIGHT_DTYPE=${2:-fp16}
-OMG_TOOL=${OMG_TOOL:-/temp/fdh/baiducloud/902137265_doulujiyao1/cann_codesample/cann_codesampe2_tar/cann_codesampe2/DDK-tools-next-6.0.1.0/tools/tools_omg/omg}
-OMG_MASTER_DIR=${OMG_MASTER_DIR:-/temp/fdh/baiducloud/902137265_doulujiyao1/cann_codesample/cann_codesampe2_tar/cann_codesampe2/DDK-tools-next-6.0.1.0/tools/tools_omg/master}
+OMG_TOOL=${OMG_TOOL:-/temp/fdh/ddk/DDK-tools-next-6.1.1.0/tools/tools_omg/omg}
+OMG_MASTER_DIR=${OMG_MASTER_DIR:-/temp/fdh/ddk/DDK-tools-next-6.1.1.0/tools/tools_omg/master}
 PLATFORM=${PLATFORM:-kirinx90}
 # Preserve the original online-IR behavior unless the caller explicitly asks
 # for a true offline-compiled OMC artifact.

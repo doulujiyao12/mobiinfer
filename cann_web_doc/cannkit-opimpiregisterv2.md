@@ -1,0 +1,16 @@
+# OpImplRegisterV2
+
+* [构造和析构函数](./cannkit-opimpiregisterv2-construction.md)  
+* [InferShape](./cannkit-infershape.md)  
+* [InferShapeRange](./cannkit-infershaperange.md)  
+* [InferDataType](./cannkit-inferdatatype.md)  
+* [Tiling](./cannkit-tiling.md)  
+* [PrivateAttr](./cannkit-privateattr.md)  
+* [TilingParse](./cannkit-tilingparse.md)  
+* [InputsDataDependency](./cannkit-inputsdatadependency.md)  
+* [InferOutDataTypeSameWithFirstInput](./cannkit-inferoutdatatypesamewithfirstinput.md)  
+* [GenSimplifiedKey](./cannkit-gensimplifiedkey.md)  
+* [OpExecuteFunc](./cannkit-opexecutefunc.md)  
+* [TilingInputsDataDependency](./cannkit-tilinginputsdatadependency.md)  
+* [HostInputs](./cannkit-hostinputs.md)  
+* [OutputShapeDependOnCompute](./cannkit-outputshapedependoncompute.md)  

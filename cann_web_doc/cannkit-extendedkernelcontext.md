@@ -1,0 +1,18 @@
+# ExtendedKernelContext
+
+* [GetInputDesc](./cannkit-getinputdesc.md)  
+* [GetOutputDesc](./cannkit-getoutputdesc.md)  
+* [GetOptionalInputDesc](./cannkit-getoptionalinputdesc.md)  
+* [GetDynamicInputDesc](./cannkit-getdynamicinputdesc.md)  
+* [GetRequiredInputDesc](./cannkit-getrequiredinputdesc.md)  
+* [GetIrInputInstanceInfo](./cannkit-getirinputinstanceinfo.md)  
+* [GetIrOutputInstanceInfo](./cannkit-getiroutputinstanceinfo.md)  
+* [GetComputeNodeInputNum](./cannkit-getcomputenodeinputnum.md)  
+* [GetComputeNodeOutputNum](./cannkit-getcomputenodeoutputnum.md)  
+* [GetAttrs](./cannkit-getattrs.md)  
+* [GetNodeType](./cannkit-getnodetype.md)  
+* [GetNodeName](./cannkit-getnodename.md)  
+* [GetComputeNodeInfo](./cannkit-getcomputenodeinfo.md)  
+* [GetKernelName](./cannkit-getkernelname.md)  
+* [GetKernelType](./cannkit-getkerneltype.md)  
+* [GetExtendInfo](./cannkit-getextendinfo.md)  

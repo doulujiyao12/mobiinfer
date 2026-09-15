@@ -23,7 +23,7 @@ NUM_IMAGES=256                  # dump 几张图 (同时 = 量化用几个样本
 HW_OVERRIDE="600,270"           # 强制缩放尺寸 -> seq_len=608
 SEED=42                         # 采样随机种子 (可复现)
 
-CALIB_WORK_ROOT=/temp/fdh/input_calib            # 所有中间产物根目录
+CALIB_WORK_ROOT=/temp/fdh/input_calib_fdh            # 所有中间产物根目录
 SRC_IMG_DIR=/temp/csm/sft-0422-quant-500-half-size  # 496 张真实图
 MODEL_CFG_DIR=/temp/fdh/baiducloud/902137265_doulujiyao1/model_6chunk_nor_kirinnpu_visual4
 
@@ -34,14 +34,14 @@ CONFIG_DUMP=${MODEL_CFG_DIR}/config_dump_608.json
 DUMP_RAW_DIR=${CALIB_WORK_ROOT}/chunk_dump_raw
 CALIB_NPZ_DIR=${CALIB_WORK_ROOT}/calib_inputs_256
 
-OMC_OUT_ROOT=/temp/fdh/model_omc
+OMC_OUT_ROOT=/temp/fdh/model_omc_fdh
 ROUTE_SUFFIX=real256            # route_dir 后缀
 NPU_CHUNKS=6
-PLATFORM=kirin9020
+PLATFORM=kirin9030
 
 KEEP_RAW=0                     # 1=保留 raw bin, 0=转完 npz 后清理 (省空间)
-SKIP_DUMP=0                     # 1=跳过 dump (复用已有 DUMP_RAW_DIR)
-SKIP_NPZ=0                      # 1=跳过 bin->npz (复用已有 CALIB_NPZ_DIR)
+SKIP_DUMP=1                     # 1=跳过 dump (复用已有 DUMP_RAW_DIR)
+SKIP_NPZ=1                      # 1=跳过 bin->npz (复用已有 CALIB_NPZ_DIR)
 # ====================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -183,7 +183,7 @@ echo ""
 
 # ---- 环境 ----
 source /opt/conda/etc/profile.d/conda.sh
-conda activate cann
+conda activate CANN
 export DDK_DOPT=/temp/fdh/baiducloud/902137265_doulujiyao1/cann_codesample/cann_codesampe2_tar/cann_codesampe2/DDK-tools-next-6.0.1.0/tools/tools_dopt/dopt_pytorch_py3
 export PYTHONPATH=${DDK_DOPT}:${REPO_ROOT}/transformers/llm/export:${PYTHONPATH:-}
 

@@ -1,0 +1,17 @@
+# InferenceContext
+
+* [构造函数和析构函数](./cannkit-inferencecontext-construction.md)  
+* [SetInputHandleShapesAndTypes](./cannkit-setinputhandleshapesandtypes.md)  
+* [SetOutputHandleShapesAndTypes](./cannkit-setoutputhandleshapesandtypes.md)  
+* [GetInputHandleShapesAndTypes](./cannkit-getinputhandleshapesandtypes.md)  
+* [GetOutputHandleShapesAndTypes](./cannkit-getoutputhandleshapesandtypes.md)  
+* [SetMarks](./cannkit-setmarks.md)  
+* [GetMarks](./cannkit-getmarks.md)  
+* [Create](./cannkit-create.md)  
+* [GetResourceContext](./cannkit-getresourcecontext.md)  
+* [SetResourceContext](./cannkit-setresourcecontext.md)  
+* [RegisterReliedOnResourceKey](./cannkit-registerreliedonresourcekey.md)  
+* [AddChangedResourceKey](./cannkit-addchangedresourcekey.md)  
+* [GetReliedOnResourceKeys](./cannkit-getreliedonresourcekeys.md)  
+* [GetChangedResourceKeys](./cannkit-getchangedresourcekeys.md)  
+* [ClearChangedResourceKeys](./cannkit-clearchangedresourcekeys.md)  
