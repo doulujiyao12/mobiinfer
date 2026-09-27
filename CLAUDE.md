@@ -234,6 +234,82 @@ Kirin9020 的 OMC 编译路径与 Kirin9030 有以下关键差异：
 
 Kirin9020 OMC 编译请直接使用 `run_visual_plugin_matmul_omc.sh` 进行单 route 编译，或参考 `run_all_chunks_real_calib_W8A8.sh` 批量编译所有 chunk。
 
+### 项目换路径后必须重新生成的校准文件
+
+**当前项目绝对路径：`/home/ma-user/workspace/feh/mobiinfer`**（CLAUDE.md 中所有绝对路径均以此为准）。
+
+`transformers/llm/export/plugin_quant_visual_matmul_route_v1/` 下有两个**存档文件**含绝对路径，一旦项目目录改名或搬家就会失效，必须重新生成：
+
+| 文件 | 含绝对路径的字段 | 行数 |
+|---|---|---|
+| `config_dump_608.json` | `visual_chunk_input_dump_dir` | 1 处 |
+| `image_prompt.txt` | 每行 `<img><hw>600,270</hw>{绝对路径}</img>` | 256 行 |
+
+#### 为什么这两处不能写成相对路径
+
+同一个 config 里的键，**解析基准不同**（改之前务必先理解，否则会越改越坏）：
+
+| 配置键 | 代码位置 | 解析基准 |
+|---|---|---|
+| `llm_model`、`visual_pre_model`、`visual_blocks_chunks` 等 | `transformers/llm/engine/src/llmconfig.hpp:143,147,181` | **config 文件所在目录**（`base_dir_` 前缀） |
+| `visual_chunk_input_dump_dir` | `transformers/llm/engine/src/omni.cpp:742-745` | **进程 CWD**（走 `stat`/`mkdir`，无 `base_dir_` 前缀） |
+| prompt 里 `<img>...</img>` 的图片路径 | `transformers/llm/engine/src/omni.cpp:1808`（`MNN::CV::imread`） | **进程 CWD** |
+
+`run_real_calib_256.sh:123` 是 `cd "${REPO_ROOT}/build_x86"` 之后才跑 `llm_demo`，所以后两者的相对路径会解析成 `build_x86/xxx`，与脚本里用绝对路径赋值的 `DUMP_RAW_DIR` 对不上，dump 或读图会静默失败。**因此这两处必须写绝对路径**，代价就是换目录后需要重新生成。
+
+#### 重新生成方法
+
+两个文件都在 `transformers/llm/export/plugin_quant_visual_matmul_route_v1/` 目录下执行。
+
+**1) `image_prompt.txt`** —— 图片已在仓库内 `calib_images/`，直接重跑采样脚本：
+
+```bash
+cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
+python3 select_images.py \
+  --src_dir ./calib_images \
+  --out_prompt ./image_prompt.txt \
+  --num 256 --hw 600,270 --seed 42
+```
+
+必须保持 `--num 256 --hw 600,270 --seed 42` 不变，否则样本集合或 `seq_len=608` 会变，已量化的 chunk 对不上。
+
+**2) `config_dump_608.json`** —— 以 6chunk 模型目录的 `config.json` 为底，改两个 dump 字段：
+
+```bash
+cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
+MODEL_CFG_DIR=/temp/fdh/baiducloud/902137265_doulujiyao1/model_6chunk_nor_kirinnpu_visual4
+python3 - "${MODEL_CFG_DIR}/config.json" ./config_dump_608.json "$(pwd)/calib_dump_raw" 256 <<'PY'
+import json, sys
+src, dst, dump_dir, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+cfg = json.load(open(src, 'r', encoding='utf-8'))
+cfg["visual_blocks_chunk_backends"] = ["cpu"] * len(cfg["visual_blocks_chunks"])
+cfg["visual_chunk_input_dump_dir"] = dump_dir
+cfg["visual_chunk_input_dump_samples"] = n
+json.dump(cfg, open(dst, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+PY
+```
+
+改完后校验（两条都必须指向新路径、`/temp` 行数必须为 0）：
+
+```bash
+python3 -c "import json;print(json.load(open('config_dump_608.json'))['visual_chunk_input_dump_dir'])"
+grep -c '/temp' image_prompt.txt        # 期望 0
+grep -cF "$(pwd)/calib_images" image_prompt.txt   # 期望 256
+```
+
+#### 注意：这两个文件是存档，实际流程会自行生成到别处
+
+`run_real_calib_256.sh:32,35` 把它们**重新生成到 `/temp`**（`PROMPT_FILE=${CALIB_WORK_ROOT}/image_prompt.txt`、`CONFIG_DUMP=${MODEL_CFG_DIR}/config_dump_608.json`），并不读取仓库里的副本。仓库内这两份的作用是：记录复现参数（`--seed 42 --num 256 --hw 600,270`），以及给不依赖 `llm_demo` 的 `generate_npz_calib.py` 路径做参考。
+
+因此换路径后的真实动作是**按上面命令重新生成**，而不是手改这两个文件。
+
+#### 相关产物与忽略规则
+
+- `calib_dump_raw/`：`llm_demo` dump 的裸 fp32 bin+meta，约 **6.1 GiB/轮**（每 chunk-样本 ≈4.08 MiB × 6 chunk × 256 样本 ≈ 6144 个文件），可由 `calib_images/` 完全再生，**不入库**。
+- `calib_npz/`：`generate_npz_calib.py` 输出的 fp16 npz，同样可再生，**不入库**。
+
+以上两条已在 `plugin_quant_visual_matmul_route_v1/.gitignore` 中忽略。注意 `calib_npz/` 命中既有 `*npz` 规则，会连带忽略其中的 `visual_calib_manifest.json`（如需入库需用 `calib_npz/*` + `!calib_npz/visual_calib_manifest.json` 例外）。
+
 
 ##环境配置
 查看 @ENV.md 文件

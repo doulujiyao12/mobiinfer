@@ -6,3 +6,9 @@
 *.omc
 model*
 *npz
+
+# 运行时校准中间产物: 体积大且可由 calib_images/ 完全再生, 不入库
+#   calib_dump_raw/  llm_demo dump 的裸 fp32 bin+meta (~6.1 GiB/轮, 见 config_dump_608.json)
+#   calib_npz/       generate_npz_calib.py 输出的 fp16 npz
+calib_dump_raw/
+calib_npz/

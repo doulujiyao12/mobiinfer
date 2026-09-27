@@ -1,0 +1,51 @@
+{
+  "llm_model": "llm.mnn",
+  "llm_weight": "llm.mnn.weight",
+  "backend_type": "cpu",
+  "thread_num": 4,
+  "precision": "low",
+  "memory": "low",
+  "sampler_type": "mixed",
+  "temperature": 0.8,
+  "top_k": 40,
+  "top_p": 0.9,
+  "min_p": 0.05,
+  "tfs_z": 1.0,
+  "typical": 0.95,
+  "repetition_penalty": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "penalty_window": 0,
+  "n_gram": 8,
+  "ngram_factor": 1.0,
+  "tokenizer_file": "tokenizer.mtok",
+  "mllm": {
+    "backend_type": "cpu",
+    "thread_num": 4,
+    "precision": "normal",
+    "memory": "low"
+  },
+  "visual_split": true,
+  "visual_pre_model": "visual_pre.mnn",
+  "visual_blocks_model": "visual_blocks.mnn",
+  "visual_post_model": "visual_post.mnn",
+  "visual_blocks_backend_type": "hiai",
+  "visual_blocks_chunks": [
+    "visual_blocks_npu_0.mnn",
+    "visual_blocks_npu_1.mnn",
+    "visual_blocks_npu_2.mnn",
+    "visual_blocks_npu_3.mnn",
+    "visual_blocks_npu_4.mnn",
+    "visual_blocks_npu_5.mnn"
+  ],
+  "visual_blocks_chunk_backends": [
+    "cpu",
+    "cpu",
+    "cpu",
+    "cpu",
+    "cpu",
+    "cpu"
+  ],
+  "visual_chunk_input_dump_dir": "/home/ma-user/workspace/feh/mobiinfer/transformers/llm/export/plugin_quant_visual_matmul_route_v1/calib_dump_raw",
+  "visual_chunk_input_dump_samples": 256
+}
