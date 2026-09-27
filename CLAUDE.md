@@ -303,6 +303,61 @@ grep -cF "$(pwd)/calib_images" image_prompt.txt   # 期望 256
 
 因此换路径后的真实动作是**按上面命令重新生成**，而不是手改这两个文件。
 
+#### 路径 B：`generate_npz_calib.py` 直接生成校准 NPZ（不依赖 llm_demo）
+
+`generate_npz_calib.py` 走的是**纯 Python 前向**路线：加载 HF 模型 + autoround 权重，过 `patch_embed` 与各 chunk 的 blocks，在 chunk 边界直接存 npz。它**不需要** `llm_demo`、不需要重编引擎、也不需要 2.2G 的 6chunk 目录，只需 HF 模型与 GPTQ 权重，因此是换机器后最省事的复现路径。
+
+**`--hw` 尺寸覆盖（与 prompt 的 `<hw>` 标签语义一致）**
+
+引擎侧 `qwen2VisionProcess`（`omni.cpp:982`）的处理是「先把尺寸置为 `<hw>` 的值，再交给 `smartResize` 规整」。脚本的 `--hw` 复刻了同一顺序，故两者结果严格一致：
+
+```
+--hw 600,270  ->  smart_resize(600,270, factor=32, 65536, 16777216) = 608x256
+              ->  grid 38x16  ->  seq_len = 608
+```
+
+生成与 `run_real_calib_256.sh` 格式相同的校准数据集：
+
+```bash
+cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
+python3 generate_npz_calib.py \
+  --num_samples 256 \
+  --hw 600,270 \
+  --output_dir ./calib_npz
+```
+
+`--hw` 的语义与参数：
+
+| 参数 | 说明 |
+|---|---|
+| 不传（默认） | 按图片自然尺寸 `smart_resize`，`seq_len` 随图片变化 |
+| `--hw 600,270` | 固定尺寸，产出统一 `seq_len=608`，与 prompt 的 `<hw>600,270</hw>` 等价 |
+
+**必须传 `--hw`，否则多数图片集无法使用**：`calib_images/` 的 495 张图自然尺寸有多种（`704x320`、`608x288`、`672x320`、`384x192`…），自然 `seq_len` 会得到 `880/684/840/288` 等混合值。而导出端 `visual_plugin_quant_matmul_route.py:1085` 是 `export_chunk_onnx(args, samples[0], ...)`——**只用 `samples[0]` 固定 shape 且无 dynamic_axes**，混合 `seq_len` 必然失败。脚本会在**开始前**只读图片头做预检，尺寸不一致时直接报错，不会跑到写出几十 GB 才暴露：
+
+```text
+校准样本 seq_len 不一致, 导出端只用 samples[0] 定 shape 会失败:
+  seq_len=288 (1 张, 例 ...: 源 345x157 -> 384x192); seq_len=880 (451 张, ...)
+```
+
+**参数与产物体积**（供估算）：
+
+| 项 | 值 |
+|---|---|
+| `--num_samples 16` | 对应 `ENV.md` 的 `CALIB_SAMPLE_COUNT=16`，6 chunk × 16 = 96 个 npz ≈ 144 MB |
+| `--num_samples 256` | 6 chunk × 256 = 1536 个 npz ≈ 3.1 GB |
+| 每样本 shape | `hidden_states_in (1,608,1024)` / `rotary_pos_emb (2,608,1,64)` / `attention_mask (1,608,608)`，均 fp16 |
+| 样本选取 | `sorted(files)[:num_samples]`（**非随机**，与 `select_images.py` 的 `rng.sample(seed=42)` 不同） |
+
+> 注意：两条路径选取的图片子集**不同**（路径 A 的 256 张与路径 B 的 `sorted[:256]` 仅约 126 张重叠）。二者产出的 npz **格式与 shape 完全一致**，可直接用于量化；但若要求与既有 `calib_inputs_256/` 逐样本对齐，需以路径 A 为准，或让脚本改用相同的采样方式。
+
+**模型权重是外部依赖**：`--model_path`（HF）、`--gptq_path`（autoround W8A8）不随仓库备份，可用环境变量覆盖默认值：
+
+```bash
+export MOBI_HF_MODEL=/path/to/mobi0402_2B_halfimage_rl
+export MOBI_GPTQ_MODEL=/path/to/mobi0402_2B_halfimage_rl-w8g128
+```
+
 #### 相关产物与忽略规则
 
 - `calib_dump_raw/`：`llm_demo` dump 的裸 fp32 bin+meta，约 **6.1 GiB/轮**（每 chunk-样本 ≈4.08 MiB × 6 chunk × 256 样本 ≈ 6144 个文件），可由 `calib_images/` 完全再生，**不入库**。

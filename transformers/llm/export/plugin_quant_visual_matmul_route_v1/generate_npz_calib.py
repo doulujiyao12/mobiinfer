@@ -77,6 +77,53 @@ def _reset_kv(module):
             sub.past_key_value = None
 
 
+def _parse_hw(hw):
+    """解析 --hw "H,W" -> (H, W)。None/空串表示不覆盖（按图片自然尺寸）。"""
+    if hw is None or hw == "":
+        return None
+    parts = [p.strip() for p in str(hw).split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"--hw 需要 'H,W' 两个整数, 收到: {hw!r}")
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"--hw 需要整数, 收到: {hw!r}")
+
+
+def _expected_seq_len(visual, image_files, image_dir, hw_override):
+    """只读图片头预计算每样本 seq_len, 并校验一致性; 返回公共 seq_len。
+
+    与 generate_npz 的真实计算路径对齐:
+      - 有 hw_override: 先用 <hw> 覆盖尺寸再 smart_resize (引擎 qwen2VisionProcess 语义)
+      - 无 hw_override: 按图片自然尺寸 smart_resize
+    网格/序列长度: grid = resized // patch_size, seq_len = grid_t * grid_h * grid_w,
+    其中 grid_t=1 (单帧, temporal_patch_size=2 且同图拼接两份)。
+    """
+    factor = visual.patch_size * visual.merge_size
+    patch = visual.patch_size
+    seen = {}
+    for name in image_files:
+        src_w, src_h = Image.open(os.path.join(image_dir, name)).size
+        h, w = hw_override if hw_override is not None else (src_h, src_w)
+        resized_h, resized_w = visual.smart_resize(
+            h, w, factor, visual.min_pixels, visual.max_pixels)
+        seq_len = (resized_h // patch) * (resized_w // patch)
+        seen.setdefault(seq_len, []).append((name, src_h, src_w, resized_h, resized_w))
+    if len(seen) > 1:
+        detail = "; ".join(
+            f"seq_len={s} ({len(v)} 张, 例 {v[0][0]}: 源 {v[0][1]}x{v[0][2]}"
+            f" -> {v[0][3]}x{v[0][4]})"
+            for s, v in sorted(seen.items())
+        )
+        raise ValueError(
+            "校准样本 seq_len 不一致, 导出端只用 samples[0] 定 shape 会失败:\n  " + detail +
+            "\n  解决: 传 --hw 600,270 固定尺寸 (等价 prompt 的 <hw>600,270</hw>,"
+            "\n        规整为 608x256 -> grid 38x16 -> seq_len=608),"
+            "\n        或改用尺寸一致的图片集 (--image_dir)。"
+        )
+    return next(iter(seen))
+
+
 @torch.no_grad()
 def generate_npz(args):
     model_path = args.model_path
@@ -85,6 +132,10 @@ def generate_npz(args):
     output_dir = args.output_dir
     num_samples = args.num_samples
     chunk_specs = build_chunk_specs(args.num_visual_blocks, args.num_chunks)
+
+    # hw_override: 对应 llm_demo prompt 的 <hw>H,W</hw>。给出时所有样本共用同一
+    # 尺寸，seq_len 固定；这是导出端能用的前提（见下方一致性校验）。
+    hw_override = _parse_hw(args.hw)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -106,6 +157,15 @@ def generate_npz(args):
         image_files = image_files[:num_samples]
 
     print(f"Found {len(image_files)} images, generating {args.num_chunks} NPU chunks × {len(image_files)} samples")
+    if hw_override is not None:
+        print(f"hw override: {hw_override[0]},{hw_override[1]}  (对齐 <hw> 标签语义)")
+    else:
+        print("hw override: 无 (按图片自然尺寸, seq_len 将随图片变化)")
+
+    # ---- 0. 预检: 所有样本必须同一 seq_len ----
+    # 只读图片头算尺寸, 代价极低; 避免跑到写出几十 GB 之后才在导出阶段暴露形状不一致。
+    expected = _expected_seq_len(visual, image_files, image_dir, hw_override)
+    print(f"precheck: seq_len={expected} (共 {len(image_files)} 张, 尺寸一致)")
 
     manifest = []
     for img_idx, img_name in enumerate(image_files):
@@ -117,7 +177,7 @@ def generate_npz(args):
 
         # 使用模型内置的 img_process 做预处理 + patch_reshape + 位置编码 + attention_mask
         # 但我们只取到 patch_embed 之后的 hidden_states
-        image_tensor = _preprocess_image(visual, pil_image)
+        image_tensor = _preprocess_image(visual, pil_image, hw_override)
         flatten_patches, grid_thw = visual.vision_reshape(image_tensor)
         position_ids = visual.vision_position_ids(grid_thw)
         attention_mask = visual.vision_attention_mask(grid_thw)
@@ -195,8 +255,17 @@ def generate_npz(args):
     return output_dir
 
 
-def _preprocess_image(visual, pil_image):
-    """使用 model internal 的图片预处理 (与 img_process 一致)"""
+def _preprocess_image(visual, pil_image, hw_override=None):
+    """使用 model internal 的图片预处理 (与 img_process 一致)
+
+    hw_override: 可选的 (H, W)，对应 llm_demo prompt 里的 <hw>H,W</hw> 标签。
+        引擎侧 (omni.cpp::qwen2VisionProcess) 的处理是：先把 mVisionHeight /
+        mVisionWidth 置为该值，再交给 smartResize() 规整。这里保持一致——
+        同样先覆盖再 smart_resize，因此 600,270 会被规整为 608x256，
+        得到 grid 38x16、seq_len=608，与 run_real_calib_256.sh 那条
+        (llm_demo dump) 链路完全对齐。
+        不传时按图片自然尺寸走 smart_resize（即模型默认行为，seq_len 随图片变化）。
+    """
     from transformers.image_transforms import (
         convert_to_rgb,
         resize,
@@ -212,6 +281,9 @@ def _preprocess_image(visual, pil_image):
     image = convert_to_rgb(pil_image)
     image = to_numpy_array(image)
     height, width = image.shape[0], image.shape[1]
+    # 引擎在 smartResize 之前用 <hw> 覆盖 mVisionHeight/mVisionWidth，此处对齐
+    if hw_override is not None:
+        height, width = hw_override
     resized_height, resized_width = visual.smart_resize(
         height, width,
         visual.patch_size * visual.merge_size,
@@ -246,6 +318,13 @@ def main():
     parser.add_argument("--num_samples", type=int, default=0, help="0=use all images")
     parser.add_argument("--num_chunks", type=int, default=6)
     parser.add_argument("--num_visual_blocks", type=int, default=24)
+    # --- 尺寸覆盖: 对齐 llm_demo prompt 的 <hw>H,W</hw> 语义 ---
+    parser.add_argument("--hw", default=None,
+                        help="可选, 'H,W' 形式的尺寸覆盖 (如 600,270)。等价于 llm_demo "
+                             "prompt 里的 <hw>H,W</hw>: 先覆盖尺寸再 smart_resize, 因此 "
+                             "600,270 -> 608x256 -> grid 38x16 -> seq_len=608, 与 "
+                             "run_real_calib_256.sh 那条 dump 链路一致。"
+                             "不传则按图片自然尺寸 (seq_len 随图片变化, 不保证一致)。")
     args = parser.parse_args()
 
     output_dir = generate_npz(args)
