@@ -305,7 +305,9 @@ grep -cF "$(pwd)/calib_images" image_prompt.txt   # 期望 256
 
 #### 路径 B：`generate_npz_calib.py` 直接生成校准 NPZ（不依赖 llm_demo）
 
-`generate_npz_calib.py` 走的是**纯 Python 前向**路线：加载 HF 模型 + autoround 权重，过 `patch_embed` 与各 chunk 的 blocks，在 chunk 边界直接存 npz。它**不需要** `llm_demo`、不需要重编引擎、也不需要 2.2G 的 6chunk 目录，只需 HF 模型与 GPTQ 权重，因此是换机器后最省事的复现路径。
+`generate_npz_calib.py` 走的是**纯 Python 前向**路线：加载 HF fp 模型，过 `patch_embed` 与各 chunk 的 blocks，在 chunk 边界直接存 npz。它**不需要** `llm_demo`、不需要重编引擎、也不需要 2.2G 的 6chunk 目录，只需 HF fp 模型，因此是换机器后最省事的复现路径。
+
+> 该脚本**不使用任何 GPTQ/autoround 量化权重**，只用 fp 权重做前向。量化由下游 `visual_plugin_quant_matmul_route.py` 用 DOPT 完成（见 9030 OMC manifest 的 `"weight_source": "dopt_fake_quant"`）。脚本里曾有的 `--gptq_path` 参数实为死参数（`utils/model.py` 与 `utils/vision.py` 均不消费 `gptq`），已移除。
 
 **`--hw` 尺寸覆盖（与 prompt 的 `<hw>` 标签语义一致）**
 
@@ -351,11 +353,10 @@ python3 generate_npz_calib.py \
 
 > 注意：两条路径选取的图片子集**不同**（路径 A 的 256 张与路径 B 的 `sorted[:256]` 仅约 126 张重叠）。二者产出的 npz **格式与 shape 完全一致**，可直接用于量化；但若要求与既有 `calib_inputs_256/` 逐样本对齐，需以路径 A 为准，或让脚本改用相同的采样方式。
 
-**模型权重是外部依赖**：`--model_path`（HF）、`--gptq_path`（autoround W8A8）不随仓库备份，可用环境变量覆盖默认值：
+**模型权重是外部依赖**：`--model_path`（HF fp 权重）不随仓库备份，可用环境变量覆盖默认值：
 
 ```bash
 export MOBI_HF_MODEL=/path/to/mobi0402_2B_halfimage_rl
-export MOBI_GPTQ_MODEL=/path/to/mobi0402_2B_halfimage_rl-w8g128
 ```
 
 #### 相关产物与忽略规则

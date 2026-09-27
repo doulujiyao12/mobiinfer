@@ -3,7 +3,7 @@
 从校准图片生成 DOPT 校准用的 NPZ 激活值 dump 文件。
 
 流程:
-  HF model (mobi0402_2B) + autoround W8A8 weights
+  HF model (mobi0402_2B, fp 权重)
     → 加载校准图片 (仓库内 calib_images/)
     → visual_pre (patch_embed)
     → 分块过 6 个 NPU chunk
@@ -13,8 +13,11 @@
   - 校准图片随本仓库备份在 calib_images/, 是 --image_dir 的默认值。
   - 输出的 NPZ 体积大且可由图片完全再生, 默认写到 calib_npz/,
     已被本目录 .gitignore 的 *npz 忽略, 不入库。
-  - HF 模型与 autoround W8A8 权重是外部依赖, 不随本仓库备份,
-    需另行提供 (默认沿用 /temp 路径, 可用环境变量覆盖)。
+  - HF 模型是外部依赖, 不随本仓库备份, 需另行提供
+    (默认沿用 /temp 路径, 可用环境变量覆盖)。
+
+注意: 本脚本只用 fp 权重做前向。它不加载任何 GPTQ/autoround 量化权重——
+量化是在下游 visual_plugin_quant_matmul_route.py 里用 DOPT 完成的。
 """
 
 import argparse
@@ -35,7 +38,7 @@ sys.path.insert(0, EXPORT_DIR)
 from utils.model import LlmModel
 
 
-def make_args(model_path, gptq_path):
+def make_args(model_path):
     class DummyArgs:
         pass
     args = DummyArgs()
@@ -46,7 +49,6 @@ def make_args(model_path, gptq_path):
         "export": "mnn", "dst_path": "/tmp", "transformer_fuse": False,
         "group_conv_native": False, "visual_quant_bit": 8, "visual_quant_block": 128,
         "visual_sym": False, "sym": False, "hqq": False, "visual_keep_matmul": False,
-        "visual_gptq_path": gptq_path,
         "tie_word_embeddings": False, "onnx_slim": False, "keep_onnx": True,
         "cleanup_onnx": False, "lora_path": None, "lora_split": False,
         "eagle_path": None, "embed_bit": 16, "skip_weight": False,
@@ -127,7 +129,6 @@ def _expected_seq_len(visual, image_files, image_dir, hw_override):
 @torch.no_grad()
 def generate_npz(args):
     model_path = args.model_path
-    gptq_path = args.gptq_path
     image_dir = args.image_dir
     output_dir = args.output_dir
     num_samples = args.num_samples
@@ -140,7 +141,7 @@ def generate_npz(args):
     os.makedirs(output_dir, exist_ok=True)
 
     print("Loading model...")
-    dummy_args = make_args(model_path, gptq_path)
+    dummy_args = make_args(model_path)
     model = LlmModel.from_pretrained(model_path, args=dummy_args)
     visual = model.visual
     visual.eval()
@@ -306,10 +307,7 @@ def main():
     # --- 外部依赖: 模型权重不随仓库备份, 需另行提供 ---
     parser.add_argument("--model_path",
                         default=os.environ.get("MOBI_HF_MODEL", "/temp/models/mobi0402_2B_halfimage_rl"),
-                        help="HF 模型目录 (外部依赖; 默认 $MOBI_HF_MODEL)")
-    parser.add_argument("--gptq_path",
-                        default=os.environ.get("MOBI_GPTQ_MODEL", "/temp/csm/autoround_export/mobi0402_2B_halfimage_rl-w8g128/"),
-                        help="autoround W8A8 权重目录 (外部依赖; 默认 $MOBI_GPTQ_MODEL)")
+                        help="HF 模型目录 (fp 权重; 外部依赖, 默认 $MOBI_HF_MODEL)")
     # --- 仓库内路径 ---
     parser.add_argument("--image_dir", default=CALIB_IMAGE_DIR,
                         help="校准图片目录 (默认: 仓库内 calib_images/)")
