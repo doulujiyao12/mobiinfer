@@ -113,11 +113,21 @@ mobiinfra-oh 这个目录下面是端侧推理的deveco 的项目代码库，主
 
 ### 环境准备
 
-先阅读仓库根目录的 `ENV.md`，使用其中记录的当前 DDK/CANN/Conda 路径。不要把 `ENV.md` 中的令牌或密码输出到日志、提交或命令行参数。当前 Kirin9030 工具链的关键组成是：
+先阅读仓库根目录的 `ENV.md`，使用其中记录的当前 DDK/CANN/Conda 路径。不要把 `ENV.md` 中的令牌或密码输出到日志、提交或命令行参数。
+
+> **路径已迁移（2026-10 重启后）**：旧 `/temp/fdh/baiducloud/...` 与 `/temp/models/csm/` 均已不存在，DDK/CANN 现统一放在 `/temp/huawei-sdk/`。下面命令中的路径如与 `ENV.md` 不一致，以 `ENV.md` 为准。
+
+当前 Kirin9030 工具链的关键组成是：
 
 ```bash
-export DDK_PATH=/temp/fdh/baiducloud/902137265_doulujiyao1/cann_codesample/cann_codesampe2_tar/cann_codesampe2/DDK-tools-next-6.0.1.0
+export DDK_PATH=/temp/huawei-sdk/DDK-tools-next-6.1.1.0
 source "$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh"
+```
+
+conda 环境名是**大写 `CANN`**（不是小写 `cann`）：
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh && conda activate CANN
 ```
 
 如果 DDK 的 Python package 目录缺少适配器，使用 DDK 自带 wheel 离线安装，不要从公网拉取不匹配版本：
@@ -194,10 +204,10 @@ OMG generate offline model success
 
 Kirin9030 的 W8A8 `compress_conf` 路径在旧 DDK 6.0.1.0 下会失败（`MatMulV2` 按 FP16 权重大小校验，压缩 INT8 buffer 只有预期一半，报 `Size check failed` → `Trans weight failed`）。升级到 **DDK-tools-next-6.1.1.0 + kirin9030-plugin-next-6.1.1.0** 后该问题已修复，W8A8 OMC 可正常编译。
 
-关键组成（详见 `ENV.md`，旧版 6.0.1.0 路径仍保留）：
+关键组成（详见 `ENV.md`）：
 
 ```bash
-export DDK_PATH=/temp/models/csm/DDK-tools-next-6.1.1.0
+export DDK_PATH=/temp/huawei-sdk/DDK-tools-next-6.1.1.0
 source "$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh"   # Kirin9030 必须加载 AscendC
 ```
 
@@ -205,6 +215,12 @@ source "$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh"   # Kirin9030 必须�
 
 ```bash
 cd "$DDK_PATH/tools/tools_ascendc" && bash -c 'source install.sh'
+```
+
+`omg` 与 `omg master` 可执行文件在解压后可能没有执行位，若报 `Permission denied` 需先 `chmod +x`：
+
+```bash
+chmod +x "$DDK_PATH"/tools/tools_omg/omg "$DDK_PATH"/tools/tools_omg/master/omg
 ```
 
 Kirin9030 W8A8 离线 OMC 单 route 示例（DOPT W8A8、带 compress_conf、加载 AscendC）：
@@ -275,9 +291,11 @@ python3 select_images.py \
 
 **2) `config_dump_608.json`** —— 以 6chunk 模型目录的 `config.json` 为底，改两个 dump 字段：
 
+> 注意：6chunk 模型目录是**外部依赖，不随仓库备份**，重启/换机后常缺失（旧路径 `/temp/fdh/baiducloud/.../model_6chunk_nor_kirinnpu_visual4` 已不存在）。若目录缺失，请改用下方「路径 B」的 `generate_npz_calib.py`，它只需 HF fp 模型即可产出格式完全一致的校准 npz，无需该目录。
+
 ```bash
 cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
-MODEL_CFG_DIR=/temp/fdh/baiducloud/902137265_doulujiyao1/model_6chunk_nor_kirinnpu_visual4
+MODEL_CFG_DIR=/path/to/model_6chunk_nor_kirinnpu_visual4   # 外部依赖，按实际位置填写
 python3 - "${MODEL_CFG_DIR}/config.json" ./config_dump_608.json "$(pwd)/calib_dump_raw" 256 <<'PY'
 import json, sys
 src, dst, dump_dir, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
@@ -365,6 +383,83 @@ export MOBI_HF_MODEL=/path/to/mobi0402_2B_halfimage_rl
 - `calib_npz/`：`generate_npz_calib.py` 输出的 fp16 npz，同样可再生，**不入库**。
 
 以上两条已在 `plugin_quant_visual_matmul_route_v1/.gitignore` 中忽略。注意 `calib_npz/` 命中既有 `*npz` 规则，会连带忽略其中的 `visual_calib_manifest.json`（如需入库需用 `calib_npz/*` + `!calib_npz/visual_calib_manifest.json` 例外）。
+
+> 磁盘提示：本项目所在盘空间有限，**所有中间产物请输出到 `/temp/work/`**（见 `ENV.md`），不要写进仓库目录。`generate_npz_calib.py` 的 `--output_dir`、OMC 的 `--route_dir`、`llmexport.py` 的 `--dst_path`、以及 x86 构建目录都应指向 `/temp/work/` 下的子目录。
+
+### 端到端已验证流程（Kirin9030 + W8A8，2026-10）
+
+针对 mobi2B：**VIT 走 Kirin9030 离线 OMC 8bit 跑 NPU，LLM 走 GPTQ 8bit 跑 CPU**。完整链路与实测结果如下。
+
+**关键前置**：conda 环境是 `CANN`（大写）；DDK 用 6.1.1.0；`omg` 需 `chmod +x`；AscendC 适配器 wheel 需装入 `tools_ascendc/package/python`（Kirin9030 OMC 必须 `import te_fusion` 成功）。
+
+1. **编译 host 工具**（MNNConvert 供 `llmexport` 使用，llm_demo 供 host 侧验证）：
+
+```bash
+mkdir -p /temp/work/build-host-converter && cd /temp/work/build-host-converter
+cmake /home/ma-user/workspace/feh/mobiinfer \
+  -DMNN_BUILD_CONVERTER=ON -DMNN_BUILD_TOOLS=ON \
+  -DMNN_BUILD_LLM=ON -DMNN_BUILD_LLM_OMNI=ON
+make -j$(nproc) MNNConvert llm_demo
+```
+
+2. **生成校准 npz**（路径 B，只需 HF fp 模型）：见上「路径 B」，16 样本产出 `6×16=96` 个 npz，`seq_len=608`。
+
+3. **逐 chunk 量化 + 导出 ONNX**（W8A8）：
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh && conda activate CANN
+export DDK_DOPT=/temp/huawei-sdk/DDK-tools-next-6.1.1.0/tools/tools_dopt/dopt_pytorch_py3
+export PYTHONPATH=$DDK_DOPT:/home/ma-user/workspace/feh/mobiinfer/transformers/llm/export:$PYTHONPATH
+cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
+python visual_plugin_quant_matmul_route.py \
+  --route_dir /temp/work/model_omc/chunk0_kirin9030 --chunk_index 0 --npu_chunks 6 \
+  --quant_strategy Quant_aigc_ptq --weight_bit 8 --weight_algo min_max \
+  --act_bit 8 --input_algo min_max --num_samples 16 --group_size 128 \
+  --use_qwen3_style_rotary --input_dir /temp/work/calib_npz --force_regen all
+```
+
+4. **Kirin9030 离线 OMC 编译**（必须 `TARGET_MODEL_TYPE=omc` + `LOAD_ASCENDC_ENV=auto`）：
+
+```bash
+PLATFORM=kirin9030 TARGET_MODEL_TYPE=omc USE_COMPRESS_CONF=true LOAD_ASCENDC_ENV=auto \
+OMG_TOOL=$DDK_PATH/tools/tools_omg/omg OMG_MASTER_DIR=$DDK_PATH/tools/tools_omg/master \
+ASCENDC_ENV_SCRIPT=$DDK_PATH/tools/tools_ascendc/set_ascendc_env.sh \
+bash run_visual_plugin_matmul_omc.sh /temp/work/model_omc/chunk0_kirin9030 fp16
+```
+
+实测 6 个 chunk 全部通过判据：`partition type NPU:1, CPU:0`、`SaveCompiledModelToFile SUCCESS`、`OMG generate offline model success`、`QuantBatchMatmulV3` 出现（≈271 次/chunk），无 `CPU fallback`。产物 **50MB/chunk**（`.omc`）。
+
+5. **导出完整 MNN 模型**（VIT 6 chunk 全 NPU + LLM GPTQ 8bit CPU）：
+
+```bash
+cd transformers/llm/export
+python llmexport.py \
+  --path /temp/models/mobi0402_2B_halfimage_rl \
+  --export mnn \
+  --gptq_path /temp/models/autoround_export/mobi0402_2B_halfimage_rl-w8g128/ \
+  --visual_gptq_path /temp/models/autoround_export/mobi0402_2B_halfimage_rl-w8g128/ \
+  --quant_bit 8 --quant_block 128 --visual_quant_bit 8 --visual_quant_block 128 \
+  --lm_quant_bit 16 --seperate_embed \
+  --visual_split --visual_npu_chunks 6 \
+  --visual_chunk_backends "npu,npu,npu,npu,npu,npu" \
+  --mnnconvert /temp/work/build-host-converter/MNNConvert \
+  --dst_path /temp/work/mnn_export
+```
+
+实测 33 文件 / 4.7GB / 0 error；日志含 `Visual GPTQ: replaced 24/24 block weights`（6 chunk 各一次）与 `apply gptq to`（394 次，LLM 侧）。
+
+6. **组装交付目录**：把 `mnn_export/` 的全部文件（含 `llm_config.json`、`*.mnn.json`）复制到
+   `/temp/models/mnn_mobi_2B_w8a8_visual_npu_kirin9030/`，并把 6 个 OMC 产物按 app 侧约定
+   命名为 `om/visual_blocks_npu_<i>.om`；config 中设 `npu_model_dir: "om"` 与
+   `visual_blocks_offline_om: ["om/visual_blocks_npu_<i>.om", ...]`（全部 `npu`）。
+
+**易踩的坑**（本次实际遇到）：
+
+- `llm_config.json` **必须**随模型一起拷贝，缺它会报 `tensor [deepstack_embeds] is input but not found` / `Create module error`，看起来像 deepstack 不匹配，实际只是缺文件。
+- 用 symlink 建测试目录后在 symlink 上 `json.dump` 会**穿透改写源文件**；测试 config 要用真实文件。
+- `visual_blocks_om_paths` 只存在于文档，**引擎不读该键**；OM 路径由 app 侧 `setNpuChunkExecutor` 注入（见 `omni.hpp:180`），app 按 `visual_blocks_offline_om` / `npu_model_dir` 解析（`mobiinfra-oh/entry/src/main/cpp/napi_init.cpp`）。
+- host 上无 hiai NPU，验证时把 `visual_blocks_chunk_backends` 全置 `cpu` 才能跑通视觉前向。
+
 
 
 ##环境配置
