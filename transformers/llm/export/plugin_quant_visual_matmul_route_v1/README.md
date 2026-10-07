@@ -1017,15 +1017,23 @@ done
 - `weight.bit=4`
 - `weight.group_size=128`
 - `input.bit=16`
+- `input.unsigned_quant=false`
 
 默认**不会**加入 `output` 配置，因此不会影响当前已经验证通过的 `kirinx90` 路线。
 默认也**不会**加入以下可选字段，只有你显式传参时才会写进 `dopt_config`：
 
 - `weight.weight_algo`
 - `input.input_algo`
-- `input.unsigned_quant`
 
-默认会生成 `weight.group_size`；如果你显式传 `--omit_group_size`，脚本就不会在 `dopt_config` 中写入这一项。
+`weight.group_size` 只在 W4 时生成；W8 自动省略，即使传了 `--group_size`。W4 仍可用 `--omit_group_size` 省略。
+激活方式始终显式写入：A8 默认 `input.unsigned_quant=true`，保持 DOPT PTQ 的 U8S8 默认行为；A16 默认为 false。
+可用互斥的 `--input_unsigned_quant` / `--input_signed_quant` 覆盖。切换方式后须重新执行 `prepare` 和 `calibrate`，或执行 `all`；旧 checkpoint 的量化状态会覆盖新配置，不能仅在 `export-onnx` 时切换。
+
+`config_summary.json` 记录实际写入的配置，`calibration_report.json` 从校准 checkpoint 记录每层的位宽、激活符号及权重 scale 形状。`export_report.json` 优先使用这份校准记录；旧产物缺少该记录时使用配置，省略的 `unsigned_quant` 标为 null，避免把 SDK 默认值误报为 false。`quant_param_2` 保留官方插件示例的 false，目前未获得 Kirin9030 的明确平台映射依据。
+
+这些修改纠正配置及报告，尚未证明修复 Kirin9030 真机精度问题。原始 6 份参数在删除 W8 的 `group_size` 后仍可逐字节复现，参数配对核验及真机对照见 [W8A8 排查记录](../../../../docs/inference/w8a8-probe.md)。配置依据：[华为插件式量化说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/cannkit-plug-in-quantification)。
+
+W8A8 加显式输出 INT16 的完整候选经用户真机测试仍不对齐，现已暂停精度调优并移除一次性实验脚本。保留的配置与报告修正不代表精度故障已修复；历史证据与候选结果见上述排查记录。输出量化默认仍关闭。
 
 ```bash
 python visual_plugin_quant_matmul_route.py \
@@ -1045,6 +1053,7 @@ python visual_plugin_quant_matmul_route.py \
 - `--weight_algo`
 - `--input_algo`
 - `--input_unsigned_quant`
+- `--input_signed_quant`
 
 例如改成 `W4 + group64 + A16`：
 
@@ -1096,8 +1105,8 @@ python visual_plugin_quant_matmul_route.py \
   prepare
 ```
 
-如果你不传 `--weight_algo`、`--input_algo` 或 `--input_unsigned_quant`，脚本不会在 `dopt_config` 中生成这些字段。
-如果你传了 `--omit_group_size`，脚本也不会生成 `weight.group_size`；不传时仍按默认值写入。
+如果不传 `--weight_algo` 或 `--input_algo`，脚本不会生成这两个字段；`input.unsigned_quant` 始终按上述规则显式生成。
+`--omit_group_size` 用于省略 W4 的 `weight.group_size`；W8 始终省略。
 
 如果你要尝试 `kirin9020`，可以在 `prepare` 或 `all` 时额外打开文档里提到的 `output` 配置：
 

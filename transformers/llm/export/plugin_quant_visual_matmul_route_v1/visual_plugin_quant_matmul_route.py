@@ -745,7 +745,7 @@ def patch_quant_config(
     weight_algo: str | None,
     act_bit: int,
     input_algo: str | None,
-    unsigned_quant: bool,
+    unsigned_quant: bool | None,
     enable_output_quant: bool,
     output_bit: int,
     output_per_channel: bool,
@@ -753,6 +753,11 @@ def patch_quant_config(
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+    # DOPT documents group_size only for W4. Keep the existing U8S8 PTQ
+    # default explicit, and retain signed activations for the A16 route.
+    emit_group_size = emit_group_size and weight_bit == 4
+    if unsigned_quant is None:
+        unsigned_quant = act_bit == 8
     layer_strategy = cfg.get("layer_strategy", {})
     patched = []
     skipped = []
@@ -777,8 +782,7 @@ def patch_quant_config(
         }
         if input_algo:
             layer["input"]["input_algo"] = input_algo
-        if unsigned_quant:
-            layer["input"]["unsigned_quant"] = True
+        layer["input"]["unsigned_quant"] = unsigned_quant
         if enable_output_quant:
             layer["output"] = {
                 "bit": output_bit,
@@ -807,6 +811,45 @@ def patch_quant_config(
         "output_per_channel": output_per_channel if enable_output_quant else None,
         "output_input_algo": output_input_algo if enable_output_quant else None,
     }
+
+
+def quantization_report(config_path, state_dict=None):
+    with open(config_path, "r", encoding="utf-8") as f:
+        strategies = json.load(f)["layer_strategy"]
+    layers = {}
+    for name, layer in strategies.items():
+        if layer.get("quant_strategy", "float") == "float":
+            continue
+        if "weight" not in layer or "input" not in layer:
+            continue
+        weight = layer["weight"]
+        activation = layer["input"]
+        settings = {
+            "weight_bit": weight["bit"],
+            "act_bit": activation["bit"],
+            # An omitted legacy field means SDK default, not signed=False.
+            "input_unsigned_quant": activation.get("unsigned_quant"),
+            "group_size": weight.get("group_size") if weight["bit"] == 4 else None,
+        }
+        if state_dict is not None:
+            prefix = name + ".quant_op."
+            settings["weight_bit"] = int(state_dict[prefix + "weight_quantizer.bit"].item())
+            settings["act_bit"] = int(state_dict[prefix + "input_quantizer.bit"].item())
+            settings["input_unsigned_quant"] = bool(
+                state_dict[prefix + "input_quantizer.unsigned_quant"].item()
+            )
+            settings["weight_scale_shape"] = list(state_dict[prefix + "weight_quantizer.s"].shape)
+        layers[name] = settings
+    keys = ("weight_bit", "act_bit", "input_unsigned_quant", "group_size")
+    summary = {}
+    for key in keys:
+        values = {settings[key] for settings in layers.values()}
+        summary[key] = next(iter(values)) if len(values) == 1 else None
+    summary["quantization"] = {
+        "source": "calibrated_checkpoint" if state_dict is not None else "dopt_config",
+        "layers": layers,
+    }
+    return summary
 
 
 def load_calibration_samples(
@@ -981,7 +1024,10 @@ def calibrate_and_export_quant(args):
             print(f"calibrated sample {idx}: {manifest[idx]['file']}")
     set_calibrate_state(qmodel, False)
     state_path = calibrated_state_path(args.route_dir, args.chunk_index)
-    torch.save(qmodel.state_dict(), state_path)
+    state = qmodel.state_dict()
+    settings = quantization_report(cfg_path, state)
+    torch.save(state, state_path)
+    del state
     set_quant_state(qmodel, weight_state=True, input_state=True)
     generate_quant_params(
         qmodel,
@@ -995,10 +1041,9 @@ def calibrate_and_export_quant(args):
         "quant_params_file": quant_params_path(args.route_dir),
         "num_samples": len(samples),
         "samples": manifest,
-        "act_bit": args.act_bit,
-        "input_unsigned_quant": args.input_unsigned_quant,
-        "weight_bit": args.weight_bit,
-        "group_size": args.group_size,
+        "quant_param_2": False,
+        "embedding_separate": False,
+        **settings,
         **meta,
     }
     report_path = os.path.join(args.route_dir, "quant_output", "calibration_report.json")
@@ -1019,7 +1064,24 @@ def export_chunk_onnx(args, sample, state, weight_source):
     )
     missing = []
     unexpected = []
+    settings = {
+        "act_bit": args.act_bit,
+        "input_unsigned_quant": (
+            args.input_unsigned_quant if args.input_unsigned_quant is not None else False
+        ),
+        "weight_bit": args.weight_bit,
+        "group_size": args.group_size,
+    }
     if state is not None:
+        settings = quantization_report(config_path(args.route_dir, args.chunk_index))
+        calibration_report_path = os.path.join(args.route_dir, "quant_output", "calibration_report.json")
+        if os.path.exists(calibration_report_path):
+            with open(calibration_report_path, "r", encoding="utf-8") as f:
+                calibration_report = json.load(f)
+            if calibration_report.get("quantization", {}).get("source") == "calibrated_checkpoint":
+                settings = {key: calibration_report[key] for key in settings}
+                settings["quant_param_2"] = calibration_report["quant_param_2"]
+                settings["embedding_separate"] = calibration_report["embedding_separate"]
         state = remap_fake_quant_state_for_export(state)
         missing, unexpected = chunk.load_state_dict(state, strict=False)
     onnx_path = os.path.join(args.route_dir, "onnx", f"visual_blocks_npu_{args.chunk_index}.onnx")
@@ -1060,10 +1122,7 @@ def export_chunk_onnx(args, sample, state, weight_source):
         "output_names": out_names,
         "weight_source": weight_source,
         "calibration_used": state is not None,
-        "act_bit": args.act_bit,
-        "input_unsigned_quant": args.input_unsigned_quant,
-        "weight_bit": args.weight_bit,
-        "group_size": args.group_size,
+        **settings,
         **meta,
     }
     report_path = os.path.join(args.route_dir, "onnx", "export_report.json")
@@ -1150,11 +1209,11 @@ def build_parser():
     parser.add_argument("--force_regen", action="store_true", help="Regenerate quant config")
     parser.add_argument("--quant_strategy", default="Quant_act_weight_eco", help="Plugin-quant strategy")
     parser.add_argument("--weight_bit", type=int, default=4, help="Weight bit width")
-    parser.add_argument("--group_size", type=int, default=128, help="Weight group size")
+    parser.add_argument("--group_size", type=int, default=128, help="W4 weight group size; omitted for W8")
     parser.add_argument(
         "--omit_group_size",
         action="store_true",
-        help="Omit weight.group_size from dopt_config; default behavior still writes it",
+        help="Omit weight.group_size for W4; W8 always omits it",
     )
     parser.add_argument(
         "--weight_algo",
@@ -1184,10 +1243,19 @@ def build_parser():
         default="min_max",
         help="Output quant input_algo when output quant is enabled",
     )
-    parser.add_argument(
+    activation_mode = parser.add_mutually_exclusive_group()
+    activation_mode.add_argument(
         "--input_unsigned_quant",
         action="store_true",
-        help="Use unsigned activation quantization; default is signed for A16 experiments",
+        default=None,
+        help="Use unsigned activation quantization; default for A8",
+    )
+    activation_mode.add_argument(
+        "--input_signed_quant",
+        dest="input_unsigned_quant",
+        action="store_false",
+        default=None,
+        help="Use symmetric signed activation quantization; default for A16",
     )
     parser.add_argument(
         "--use_qwen3_style_rotary",

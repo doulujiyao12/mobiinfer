@@ -12,3 +12,5 @@ model*
 #   calib_npz/       generate_npz_calib.py 输出的 fp16 npz
 calib_dump_raw/
 calib_npz/
+# Temporary SDK compiler process metadata
+kernel_meta_temp_*/
