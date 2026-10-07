@@ -239,6 +239,39 @@ bash transformers/llm/export/plugin_quant_visual_matmul_route_v1/run_visual_plug
 
 成功判据与通用要求相同（`partition type NPU:1, CPU:0` / `SaveCompiledModelToFile SUCCESS` / `OMG generate offline model success`），并确认 `QuantBatchMatmulV3` 量化 matmul 出现在日志中（否则可能是静默回退 FP16）。已用真实校准输入（608 token、W8A8 act_bit=8）编译 6 个 visual chunk，产物约 52MB/chunk，比 FP16 非压缩（49MB）略大，比 Kirin9020 W8A8（98MB）小。Kirin9030 W8A8 路径仍须加载 AscendC 环境，不能像 Kirin9020 那样省略。
 
+> ⚠️ **真机结论修正（2026-10）：visual chunk 的离线 OM 不要用 `compress_conf`（W8A8 激活量化），改用纯 FP16。**
+>
+> 症状：W8A8 `compress_conf` 编译出的 6 个 `.om` 在真机上**编译与执行都成功**（`RunSync` 全部返回成功、输入元素数匹配、无 NaN/Inf、无 CPU fallback），但**激活数值完全错误**——chunk0 输入正确（absmax≈32.65，与校准 32.28~33.13 吻合），而 chunk0 输出（=chunk1 输入）absmax 达到 **152.75**，校准数据同位置只有 **18.89~24.02**（约 7.5 倍）。表现为回答与图片无关、换图后回答仍相似。
+>
+> 定位证据：
+> 1. **受控对照**：旧仓库（真机验证离线 OM 正常）用 `FP16 + compression:none`；出问题的版本**唯一差异**就是加了 `compress_conf`。而"在线 OM 正常、离线 OM 错误"的分界也正好是 `compress_conf`（在线编译不经过 DOPT 激活量化）。
+> 2. **ONNX 无罪**：同一份固定输入下，用于编译的 ONNX（onnxruntime 执行）与 torch 参考前向一致 —— chunk0 输出 absmax 均为 17.28，cos=0.99977（残差仅 fp16 舍入）。6 个 chunk × 4 张图全部 cos=1.0000。所以**偏差不是导出造成的，而是在 OMG 编译/OM 执行环节**。
+> 3. **可疑日志**：`compress_conf` 路径每个 chunk 稳定产生 96 条 `quantize_cfg_parser.cpp GenerateIntArrayConfig(95)::"can't find key [shape]"`（无 `compress_conf` 时为 0）。这 96 条 = 24 层 × 4，正对应被激活量化的 24 个 Linear——即 OMG 解析 DOPT 生成的 `quant_params_file` 时未能完整匹配配置。
+> 4. **体积旁证**：真机可用的旧 `.om` 为 101.8 MB/chunk，本次 FP16 重编为 101.8 MB/chunk（相差 <0.01%），而 W8A8 版只有 52.1 MB。
+>
+> 修复：**离线 OM 一律走 FP16**，且按 CLAUDE.md 的要求**直接从原始 HuggingFace 浮点权重导出**（`export-fp16`，不经 DOPT `fake_quant_weight`），OMG 侧 `USE_COMPRESS_CONF=false`。`.mnn`（int8 GPTQ）保持不变，因为它服务于 CPU 与在线 OM 路径，两者本来就正常。
+>
+> 注意：本仓库 README 里"W8/A16 + 真实校准 cos>0.9997"的结论是在 **host 上用 MNN/eval 脚本**测的，**没有覆盖 OMG `compress_conf` 的真机行为**——host 侧 `eval_chunk_quant.py` 不经过 OMG，因此无法暴露这个问题。这类"host 全绿、真机错"的差异，必须靠真机 `RunSync` 后的激活量级来判断。
+>
+> **补充排查（2026-10 第二轮，证据更完整）**：为什么"量化了也不该图文无关"——量化误差是**有界**的，不可能把 chunk0 输出从 ~20 放大到 152.75（7.5×），所以只能是**量化参数被错误套用**，而非单纯的精度损失。逐条证据：
+>
+> 1. **W8A8 从来不是 Kirin9030 的验证配置**。仓库里所有 W8A8 脚本与 README 冒烟测试都写死 `PLATFORM=kirin9020`：
+>    `run_real_calib_256_W8A8.sh`、`run_all_chunks_real_calib_W8A8.sh`、README「单 chunk 手动跑」示例。
+>    且 `docs/change-summary-20260815.md` §9.3 早已明确标注该矛盾：
+>    「`run_all_chunks_real_calib_W8A8.sh` 的 `PLATFORM=kirin9030`：该脚本走 DOPT W8A8 + compress_conf 路径，与 Kirin9030 的 FP16 OMC 策略**矛盾**……否则需要确认。」——这条从未被解决。
+> 2. **`act_bit=16` + compress_conf 在 Kirin9030 上根本编不出来**（实测）：`QuantizeOptimizer Fail!` / `anchor_utils.cpp ... The input data anchor is invalid`，无产物。
+>    也就是说，README 里"已验证"的 `A16 + unsigned` 口径在 9030 上不可用；能在 9030 编出来的**只有 `act_bit=8`**，而它从未被真机验证过。
+> 3. **96 条 `can't find key [shape]` = 24 层 × 4 字段**（chunk0/1/5 一致，无 compress_conf 时为 0）。对应 OMG `quantize_cfg_parser.cpp GenerateIntArrayConfig` 未能完整吃到 DOPT 的 `quant_params_file`。试过 `quant_param_2=True`、给 ONNX 补 `shape_inference`（value_info 0→299）、`--fp16` 改权重 dtype，**96 条均不减少**——说明是 OMG 侧解析不匹配，不是我们漏了哪一项元数据。
+> 4. **host 侧模拟（torch 注入 DOPT 记录的真实参数）**：
+>    - 正确套用 → chunk0 输出 absmax 20.13、跨图 cos **0.756**（能区分图片，符合预期）
+>    - 退化为固定范围（如 [0,1] / [-1,1]）→ 跨图 cos **0.9987 / 0.9996**（**图文无关**，与真机症状同类）
+>    - 其他错误模式（漏减 offset、当有符号、直接用整数）→ 放大到 1304 / 4919 / 44235，量级远超真机
+>    结论：真机症状属于「参数被错用/退化为固定范围」这一类，而非「参数正确但精度不够」。
+> 5. `group_size` 实测**不生效**：`--group_size 128` 与 `--group_size 0` 产出的 `quant_params_file` 字节完全相同（md5 一致）；设 `custom_group_size` 环境变量（官方 `opt_main.py` 的做法）也不改变 `weight_quantizer.s` 粒度（始终 = out_channels，per-channel）。即 `dopt_config` 里写的 `group_size: 128` 没有传到 DOPT。**注意**：per-channel 比 per-group 更细，这条本身不会导致图文无关，不构成根因，但说明「配置写了不等于生效」，不宜再据此推断。
+>
+> **结论**：Kirin9030 上 `compress_conf` 离线路径属于**未验证组合**，OMG 对 DOPT 量化参数的消费与预期不符，且缺少可用的真机迭代条件。**不要在 9030 上用 W8A8 `compress_conf` 生成视觉 chunk 的离线 OM**；FP16 是当前唯一经真机验证可用的配置。若将来仍要启用 W8A8，需要：在设备侧逐 chunk 比对 OM 与 MNN 的 hidden 输出、确认 OMG 是否真的套用了激活 scale（96 条警告是直接信号），并在拿到可用的官方参考 `compress_conf` 后才能判断是 OMG 版本问题还是参数格式问题。
+
+
 ### 平台差异：Kirin9020 OMC 注意事项
 
 Kirin9020 的 OMC 编译路径与 Kirin9030 有以下关键差异：
@@ -327,6 +360,26 @@ grep -cF "$(pwd)/calib_images" image_prompt.txt   # 期望 256
 
 > 该脚本**不使用任何 GPTQ/autoround 量化权重**，只用 fp 权重做前向。量化由下游 `visual_plugin_quant_matmul_route.py` 用 DOPT 完成（见 9030 OMC manifest 的 `"weight_source": "dopt_fake_quant"`）。脚本里曾有的 `--gptq_path` 参数实为死参数（`utils/model.py` 与 `utils/vision.py` 均不消费 `gptq`），已移除。
 
+> ⚠️ **必须复刻 `visual_pre.mnn`，不能只做 `patch_embed`**（2026-10 修复的严重 bug）：
+> `visual_pre.mnn` 的 `hidden_states` 输出是 **`patch_embed + pos_embeds`**（见 `llmexport.py::_build_visual_split_wrappers._VisualPre`，
+> 以及 HF `Qwen3Vision.forward` 里的 `pos_embeds = pos_embed(idx)*w; hidden += sum(pos_embeds)`），
+> 它同时是 chunk0 的输入。脚本若只写 `patch_embed` 就会漏掉 `pos_embeds`。
+>
+> 实测（同一张图、hw=600,270）：
+>
+> | 计算 | absmax |
+> |---|---|
+> | 仅 `patch_embed`（bug 版） | 5.747 |
+> | `patch_embed + pos_embeds`（真值） | **32.618** |
+>
+> 漏项使 chunk0 输入被低估约 5.7 倍 → `min_max` 的 A8 scale 偏小 → 真机激活被 clip，精度下降。
+> 且误差会经 chunk0 传播到后续 chunk。**该 bug 不报错**，OMC 照样编译成功，只能靠数值比对发现。
+>
+> 修复要点（`generate_npz_calib.py`）：`patch_embed` 前先 `view(N, -1)`，再按 `get_idx_weight(grid_thw)` 加 `pos_embeds`。
+> 验证方法：新产出的 chunk0 `hidden_states_in` absmax 应≈**32.6**（旧 bug 版≈5.7）；
+> 且 chunk1 的 absmax 均值应≈**17.3**，与设备端日志记录的 `hidden absmax=17.4068` 吻合，可作为独立交叉验证。
+> 该修复亦说明：**两条路径产出的 npz"格式一致"不代表"数值等价"**，见下。
+
 **`--hw` 尺寸覆盖（与 prompt 的 `<hw>` 标签语义一致）**
 
 引擎侧 `qwen2VisionProcess`（`omni.cpp:982`）的处理是「先把尺寸置为 `<hw>` 的值，再交给 `smartResize` 规整」。脚本的 `--hw` 复刻了同一顺序，故两者结果严格一致：
@@ -370,6 +423,9 @@ python3 generate_npz_calib.py \
 | 样本选取 | `sorted(files)[:num_samples]`（**非随机**，与 `select_images.py` 的 `rng.sample(seed=42)` 不同） |
 
 > 注意：两条路径选取的图片子集**不同**（路径 A 的 256 张与路径 B 的 `sorted[:256]` 仅约 126 张重叠）。二者产出的 npz **格式与 shape 完全一致**，可直接用于量化；但若要求与既有 `calib_inputs_256/` 逐样本对齐，需以路径 A 为准，或让脚本改用相同的采样方式。
+>
+> **"格式一致" ≠ "数值等价"**：路径 A（`llm_demo` dump）dump 的是引擎里 chunk 的实际输入 `preOut[0]`（含 `pos_embeds`）；路径 B 是纯 Python 复刻，必须自己把 `pos_embeds` 补上（见上方 ⚠️）。历史上正是因为只对比了 shape/dtype 就认定两者等价，才漏掉了 `pos_embeds`。
+> **切换路径或修改任一路径的前向后，务必做数值交叉验证**（例如比对 chunk1 的 absmax 是否≈17.3，对齐设备日志），不要只比 shape。
 
 **模型权重是外部依赖**：`--model_path`（HF fp 权重）不随仓库备份，可用环境变量覆盖默认值：
 
@@ -455,10 +511,24 @@ python llmexport.py \
 
 **易踩的坑**（本次实际遇到）：
 
+- **`visual_blocks_om_deepstack_dup` 漏配会导致真机闪退**（2026-10 修复）：某个 chunk 的 deepstack 层若正好是该 chunk 的**最后一层**，其 deepstack 输出与 `hidden_states` 是同一个张量。ONNX 导出时用 `Identity` 给 deepstack 命名，而 OMG 会把这个冗余 `Identity` 删掉（编译日志：`onnx_pre_checker.cpp ... "the node Identity dont have output tensor"`），于是该 chunk 的 `.om` **只返回 1 个输出**（其他 deepstack chunk 返回 2 个）。
+  - 本模型 24 blocks / 6 chunks = 每 chunk 4 层，`deepstack_visual_indexes=[5,11,17]`；chunk2 覆盖 `[8..11]`，**index 11 恰为其末层** → **只有 chunk2 需要 dup**（chunk1 的 5、chunk4 的 17 都不是各自末层）。
+  - 漏配的后果：`allDeepstack` 少一路 → `visual_post` 收到 3 个输入而非期望的 4 个 → `MNN_ASSERT` 在 release 下是**空宏**（`MNNDefine.h:52`），拦不住 → 越界 → **App 闪退，ArkTS `try/catch` 接不住**。
+  - 修复：config.json 补 `"visual_blocks_om_deepstack_dup": [2]`。该字段的取值**只取决于 chunk 划分与 deepstack 索引，与校准来源无关**，两套校准（torch/engine）都需要。
+  - 判定方法：看各 chunk ONNX 里 deepstack 输出来自 `Add`（独立）还是 `Identity(输入=hidden_states)`（合并）。可脚本化检测：遍历 graph.output，若 deepstack 的名字由 `Identity` 产生且其输入 == hidden_states 输出名，则该 chunk 需要 dup。
+  - 安全性质：引擎侧触发条件是 `mOmDeepstackDupIndices.count(i) && omOutputs.size() <= 1`，所以**即使误配也不会重复补**（OM 返回 2 个输出时自动跳过）。
 - `llm_config.json` **必须**随模型一起拷贝，缺它会报 `tensor [deepstack_embeds] is input but not found` / `Create module error`，看起来像 deepstack 不匹配，实际只是缺文件。
 - 用 symlink 建测试目录后在 symlink 上 `json.dump` 会**穿透改写源文件**；测试 config 要用真实文件。
 - `visual_blocks_om_paths` 只存在于文档，**引擎不读该键**；OM 路径由 app 侧 `setNpuChunkExecutor` 注入（见 `omni.hpp:180`），app 按 `visual_blocks_offline_om` / `npu_model_dir` 解析（`mobiinfra-oh/entry/src/main/cpp/napi_init.cpp`）。
-- host 上无 hiai NPU，验证时把 `visual_blocks_chunk_backends` 全置 `cpu` 才能跑通视觉前向。
+- host 上无 hiai NPU，验证时把 `visual_blocks_chunk_backends` 全置 `cpu` 才能跑通视觉前向。**注意：全 CPU 路径走 MNN module，chunk2 的 2 个输出会被保留，因此 host 不会暴露这个 dup 问题——只有真机 OM 路径才会。**
+
+**引擎侧加固**（与本问题配套，`omni.cpp` / `PipelineModule.cpp`）：
+
+- `omni.cpp::qwen2VisionProcess`：调用 `visual_post` 前校验 `blocksOut.size() == postInfo->inputNames.size()`，不匹配则 `MNN_ERROR` 并返回空，避免越界。
+- `omni.cpp::qwen2VisionProcess`：`outputs` 为空时提前返回，避免 `outputs[0]` 越界。
+- `PipelineModule::onForward`：`mInputSize != inputs.size()` 时打印明确错误并返回空（原先只有 `MNN_ASSERT`，release 下是空操作）；并给 submodule 的输入/输出 stack 索引加范围检查。
+- 验证方式：故意构造会少一路 deepstack 的 config，旧二进制越界崩溃，新二进制打印 `visual_post input count mismatch: got 3, expected 4` 并优雅退出（exit 0）。
+
 
 
 

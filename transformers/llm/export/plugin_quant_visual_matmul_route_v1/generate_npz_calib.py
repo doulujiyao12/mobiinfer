@@ -177,7 +177,7 @@ def generate_npz(args):
         pil_image = Image.open(img_path).convert("RGB")
 
         # 使用模型内置的 img_process 做预处理 + patch_reshape + 位置编码 + attention_mask
-        # 但我们只取到 patch_embed 之后的 hidden_states
+        # 目标是复刻 visual_pre.mnn 的输出（= chunk0 的真实输入）
         image_tensor = _preprocess_image(visual, pil_image, hw_override)
         flatten_patches, grid_thw = visual.vision_reshape(image_tensor)
         position_ids = visual.vision_position_ids(grid_thw)
@@ -185,7 +185,20 @@ def generate_npz(args):
         rotary_pos_emb = visual.rotary(position_ids)
 
         # patch_embed: [N_patches, hidden_size]
-        hidden_states = visual.patch_embed(flatten_patches)
+        # 注意: 必须与 Qwen3Vision.forward / _VisualPre 完全一致 ——
+        # visual_pre.mnn 的输出是 `patch_embed + pos_embeds` 之和，不是单独的
+        # patch_embed。漏掉 pos_embeds 会让 chunk0 输入系统性偏小
+        # （实测 absmax 5.75 vs 含 pos_embeds 的 32.62），A8 激活 scale 因此偏低，
+        # 真实推理时激活被 clip，精度下降。
+        patch_features = flatten_patches.view(flatten_patches.size(0), -1)
+        hidden_states = visual.patch_embed(patch_features)
+        has_pos_embed = hasattr(visual, "pos_embed") and visual.pos_embed is not None
+        if has_pos_embed:
+            idx_tensor, weight_tensor = visual.get_idx_weight(grid_thw)
+            pos_embeds = visual.pos_embed(idx_tensor) * weight_tensor.unsqueeze(2)
+            pos_embeds = torch.sum(pos_embeds, 0, False)
+            hidden_states = hidden_states + pos_embeds
+            print(f" pos_embeds_absmax={float(pos_embeds.abs().max()):.3f}", end="")
 
         # 获取序列长度 seq_len = grid_t * grid_h * grid_w
         gt, gh, gw = grid_thw[0].tolist()

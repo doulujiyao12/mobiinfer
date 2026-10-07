@@ -220,7 +220,16 @@ std::vector<VARP> PipelineModule::onForward(const std::vector<VARP>& inputs) {
     for (int i = 0; i < mInitVars.size(); ++i) {
         mStack[i + mInputSize] = mInitVars[i];
     }
-    MNN_ASSERT(mInputSize == inputs.size());
+    // MNN_ASSERT is a no-op unless DEBUG is defined (see MNNDefine.h), so a
+    // module invoked with the wrong number of inputs would otherwise index past
+    // the end of mStack below. Report the mismatch and fail the forward instead
+    // of crashing the process: this typically means the caller assembled its
+    // input list from a model config that does not match the compiled graph.
+    if (mInputSize != (int)inputs.size()) {
+        MNN_ERROR("PipelineModule: input count mismatch, expected %d but got %d\n",
+                  mInputSize, (int)inputs.size());
+        return {};
+    }
     for (int i = 0; i < mInputSize; ++i) {
         mStack[i] = inputs[i];
     }
@@ -229,6 +238,11 @@ std::vector<VARP> PipelineModule::onForward(const std::vector<VARP>& inputs) {
         std::vector<VARP> tempInputs(std::get<1>(m).size());
         for (int i = 0; i < tempInputs.size(); ++i) {
             auto stackInput = std::get<1>(m)[i];
+            if (stackInput < 0 || stackInput >= (int)mStack.size()) {
+                MNN_ERROR("PipelineModule: submodule input index %d out of range [0, %d)\n",
+                          stackInput, (int)mStack.size());
+                return {};
+            }
             tempInputs[i] = mStack[stackInput];
             MNN_ASSERT(nullptr != tempInputs[i]);
         }
@@ -238,7 +252,13 @@ std::vector<VARP> PipelineModule::onForward(const std::vector<VARP>& inputs) {
             return {};
         }
         for (int i = 0; i < tempOutputs.size(); ++i) {
-            mStack[std::get<2>(m)[i]] = tempOutputs[i];
+            auto outputIndex = std::get<2>(m)[i];
+            if (outputIndex < 0 || outputIndex >= (int)mStack.size()) {
+                MNN_ERROR("PipelineModule: submodule output index %d out of range [0, %d)\n",
+                          outputIndex, (int)mStack.size());
+                return {};
+            }
+            mStack[outputIndex] = tempOutputs[i];
             MNN_ASSERT(nullptr != tempOutputs[i]);
         }
     }

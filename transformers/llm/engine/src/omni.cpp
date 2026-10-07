@@ -1447,9 +1447,41 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
         } else {
             blocksOut = mVisionBlocksModule->onForward(blocksIn);
         }
+        // Guard the pre/post handoff: visual_post expects exactly
+        // 1 + num_deepstack inputs (hidden_states + one per deepstack layer).
+        // A short blocksOut means a chunk's deepstack output was lost, which
+        // happens when a chunk's last block is itself a deepstack layer: the
+        // ONNX exporter then emits the deepstack feature as an Identity of
+        // hidden_states, and OMG drops that Identity as redundant, so the
+        // compiled OM returns one output instead of two. The config key
+        // visual_blocks_om_deepstack_dup restores it; if it is missing (or the
+        // OM layout differs from what was assumed), fail loudly here instead of
+        // indexing past the end of blocksOut downstream.
+        {
+            const auto* postInfo = mVisionPostModule->getInfo();
+            if (postInfo != nullptr) {
+                const size_t expected = postInfo->inputNames.size();
+                if (expected > 0 && blocksOut.size() != expected) {
+                    MNN_ERROR(
+                        "[vision] visual_post input count mismatch: got %zu, expected %zu "
+                        "(hidden_states + %zu deepstack). Check that "
+                        "\"visual_blocks_om_deepstack_dup\" in config.json lists every NPU "
+                        "chunk whose last block is a deepstack layer.\n",
+                        blocksOut.size(), expected, expected - 1);
+                    return std::vector<int>(0);
+                }
+            }
+        }
         outputs = mVisionPostModule->onForward(blocksOut);
     } else {
         outputs = mVisionModule->onForward(moduleInputs);
+    }
+    // visual_post (or the monolithic visual module) failed and returned nothing.
+    // Bail out before dereferencing outputs[0]; downstream callers already treat an
+    // empty return from visionProcess as an error.
+    if (outputs.empty()) {
+        MNN_ERROR("[vision] visual post-processing produced no output\n");
+        return std::vector<int>(0);
     }
     auto imageEmbedding = outputs[0];
     if (outputs.size() == 2) {
