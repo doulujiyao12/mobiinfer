@@ -1,11 +1,11 @@
 # MobiMind 视觉 NPU（Kirin9030）构建与排查记录
 
-> 本文包含历史推断与实验记录，后续核验以 [W8A8 排查记录](w8a8-probe.md) 为准。输出 INT16 完整候选经用户真机测试仍不对齐，精度调优已暂停；早期按参数文件体积推断 per-group 的结论已撤回，见第 12 节。
+> 最新状态（2026-10-08）：ViT W4A16/group64 发布包获用户真机反馈，能够区分不同图片，暂按图文功能可用记录，详见第 13 节。原 W8A8 及新增输出 INT16 的 W8A8 候选仍未修复，相关调优暂停；其核验以 [W8A8 排查记录](w8a8-probe.md) 为准。早期按参数文件体积推断 per-group 的结论已撤回，见第 12 节。
 
 > 本文是**记录性文档**，归档历次构建的实测数据、失败排查与结论。
 > 可执行的流程指南见 `CLAUDE.md` 的「OMG/OMC 离线 NPU 图编译」章节。
 >
-> 阅读约定：**「已验证」= 有真机数据；「实测」= 本机（x86）可复现；「推断」= 仅有间接证据。**
+> 阅读约定：**「已验证」= 已收集真机数据；「用户真机初测」= 用户反馈，未收集详细日志或数值；「实测」= 本机（x86）可复现；「推断」= 仅有间接证据。**
 
 ---
 
@@ -14,13 +14,14 @@
 | 项 | 值 |
 |---|---|
 | 目标芯片 | Kirin9030 (V311) |
-| 离线 OM 精度 | **FP16，无 `compress_conf`** ← 唯一经真机验证可用 |
-| OM 体积 | 101.8 MB / chunk |
+| 离线 OM 精度 | **ViT W4A16/group64 + `compress_conf`：用户真机初测可用**；FP16 无 `compress_conf` 保留为浮点基线 |
+| OM 体积 | W4A16 约 31.99 MB / chunk；FP16 约 101.8 MB / chunk |
 | 视觉 chunk 数 | 6（全 NPU），24 blocks 均分，每 chunk 4 层 |
 | 输入 shape | `hidden_states_in:1,608,1024` / `rotary_pos_emb:2,608,1,64` / `attention_mask:1,608,608` |
 | `.mnn` 侧精度 | visual blocks 为 int8 GPTQ；LLM 为 GPTQ W8A8（CPU） |
 
 **不要**在 Kirin9030 上用 `compress_conf`（W8A8）生成视觉 chunk 的离线 OM —— 见 §2。
+该限制针对已失败的 W8A8 配置；已发布 W4A16 使用不同的位宽、分组和 UINT4/LUT 权重编码，见 §13。当前反馈不代表数值严格对齐或 W8A8 问题已修复。
 
 ---
 
@@ -141,7 +142,7 @@ E/AI_NPUCL: ascendc_store.cc CloneNodeEdge(23)::"node has no peerOutAnchor."
 
 ### 2.8 结论
 
-Kirin9030 上的 `compress_conf` 离线路径属于**未验证组合**：OMG 对 DOPT 量化参数的消费与预期不符，
+本模型在 Kirin9030 上的 W8A8 `compress_conf` 离线路径属于**未验证组合**：OMG 对 DOPT 量化参数的消费与预期不符，
 且缺少可用的真机迭代条件。**不要在 9030 上用 W8A8 `compress_conf` 生成视觉 chunk 的离线 OM。**
 
 若将来仍要启用 W8A8，需要补齐以下之一：
@@ -846,3 +847,60 @@ W8 的 `group_size` 属于配置约束问题，省略后原参数仍能逐字节
 2. 若拿不到，**在能跑通 W8A8 的环境里 dump 中间产物**：把 `generate_quant_params`
    的输入 state_dict 与输出的文件都保留，逐项对照
 3. 真机逐 chunk 比对 OM vs MNN-CPU 的 hidden 输出，定位到具体算子
+
+---
+
+## 13. ViT W4A16/group64 真机初测可用（2026-10-08）
+
+### 13.1 当前结论与证据来源
+
+用户下载本次 W4A16 完整模型并在手机运行后反馈：精度问题似乎没有之前严重，至少能够区分不同图片，暂认为能够正常运行。按用户此前允许数值误差、以图文相关性为主的验收标准，将这个**特定发布包**记录为“用户真机初测可用”。
+
+本次反馈未提供图片数量、具体图片与回答、固定输入 probe 输出或 NPU 日志。因此尚未得到 NPU 对同配置 CPU 量化参考的 cosine / relative L2，也未独立确认此次运行的六图加载和 fallback 统计；不能将该反馈写成严格数值对齐、完整准确率通过或根因已定位。原 W8A8 的故障结论保留。
+
+### 13.2 对应产物与量化配置
+
+ModelScope 完整模型包：[`fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64`](https://www.modelscope.cn/models/fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64)。发布时 31 个文件的远端大小和 SHA-256 已核对，六张离线图还通过公开下载链接重新下载核验。
+
+| 项目 | 本次配置 |
+|---|---|
+| 变更范围 | 仅六张 ViT block 离线图；LLM、视觉前后处理及 MNN block 文件保持原样 |
+| 工具链 | DDK-tools-next-6.1.1.0 / kirin9030-plugin-next-6.1.1.0 |
+| 策略 | `Quant_act_weight_eco` |
+| 权重 | W4、group64；`UINT4` 索引及 signed LUT `[-8,7]` |
+| 激活 | signed INT16 输入量化、逐通道 INT16 输出量化；A16 不表示始终以 FP16 计算 |
+| 校准 | 每段 192 份真实路径 A 输入，group MinMax 初始化 |
+| 权重优化 | 本机没有 CUDA，未执行完整 GPTQ/QAT 三段式权重优化 |
+| 序列化 | `quant_param_2=True`，重导配套 ONNX 后传入 `compress_conf` |
+| 编译 | `--target=omc --platform=kirin9030`，六段均为 `NPU:1, CPU:0` |
+| 编译算子 | 每段 24 个 `QuantBatchMatmulV3`、16 个 `StaticQuant`、8 个 attention `BatchMatMulV2` |
+| 图大小 | 每段约 31.99 MB，完整运行包约 3.23 GiB |
+| 运行配置 | 固定 seq_len=608，`visual_blocks_om_deepstack_dup=[2]`，App 离线 NPU 图模式 |
+
+配置参考华为[三段式量化说明](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/cannkit-llm-three-stage-quantification)及[量化效果评估](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/cannkit-llm-quantization-effect-evaluation)。这是官方插件配置的隔离验证，不代表完整复现 CUDA 三段式优化。
+
+### 13.3 UINT4/LUT 与 ONNX 必须配套
+
+旧 `quant_param_2=False` 分支生成 INT4，当前 Kirin9030 编译器拒绝该组合；SDK 的 True 分支生成 UINT4/LUT。此时同名 `fake_quant_weight.pth` 中被使用的 Linear 权重是浮点类型保存的整数索引 `0..15`，并非可直接前向的反量化权重。
+
+必须先用 LUT 和 group scale 解码核对权重，再将**索引权重**重导到配套 ONNX，传入对应 `quant_params_file`。本次六段全部 24 个 Linear 的 LUT 解码值与原 W4 CPU fake-quant 权重逐值一致；ONNX MatMul initializer 也与配套索引 checkpoint 的转置逐值一致。只换量化参数文件、沿用旧浮点权重 ONNX 会破坏配对。
+
+最终 ONNX initializer 保留 FLOAT32 索引。提前改成 FLOAT16 会被本次 W4 压缩前处理拒绝；OMG 的 `--weight_data_type=FP16` 不代表 `compress_conf` 下的实际权重变成 FP16。此次 `.om` 文件沿用 App 命名，内容实际为 OMC。
+
+这些检查确认本次权重编码配对正确；由于 W4A16 同时改变策略、位宽、分组及编码，不能仅据其真机可用就断定旧 W8A8 故障由哪一项引起。
+
+### 13.4 电脑端精度结论仍保留
+
+八张留出截图的最终视觉特征相对原始浮点参考：cosine 为 **0.860–0.918**，relative L2 为 **39.9%–52.1%**。另测一张猫照片，cosine 为 **0.853**，relative L2 为 **60.0%**。主要误差来自 W4 权重量化；增加 A16 输入/输出量化相对 W4 仅权重量化参考的截图 relative L2 中位数为 **1.37%**、最大为 **16.82%**。
+
+相同浮点 HF LLM 的 CPU 解码测试中，三张界面截图及一张猫照片的 W4A16 回答前缀均与图片相关；部分回答在 80 tokens 截断。这是小样本图文检查，不等同于手机上的 W8 LLM，也不是完整准确率基准。
+
+此前 W8A8 加 INT16 输出候选也测过 CPU relative L2。在共同样本 0、1 的各段独立输入记录中，W4A16 有两段误差更小、四段更大；校准配置和参考前向并非完全统一，不能据此做严格性能排名，但已有结果不支持“W4A16 整体精度优于 W8A8”。此次真机反馈改变的是本发布包的图文可用状态，没有改变上述数值结论。
+
+### 13.5 使用与后续复核
+
+现有 App 不需要更新或重新安装。先清空旧的 ModelScope 仓库输入框，填写上述仓库，正常下载后选中新模型，切换“离线 NPU 图”并重新加载；不要用旧 MNN block 的 CPU 路径评估本次离线图。
+
+后续如收集运行日志，仍应检查 `NPU_ACTIVE`、`graph_ready=6`、`cpu_fallback=0`、`npu_error=0`。这些是待核验项，不是此次用户反馈中已提供的日志证据。固定输入 probe 的严格诊断阈值不替代用户的图文验收标准。
+
+上述发布包的隔离构建与主机报告位于 `/tmp/vit_w4a16_g64_official/`，发布文件及哈希审计位于 `/tmp/w4a16_modelscope_publish/`；临时目录仅作本次追溯，长期产物以上述 ModelScope 仓库为准。后续已将配套 UINT4/LUT 导出接入正式入口，并新增 [`build_kirin_offline.py`](../../transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py) 覆盖完整流程，使用方法见 [README §2.6](../../README.md#26-kirin9030-完整离线编译vit-w4a16--llm-cpu)。新入口生成的包仍需独立真机验证；手机 App 未修改。

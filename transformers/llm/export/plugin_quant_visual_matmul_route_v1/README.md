@@ -10,9 +10,19 @@
 - 再用 `FLinearMatmul` 风格导出，让 `q/k/v/o_proj` 和 `linear_fc1/2` 走 plain `MatMul + Add`
 - 最后继续跑 OMC
 
-## 当前结论
+## Kirin9030 最新状态（2026-10-08）
 
-这条路线目前已经在 `chunk0` 上验证成功：
+ViT W4A16/group64 完整模型包已发布到 [`fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64`](https://www.modelscope.cn/models/fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64)。用户真机初测反馈能够区分不同图片，暂按图文功能可用记录；此次未提供设备数值或日志，不表示严格数值对齐，原 W8A8 故障也未因此修复。
+
+该包采用 `Quant_act_weight_eco`、W4/group64、signed A16 和逐通道 INT16 输出；SDK `quant_param_2=True` 生成 UINT4/LUT 配套索引权重，ONNX 已按索引重新导出。六图均编译为纯 NPU，每段约 31.99 MB。只更换参数文件而不重导配套 ONNX 不成立。
+
+当前统一入口 [`build_kirin_offline.py`](build_kirin_offline.py) 默认采用上述 W4A16/group64 原生编码，覆盖原始 HF 导出、Path A 图片校准、配套 ONNX、OMG 编译及完整运行目录组装，支持 CLI/JSON 配置和分阶段执行。用法见[仓库 README §2.6](../../../../README.md#26-kirin9030-完整离线编译vit-w4a16--llm-cpu)。下面保留的 Kirin9020/W8 示例属于历史配置，不能只修改位宽来复现 W4 发布包。
+
+现有 App 无需更新，下载新仓库并选择离线 NPU 图模式重新加载即可。主机 L2 误差、未执行完整 CUDA 三段式优化及真机证据边界见[视觉 NPU 记录 §13](../../../../docs/inference/visual-npu-notes.md#13-vit-w4a16group64-真机初测可用2026-10-08)。
+
+## 历史 chunk0 编译结果（kirinx90）
+
+以下是旧平台上的 `chunk0` 编译记录，不能当作 Kirin9030 真机精度验证：
 
 - 最终 `.omc` 已生成：
   - `model_visual_plugin_matmul_chunk0/omc_output/visual_plugin_matmul_quantized.omc`
@@ -1029,7 +1039,7 @@ done
 激活方式始终显式写入：A8 默认 `input.unsigned_quant=true`，保持 DOPT PTQ 的 U8S8 默认行为；A16 默认为 false。
 可用互斥的 `--input_unsigned_quant` / `--input_signed_quant` 覆盖。切换方式后须重新执行 `prepare` 和 `calibrate`，或执行 `all`；旧 checkpoint 的量化状态会覆盖新配置，不能仅在 `export-onnx` 时切换。
 
-`config_summary.json` 记录实际写入的配置，`calibration_report.json` 从校准 checkpoint 记录每层的位宽、激活符号及权重 scale 形状。`export_report.json` 优先使用这份校准记录；旧产物缺少该记录时使用配置，省略的 `unsigned_quant` 标为 null，避免把 SDK 默认值误报为 false。`quant_param_2` 保留官方插件示例的 false，目前未获得 Kirin9030 的明确平台映射依据。
+`config_summary.json` 记录实际写入的配置，`calibration_report.json` 从校准 checkpoint 记录每层的位宽、激活符号及权重 scale 形状。`export_report.json` 优先使用这份校准记录；旧产物缺少该记录时使用配置，省略的 `unsigned_quant` 标为 null，避免把 SDK 默认值误报为 false。单段导出器的 `quant_param_2` 默认仍为 false；显式 `--quant_param_2` 启用 SDK 原生编码，并检查 LUT 解码与权重配对。统一 W4A16 入口默认启用该选项，原生索引 ONNX 必须保留 FLOAT32 initializer，不能加 `--fp16`。
 
 这些修改纠正配置及报告，尚未证明修复 Kirin9030 真机精度问题。原始 6 份参数在删除 W8 的 `group_size` 后仍可逐字节复现，参数配对核验及真机对照见 [W8A8 排查记录](../../../../docs/inference/w8a8-probe.md)。配置依据：[华为插件式量化说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/cannkit-plug-in-quantification)。
 

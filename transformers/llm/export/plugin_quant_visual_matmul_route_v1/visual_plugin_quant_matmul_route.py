@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -1029,20 +1030,17 @@ def calibrate_and_export_quant(args):
     torch.save(state, state_path)
     del state
     set_quant_state(qmodel, weight_state=True, input_state=True)
-    generate_quant_params(
-        qmodel,
-        quant_output_dir(args.route_dir),
-        quant_param_2=False,
-        embedding_separate=False,
-    )
+    encoding = serialize_quantized_weights(qmodel, args.route_dir, args.quant_param_2)
     report = {
         "calibrated_state": state_path,
         "fake_quant_weight": fake_quant_weight_path(args.route_dir),
         "quant_params_file": quant_params_path(args.route_dir),
         "num_samples": len(samples),
         "samples": manifest,
-        "quant_param_2": False,
+        "quant_param_2": args.quant_param_2,
         "embedding_separate": False,
+        "weight_encoding": encoding,
+        "calibrated_state_sha256": file_sha256(state_path),
         **settings,
         **meta,
     }
@@ -1050,6 +1048,69 @@ def calibrate_and_export_quant(args):
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False, default=_to_serializable)
     print(json.dumps(report, indent=2, ensure_ascii=False, default=_to_serializable))
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def serialize_quantized_weights(qmodel, route_dir, quant_param_2):
+    """Keep the calibrated model intact and audit the SDK's paired weight encoding."""
+    from dopt.dopt_lm import do_opt
+    from unittest import mock
+
+    references = {}
+    with torch.no_grad():
+        for name, module in qmodel.named_modules():
+            quant_op = getattr(module, "quant_op", None)
+            quantizer = getattr(quant_op, "weight_quantizer", None)
+            if quantizer is not None and hasattr(module, "weight"):
+                references[name] = quantizer(module.weight).detach().clone()
+    captured = []
+    original_save = do_opt.save_encrypt_file
+
+    def capture(parameters, *positional, **keyword):
+        captured.append(copy.deepcopy(parameters))
+        return original_save(parameters, *positional, **keyword)
+
+    with mock.patch.object(do_opt, "save_encrypt_file", side_effect=capture):
+        generate_quant_params(
+            copy.deepcopy(qmodel), quant_output_dir(route_dir),
+            quant_param_2=quant_param_2, embedding_separate=False,
+        )
+    if len(captured) != 1:
+        raise RuntimeError("Expected one SDK compression parameter document")
+    fake = torch.load(fake_quant_weight_path(route_dir), map_location="cpu", weights_only=True)
+    layers = []
+    for entry in captured[0]["ModelLightWeightParameter"]:
+        name = entry["name"]
+        if name not in references:
+            continue
+        weight = next(v for v in entry["quant"]["input"] if v["index"] == 1)["QuantParam"][0]
+        stored = fake[name + ".weight"]
+        lut_mode = weight.get("lutMode", False)
+        if lut_mode:
+            table_text = entry["quant"]["quantInfoExt"].split("lut_table:", 1)[1].split(";", 1)[0]
+            table = torch.tensor([float(v) for v in table_text.split(",")], dtype=stored.dtype)
+            if not torch.equal(stored, stored.round()) or stored.min() < 0 or stored.max() >= len(table):
+                raise RuntimeError(f"Invalid LUT weight indices: {name}")
+            scales = torch.tensor(json.loads(weight["scale"]), dtype=stored.dtype).reshape(-1, 1)
+            decoded = (table[stored.long()].reshape(len(scales), -1) * scales).reshape_as(stored)
+        else:
+            decoded = stored
+        if not torch.equal(decoded, references[name]):
+            raise RuntimeError(f"Serialized weights do not reproduce the quantized reference: {name}")
+        layers.append({"name": name, "dtype": weight["dataType"], "lut_mode": lut_mode,
+                       "shape": list(stored.shape), "decoded_matches_reference": True})
+    if {v["name"] for v in layers} != set(references):
+        raise RuntimeError("SDK parameter file omits a quantized weight layer")
+    return {"layers": layers, "quant_param_2": quant_param_2,
+            "quant_params_sha256": file_sha256(quant_params_path(route_dir)),
+            "fake_quant_weight_sha256": file_sha256(fake_quant_weight_path(route_dir))}
 
 
 def export_chunk_onnx(args, sample, state, weight_source):
@@ -1082,6 +1143,14 @@ def export_chunk_onnx(args, sample, state, weight_source):
                 settings = {key: calibration_report[key] for key in settings}
                 settings["quant_param_2"] = calibration_report["quant_param_2"]
                 settings["embedding_separate"] = calibration_report["embedding_separate"]
+        if settings.get("quant_param_2") and args.fp16:
+            raise ValueError("Native SDK weight encoding must retain FLOAT32 ONNX initializers; omit --fp16")
+        encoding = calibration_report.get("weight_encoding", {}) if os.path.exists(calibration_report_path) else {}
+        if encoding and (
+            encoding["fake_quant_weight_sha256"] != file_sha256(fake_quant_weight_path(args.route_dir)) or
+            encoding["quant_params_sha256"] != file_sha256(quant_params_path(args.route_dir))
+        ):
+            raise RuntimeError("Paired quantization parameters or weights changed after calibration")
         state = remap_fake_quant_state_for_export(state)
         missing, unexpected = chunk.load_state_dict(state, strict=False)
     onnx_path = os.path.join(args.route_dir, "onnx", f"visual_blocks_npu_{args.chunk_index}.onnx")
@@ -1111,6 +1180,32 @@ def export_chunk_onnx(args, sample, state, weight_source):
             **export_kwargs,
         )
     final_onnx = process_onnx_for_omg(onnx_path, fp16=args.fp16)
+    graph_metadata = onnx.load(final_onnx, load_external_data=False).graph
+    external_locations = {
+        field.value for value in graph_metadata.initializer for field in value.external_data
+        if field.key == "location"
+    }
+    external_hashes = {
+        location: file_sha256(Path(final_onnx).parent / location) for location in external_locations
+    }
+    paired_initializers_verified = False
+    if state is not None and settings.get("quant_param_2"):
+        graph = onnx.load(final_onnx).graph
+        nodes = {node.name: node for node in graph.node}
+        initializers = {value.name: onnx.numpy_helper.to_array(value) for value in graph.initializer}
+        for layer in encoding.get("layers", []):
+            name = layer["name"]
+            node = nodes.get(name)
+            if node is None or node.op_type != "MatMul" or node.input[1] not in initializers:
+                raise RuntimeError(f"Missing paired MatMul weight initializer: {name}")
+            key = next(iter(remap_fake_quant_state_for_export({name + ".weight": None})))
+            expected = state[key].detach().numpy().T
+            actual = initializers[node.input[1]]
+            if actual.dtype != np.float32 or not np.array_equal(actual, expected):
+                raise RuntimeError(f"ONNX initializer differs from the SDK-paired weight: {name}")
+        if not encoding.get("layers"):
+            raise RuntimeError("Native export requires the calibration weight-encoding audit")
+        paired_initializers_verified = True
     rename_map = align_onnx_node_names_with_quant_params(final_onnx)
     route_cfg_path = write_route_config(args.route_dir, final_onnx, sample, out_names, meta)
     report = {
@@ -1122,6 +1217,11 @@ def export_chunk_onnx(args, sample, state, weight_source):
         "output_names": out_names,
         "weight_source": weight_source,
         "calibration_used": state is not None,
+        "paired_initializers_verified": paired_initializers_verified,
+        "onnx_sha256": file_sha256(final_onnx),
+        "onnx_external_data_sha256": external_hashes,
+        "quant_params_sha256": file_sha256(quant_params_path(args.route_dir)) if state is not None else None,
+        "fake_quant_weight_sha256": file_sha256(fake_quant_weight_path(args.route_dir)) if state is not None else None,
         **settings,
         **meta,
     }
@@ -1195,6 +1295,10 @@ def build_parser():
     parser.add_argument("--num_samples", type=int, default=4, help="Calibration sample count")
     parser.add_argument("--fp16", action="store_true", help="Convert large MatMul/Gemm weights to fp16")
     parser.add_argument(
+        "--quant_param_2", action="store_true",
+        help="Use SDK native weight encoding (UINT4/LUT for W4); re-export paired ONNX without --fp16",
+    )
+    parser.add_argument(
         "--sequence_length", type=int, default=608,
         help="Static visual sequence length for raw FP16 export",
     )
@@ -1229,7 +1333,7 @@ def build_parser():
     parser.add_argument(
         "--enable_output_quant",
         action="store_true",
-        help="Add output quant config for linear layers; intended for Kirin9020 experiments",
+        help="Add output quant config for linear layers, including the Kirin9030 W4A16 workflow",
     )
     parser.add_argument("--output_bit", type=int, default=16, help="Output quant bit width")
     parser.add_argument(

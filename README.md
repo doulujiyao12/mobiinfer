@@ -201,11 +201,14 @@ cd ${PHONEDIR}
 
 ```bash
 # 假设已将包解压到 ~/downloads/CANN-Kit-next-6.0.1.0
+mkdir -p ./source/backend/hiai/3rdParty/{arm64-v8a,include}
 cp -r ~/downloads/CANN-Kit-next-6.0.1.0/ddk/ai_ddk_lib/lib64/* ./source/backend/hiai/3rdParty/arm64-v8a
 cp -r ~/downloads/CANN-Kit-next-6.0.1.0/ddk/ai_ddk_lib/include/* ./source/backend/hiai/3rdParty/include
 ```
 
 （目标位置：`source/backend/hiai/3rdParty/arm64-v8a` 和 `source/backend/hiai/3rdParty/include`）
+
+这是手机端运行库；第 2.6 节的离线编译还需要主机侧 **DDK-tools**（已验证版本 `DDK-tools-next-6.1.1.0`），两者是不同的 SDK 包。
 
 ### 2.2 下载 Huawei Command Line Tools
 
@@ -233,15 +236,15 @@ cd ./transformers/llm/export
 python llmexport.py --path /origin_fp/model_path \
     --export mnn --gptq_path /gptq/model/path --quant_bit 4 --quant_block 128 \
     --visual_quant_bit 4 --visual_quant_block 128 --lm_quant_bit 16 \
-    --seperate_embed --visual_split --visual_npu_chunk 6 \
+    --seperate_embed --visual_split --visual_npu_chunks 6 \
     --visual_chunk_backends "npu,npu,npu,npu,cpu,cpu"
 ```
 
 参数说明：
 
-- `--visual_npu_chunk 6` 表示把视觉头切分成 6 份。Kirin NPU 在线编译时，如果单个 graph 过大，容易报 `Low memory` 错误，因此将视觉部分拆成 6 份来减少单次编图压力。
+- `--visual_npu_chunks 6` 表示把视觉头切分成 6 份。Kirin NPU 在线编译时，如果单个 graph 过大，容易报 `Low memory` 错误，因此将视觉部分拆成 6 份来减少单次编图压力。
 - `--visual_chunk_backends "npu,npu,npu,npu,cpu,cpu"` 表示这 6 份分别使用哪些后端执行。上面的配置表示前 4 份跑在 NPU，后 2 份跑在 CPU。
-- 不建议 6 份全部都配置为 `npu`，否则在部分机型或大模型场景下，应用可能会直接 crash。
+- 在线编图时，6 份全部配置为 `npu` 在部分机型或大模型场景下可能触发内存不足；Kirin9030 的六段离线图流程见第 2.6 节。
 
 ### 2.4 编译仓库中的 Harmony/鸿蒙 端库（生成 `libMNN.so`）
 
@@ -258,150 +261,144 @@ cd build
 
 ### 2.5 使用鸿蒙 App 进行测试
 
-由于鸿蒙系统不支持命令行开发，我们开发了鸿蒙 App 进行测试。编译得到的 `libMNN.so` 需要替换到 [mobiinfer-oh](https://github.com/doulujiyao12/mobiinfer-oh) 仓库中对应位置：
+本项目使用鸿蒙 App 进行图文推理测试。编译得到的 `libMNN.so` 需要替换到 [mobiinfer-oh](https://github.com/doulujiyao12/mobiinfer-oh) 仓库中对应位置：
 
 - https://github.com/doulujiyao12/mobiinfer-oh/blob/dev/entry/libs/arm64-v8a/libMNN.so
 
-### 2.6 Kirin9020 完整离线编译（VIT NPU OMC W8A8 + LLM CPU INT8）
+### 2.6 Kirin9030 完整离线编译（ViT W4A16 + LLM CPU）
 
-以下是从 HuggingFace 模型 + GPTQ W8G128 量化模型出发，产出 Kirin9020 完整推理模型目录的一键脚本。
+统一入口为 [`build_kirin_offline.py`](transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py)，覆盖以下流程：
 
-> **前提**：机器上已配置 CANN Kit（DDK-tools-next-6.0.1.0）及 Conda `cann` 环境。
-> **校准数据**：W8A8 量化需要 2~4 张真实图片的激活值作为校准输入（.npz 格式）。如果没有现成的校准数据，可以先执行 `llm_demo` 并设置 `MNN_VISUAL_CHUNK_INPUT_DUMP` dump 出各 chunk 的 tensor，再用 `bin_to_chunk_npz.py` 转换为 .npz 格式。
+```text
+原始 HuggingFace 模型 → MNN 运行模型 → 真实图片的各 chunk 校准输入
+                     → DOPT 量化校准 → 配套 UINT4/LUT ONNX + quant_params_file
+                     → OMG --target=omc → 完整 App 模型目录
+```
+
+默认将 ViT blocks 切成六段，全部编译为 Kirin9030 NPU 离线图，采用 `Quant_act_weight_eco`、W4/group64、signed INT16 激活及逐通道 INT16 输出。注意力等未量化算子仍走浮点计算；视觉前后处理和 LLM 使用 MNN。LLM 默认 CPU INT8/group128，LM head 默认 16 bit，均可配置。
+
+此前同配置发布包已获用户真机反馈，能够区分不同图片，暂按图文功能可用记录；这不代表所有模型和校准数据都能数值对齐。原 W8A8 图文无关问题仍未修复，详见[视觉 NPU 记录 §13](docs/inference/visual-npu-notes.md#13-vit-w4a16group64-真机初测可用2026-10-08)。
+
+#### 环境与输入
+
+- Linux 主机已安装 CMake、C++ 编译器，以及本仓库导出依赖（见 [`requirements.txt`](transformers/llm/export/requirements.txt)）。使用包含 PyTorch、ONNX、Transformers 和 DOPT 所需依赖的 Python 3.10 环境。
+- DDK-tools 包含 DOPT、OMG、`tools/platform/kirin9030` 插件，AscendC 已按 SDK 说明安装。脚本默认通过现有 OMG 包装器自动加载 AscendC 环境；无需在 zsh 中直接 `source`。
+- 原始本地 HF 模型目录，以及有代表性的真实校准图片。默认每段使用 **192** 份输入；图片数量不足时应调整 `--num-samples`，2 份只适合跑通流程，不足以验证量化精度。
+- 不要求先准备 GPTQ 模型。若已有 LLM GPTQ 权重，可用 `--gptq-model` 导入 MNN；ViT 的 DOPT 源模型仍来自 `--model` 指定的原始 HF 模型。
+
+模型、平台、SDK、图片尺寸、chunk 数与后端分配、位宽、group size、量化策略和工具路径均可配置。脚本默认适用于本仓库已支持的 Qwen3-VL/mobi 视觉导出；其他模型或平台仍需相应导出支持及 SDK 支持的算子/位宽组合。
+
+#### 从原始模型执行完整流程
+
+在仓库根目录运行，先激活上述 Python 环境：
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-# ============================================================
-# Kirin9020 完整离线编译脚本
-# 输入: HuggingFace 模型 + GPTQ W8G128 量化模型
-# 输出: 编译完成的 MNN 推理目录（VIT 4 chunk OMC + CPU INT8）
-# 用法: bash kirin9020_compile.sh /path/to/hf_model /path/to/gptq_model /path/to/output
-# ============================================================
-HF_MODEL=${1:?missing HF model path}
-GPTQ_MODEL=${2:?missing GPTQ model path}
-OUTPUT_DIR=${3:?missing output dir}
-cd "$(dirname "$0")/transformers/llm/export"
+python -B transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py \
+  --model /path/to/original_hf_model \
+  --ddk /path/to/DDK-tools-next-6.1.1.0 \
+  --image-dir /path/to/calibration_images \
+  --output /path/to/mnn_model_kirin9030_w4a16 \
+  --platform kirin9030 --npu-chunks 6 \
+  --weight-bit 4 --act-bit 16 --group-size 64 \
+  --num-samples 192 --hw 600,270 \
+  --steps all
+```
 
-# ---- Step 1: 导出 MNN 模型（LLM CPU INT8 + VIT 6 chunks）----
-# GPTQ W8G128 → MNN INT8, visual_chunk_backends 控制每个 chunk 的目标后端
-python llmexport.py --path "$HF_MODEL" \
-    --export mnn \
-    --gptq_path "$GPTQ_MODEL" \
-    --quant_bit 8 --quant_block 128 \
-    --visual_quant_bit 8 --visual_quant_block 128 \
-    --lm_quant_bit 16 \
-    --seperate_embed \
-    --visual_split \
-    --visual_npu_chunk 6 \
-    --visual_chunk_backends "npu,npu,npu,npu,cpu,cpu" \
-    --dst_path "$OUTPUT_DIR"
+`--hw` 按 **H,W** 指定图片预处理尺寸，决定静态图的输入形状；真机使用的图片预处理必须与之匹配。脚本从实际校准输入读取形状并校验各段一致，不将序列长度写死；也可用 `--sequence-length` 额外检查期望值。
 
-# ---- Step 2: W8A8 calibration + ONNX export per NPU chunk (0-3) ----
-# 校准输入: .npz 格式的激活数据（hidden_states_in / rotary_pos_emb / attention_mask）
-# 每个 chunk 对应 ${CALIB_DIR}/chunk_${i:02d}_sample_*.npz
-CALIB_DIR=${CALIB_DIR:-/tmp/calib_inputs}
-NUM_SAMPLES=${NUM_SAMPLES:-2}
+工作目录默认为输出目录旁的 `<output>.work/`，包含主机工具、MNN 中间模型、校准输入、各段 ONNX/参数和日志。可用 `--work-dir` 指定其他目录。最终输出仅包含运行所需文件及 manifest/校验清单，App 不必下载这些中间文件。
 
-for i in 0 1 2 3; do
-    ROUTE_DIR="${OUTPUT_DIR}/route_chunk${i}"
-    python visual_plugin_quant_matmul_route.py \
-        --route_dir "$ROUTE_DIR" \
-        --chunk_index $i \
-        --npu_chunks 6 \
-        --quant_strategy Quant_aigc_ptq \
-        --weight_bit 8 --weight_algo min_max \
-        --act_bit 16 --input_algo min_max \
-        --num_samples "$NUM_SAMPLES" \
-        --group_size 128 \
-        --use_qwen3_style_rotary \
-        --input_dir "$CALIB_DIR" \
-        --force_regen all
-done
+#### JSON 配置与分阶段执行
 
-# ---- Step 3: OMC 编译 (Kirin9020, compress_conf on) ----
-for i in 0 1 2 3; do
-    ROUTE_DIR="${OUTPUT_DIR}/route_chunk${i}"
-    PLATFORM=kirin9020 \
-    TARGET_MODEL_TYPE=omc \
-    USE_COMPRESS_CONF=true \
-    bash run_visual_plugin_matmul_omc.sh "$ROUTE_DIR" fp16
-done
+可以将配置保存为本地 `build.json`。键名使用下划线，命令行参数会覆盖 JSON 中的值：
 
-# ---- Step 4: 装配最终模型目录 ----
-mkdir -p "${OUTPUT_DIR}/om"
-for i in 0 1 2 3; do
-    cp "${OUTPUT_DIR}/route_chunk${i}/omc_output/visual_plugin_matmul_quantized.omc" \
-       "${OUTPUT_DIR}/om/visual_blocks_npu_${i}.om"
-done
-
-cd "$OUTPUT_DIR"
-# 更新 config.json
-python3 -c "
-import json
-cfg = json.load(open('config.json'))
-cfg.setdefault('npu_model_dir', 'om')
-cfg['visual_blocks_offline_om'] = [
-    'om/visual_blocks_npu_0.om',
-    'om/visual_blocks_npu_1.om',
-    'om/visual_blocks_npu_2.om',
-    'om/visual_blocks_npu_3.om',
-    '', ''
-]
-json.dump(cfg, open('config.json', 'w'), indent=2, ensure_ascii=False)
-"
-# 生成 manifest
-cat > offline_om_manifest.json <<EOF
+```json
 {
-  "format": "offline_compiled_omc",
-  "platform": "kirin9020",
-  "compression": "dopt_w8a8_compress_conf",
-  "offline_vit": {
-    "precision": "W8A16",
-    "weight_source": "dopt_fake_quant",
-    "compress_conf_used": true
-  }
+  "model": "/path/to/original_hf_model",
+  "ddk": "/path/to/DDK-tools-next-6.1.1.0",
+  "image_dir": "/path/to/calibration_images",
+  "output": "/path/to/mnn_model_kirin9030_w4a16",
+  "platform": "kirin9030",
+  "npu_chunks": 6,
+  "chunk_backends": "npu,npu,npu,npu,npu,npu",
+  "num_samples": 192,
+  "hw": "600,270",
+  "weight_bit": 4,
+  "act_bit": 16,
+  "group_size": 64,
+  "native_weight_encoding": true,
+  "output_quant": true
 }
-EOF
-
-echo "Done: $OUTPUT_DIR"
 ```
-
-#### 校准数据格式
-
-Step 2 的 `--input_dir` 下每个 `.npz` 文件包含三个 float16 tensor，命名规则 `chunk_{CI:02d}_sample_{SI:03d}.npz`：
-
-| 键 | 形状 | 说明 |
-|---|---|---|
-| `hidden_states_in` | `(1, 608, 1024)` | chunk 输入 |
-| `rotary_pos_emb` | `(2, 608, 1, 64)` | 位置编码 |
-| `attention_mask` | `(1, 608, 608)` | 因果 mask（-65504 为屏蔽） |
-
-**生成校准数据**（方式一，推荐）：
 
 ```bash
-# 先在 MNN 模型上运行图片推理，dump chunk 输入，再转成 .npz
-# 输入: 训练图片（通过 llm_demo input.txt 传入）
-# 输出: $CALIB_DIR/ 下的 chunk_XX_sample_YYY.npz（供 Step 2 使用）
+# 先预览完整命令，不读取权重、不生成文件
+python -B transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py \
+  --config build.json --dry-run
 
-MNN_MODEL_DIR=/path/to/mnn_model          # llmexport 产出的模型目录（含 config.json）
-IMAGE_LIST=/path/to/input_image_list.txt   # llm_demo 输入文件，每行一张图片路径
-CALIB_DIR=/tmp/calib_inputs                # 输出目录（供 Step 2 的 $CALIB_DIR 使用）
-DUMP_DIR=/tmp/chunk_dump                   # dump 中间文件（用完可删）
+# 原始模型 → MNN → 真实图片校准输入
+python -B transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py \
+  --config build.json --steps tools,export-mnn,calib-inputs
 
-# 1) dump chunk 输入 tensor
-export MNN_VISUAL_CHUNK_INPUT_DUMP="$DUMP_DIR"
-./llm_demo "$MNN_MODEL_DIR/config.json" "$IMAGE_LIST"
+# 校准 → 配套 ONNX → OMC → 完整运行目录
+python -B transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py \
+  --config build.json --steps quantize,export-onnx,compile,package
 
-# 2) 转成 .npz 格式
-python bin_to_chunk_npz.py "$DUMP_DIR" "$CALIB_DIR"
+# 仅重新编译指定的两个已导出 chunk
+python -B transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py \
+  --config build.json --steps compile --chunks 0,2
 ```
 
-方式二：自行编写 Python 脚本加载 HF 模型，用 `visual.patch_embed` 逐 chunk 前向获取 hidden_states_in，按上述格式保存为 `.npz`。
+| 阶段 | 执行内容 |
+|---|---|
+| `tools` | 编译主机 `MNNConvert` 和启用校准 dump 的 `llm_demo` |
+| `export-mnn` | 从原始 HF 导出 LLM、视觉前后处理和全部 MNN chunks |
+| `calib-inputs` | 从真实图片生成每段校准 NPZ 输入，或检查提供的已有输入 |
+| `quantize` | 为所选 NPU chunks 生成配置、校准并序列化配套量化权重/参数 |
+| `export-onnx` | 用 SDK 配套权重导出并校验 ONNX |
+| `compile` | 按指定平台调用 OMG，检查纯 NPU 分区及离线编译成功证据 |
+| `package` | 组装全部运行文件与 NPU 图，生成配置、manifest 和 SHA-256 清单 |
 
-#### 产物校验
+单独执行后续阶段需要前序产物；`package` 始终要求全部配置为 NPU 的图均已编译。阶段按 `--steps` 给出的顺序执行。同一工作目录会记录构建参数，分阶段运行应复用同一配置；更换模型、平台、输入尺寸或量化设置时使用新的工作及输出目录，避免混用旧产物。
 
-编译完成后检查 `om/visual_blocks_npu_0.om` 约 98MB，日志确认含 `partition type NPU:1, CPU:0`、`SaveCompiledModelToFile SUCCESS`、`OMG generate offline model success`。
+可通过 `--mnnconvert`、`--llm-demo` 复用已有主机工具，通过 `--omg`、`--ascendc-env` 指定工具位置，参数全集见 `--help`。若使用 Path A，已有 `llm_demo` 必须编译时启用 `-DMNN_VISUAL_CHUNK_INPUT_DUMP=ON`。
+
+OMG 对输出路径字符有限制。脚本默认在系统临时目录中暂存配套输入并编译，再拷贝到指定工作目录；可用 `--compiler-work-dir` 指定临时根目录，该路径仅使用 ASCII 字母、数字、斜杠和下划线。
+
+#### 校准路径与权重配对
+
+默认采用 **Path A**：先导出 MNN，将校准配置的全部视觉 chunks 切到 CPU，按图片列表运行 `llm_demo`，使用 `visual_chunk_input_dump_dir` / `visual_chunk_input_dump_samples` 配置导出输入，再调用 `bin_to_chunk_npz.py` 转换。脚本自动完成这些步骤，单独设置名为 `MNN_VISUAL_CHUNK_INPUT_DUMP` 的环境变量不会开启运行时 dump。
+
+可用 `--calibration-method hf` 改为原始 HF 视觉前向生成输入，这与 Path A 的 MNN 数值路径不同。若已有 NPZ，可在初始配置中设置 `calib_input_dir`（或 `--calib-input-dir`），复用输入并跳过图片推理；这种情况下不需要 `image_dir`。
+
+NPZ 命名为 `chunk_{CI:02d}_sample_{SI:03d}.npz`，包含以下浮点输入。形状以实际模型和图片尺寸为准：
+
+| 键 | 通用形状 | 说明 |
+|---|---|---|
+| `hidden_states_in` | `(1, S, hidden_size)` | chunk 输入 |
+| `rotary_pos_emb` | `(2, S, 1, rotary_dim)` | 位置编码 |
+| `attention_mask` | `(1, S, S)` | 视觉注意力 mask；单图有效区域通常全零，并非语言模型因果 mask |
+
+W4 原生编码必须将 `quant_param_2=True` 生成的 **UINT4/LUT 索引权重**与参数文件一起使用；这种 `fake_quant_weight.pth` 不能直接当作反量化后的浮点权重评估。统一入口默认启用该编码，保留 FLOAT32 ONNX 索引 initializer，不使用单段导出器的 `--fp16`。OMG 的 `fp16` 权重选项不意味着量化 Linear 变为 W16：其 W4 编码由配套 `compress_conf` 指定。
+
+本流程包含 DOPT 配置、真实输入校准、权重/激活参数导出和离线编译，**不执行完整 CUDA GPTQ/QAT 三段式权重训练优化**。改变位宽或关闭原生编码只是配置能力，不代表未验证组合可以在 Kirin9030 正常编译或保持精度。
+
+#### 产物与校验
+
+运行目录包含 `config.json`、`llm_config.json`、tokenizer、embedding、LLM/视觉 MNN 文件，以及 `om/visual_blocks_npu_<i>.om`。这些 `.om` 文件实际来自 OMG 的 **`--target=omc`**，扩展名沿用 App 约定。脚本从图输出推导 `visual_blocks_om_deepstack_dup` 并写入配置，不将某个 chunk 编号写死。
+
+构建时会检查 LUT/scale 解码权重与校准参考逐值一致、ONNX initializer 与 SDK 索引配套，并核对参数、ONNX 主文件和外部权重的 SHA-256。OMG 日志必须包含纯 NPU 分区、`SaveCompiledModelToFile SUCCESS` 与 `OMG generate offline model success`；最终 `success` 不能掩盖 CPU 回退或致命量化错误。
+
+各阶段日志位于 `<work-dir>/logs/`。最终 `offline_om_manifest.json` 记录配置及图哈希，`SHA256SUMS` 可用于检查传输是否完整：
+
+```bash
+cd /path/to/mnn_model_kirin9030_w4a16
+sha256sum -c SHA256SUMS
+```
+
+生成的包仍需真机图文测试；manifest 中 `device_tested` 默认是 `false`。对于已支持离线图模式的当前 App，无需改代码，将完整模型目录导入或发布后重新下载，并选择离线 NPU 模式加载即可。
+
+统一入口已用原始 mobi 2B 模型、两张真实图片和 DDK-tools-next-6.1.1.0 跑通完整流程，六段均生成纯 NPU OMC，运行包哈希校验通过。这是流程验证，不是两张图片校准后的精度结论。
 
 ### 2.7 说明与注意事项
 
@@ -409,8 +406,8 @@ python bin_to_chunk_npz.py "$DUMP_DIR" "$CALIB_DIR"
 - `HARMONY_HOME` 必须指向命令行工具提供的 OpenHarmony SDK 根目录，否则构建脚本找不到工具链。
 - 若构建失败，请查阅 `project/harmony/build_64.sh` 中的日志与输出路径，按错误提示补充依赖。
 - 本节假定你已经在机器上安装并配置好对应的交叉编译工具链以及必要的 Android/Harmony 环境变量。
-- Kirin9020 OMC 不需要 AscendC 环境，编译脚本会自动跳过。如需在 Kirin9030 上使用 OMC，须先执行 `source set_ascendc_env.sh`。
-- 4 个 NPU chunk（0-3）使用离线 OMC 图 + W8A8 压缩权重，约 98MB/chunk。2 个 CPU chunk（4-5）使用 MNN 格式 + 4bit 量化。
+- Kirin9030 离线编译需要可用的 AscendC 环境及匹配平台插件。统一入口自动加载环境，并拒绝 CPU 回退产物。
+- 默认六个 ViT chunks 使用 W4A16 离线 OMC；可通过 `--chunk-backends` 指定部分 CPU chunks，其 MNN 权重精度由 `--visual-mnn-quant-bit` 控制。模型大小依赖模型结构及量化配置，不应仅按文件体积判断正确性。
 
 ---
 

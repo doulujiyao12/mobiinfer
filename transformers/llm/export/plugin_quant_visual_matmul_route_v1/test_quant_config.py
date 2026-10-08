@@ -124,6 +124,74 @@ class QuantConfigTest(unittest.TestCase):
                 self.assertEqual(report["quantization"]["source"], "calibrated_checkpoint")
                 self.assertFalse(report["quant_param_2"])
 
+    def test_native_w4_lut_is_paired_with_float32_onnx_and_rejects_stale_parameters(self):
+        class TinyVisual(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Keep a MatMul rather than allowing onnxsim to fold the tiny
+                # biased layer into Gemm. Real ViT weights exceed the exporter's
+                # 1 MB simplification threshold and retain named MatMul nodes.
+                self.linear = torch.nn.Linear(128, 4, bias=False)
+
+            def forward(self, hidden_states_in, rotary_pos_emb, attention_mask):
+                return self.linear(hidden_states_in)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config, _model = self.configure(directory, ("--group_size", "64"), w8=False)
+            config.rename(route.config_path(directory, 0))
+            args = build_parser().parse_args(["--route_dir", directory, "--quant_param_2", "calibrate"])
+            sample = {"hidden_states_in": torch.linspace(-3, 8, 384).reshape(1, 3, 128),
+                      "rotary_pos_emb": torch.zeros(2, 3, 1, 64), "attention_mask": torch.zeros(1, 3, 3)}
+            meta = {"chunk_index": 0, "local_deepstack_count": 0}
+            with mock.patch.object(route, "load_visual_chunk", side_effect=lambda *a, **kw: (TinyVisual(), meta)), \
+                    mock.patch.object(route, "load_calibration_samples", return_value=([sample], [{"file": "test-input"}])), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                route.calibrate_and_export_quant(args)
+                calibrated = json.loads((Path(directory) / "quant_output/calibration_report.json").read_text())
+                layer = calibrated["weight_encoding"]["layers"][0]
+                self.assertEqual(layer["dtype"], "UINT4")
+                self.assertTrue(layer["lut_mode"])
+                self.assertTrue(layer["decoded_matches_reference"])
+                weights = torch.load(route.fake_quant_weight_path(directory), weights_only=True)
+                self.assertTrue(torch.equal(weights["linear.weight"], weights["linear.weight"].round()))
+                # The production exporter replaces Linear with FLinearMatmul;
+                # do the same in this tiny model rather than exporting torch's
+                # fused bias form with a different node-name convention.
+                def export_model(*positional, **keyword):
+                    model = TinyVisual()
+                    if keyword.get("prepare_export"):
+                        route._replace_linear_with_flinear(model)
+                    return model, meta
+                with mock.patch.object(route, "load_visual_chunk", side_effect=export_model):
+                    route.export_onnx(args)
+                exported = json.loads((Path(directory) / "onnx/export_report.json").read_text())
+                self.assertTrue(exported["paired_initializers_verified"])
+                self.assertEqual(exported["quant_params_sha256"], calibrated["weight_encoding"]["quant_params_sha256"])
+                args.fp16 = True
+                with self.assertRaisesRegex(ValueError, "retain FLOAT32"):
+                    route.export_onnx(args)
+                args.fp16 = False
+                with open(route.quant_params_path(directory), "ab") as stream:
+                    stream.write(b"changed")
+                with self.assertRaisesRegex(RuntimeError, "changed after calibration"):
+                    route.export_onnx(args)
+
+    def test_serialization_preserves_calibrated_model_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, model = self.configure(directory, ("--group_size", "64"), w8=False)
+            do_opt.set_quant_state(model, weight_state=True, input_state=True)
+            do_opt.set_calibrate_state(model, True)
+            with torch.no_grad():
+                model(torch.randn(1, 3, 128))
+            do_opt.set_calibrate_state(model, False)
+            original = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+            route.ensure_route_layout(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                route.serialize_quantized_weights(model, directory, True)
+            self.assertEqual(set(original), set(model.state_dict()))
+            for name, tensor in model.state_dict().items():
+                self.assertTrue(torch.equal(tensor, original[name]), name)
+
 
 if __name__ == "__main__":
     unittest.main()

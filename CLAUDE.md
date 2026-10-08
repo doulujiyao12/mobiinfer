@@ -111,13 +111,22 @@ mobiinfra-oh 这个目录下面是端侧推理的deveco 的项目代码库，主
 
 1. **`--target=omc` 才是离线图**。`--target=om` 生成的是设备侧在线编译的 HiAI IR 容器。
    本项目沿用 `.om` 扩展名（兼容 App 的 chunk 解析），须用 OMG 日志确认来自 `omc`。
-2. **离线 OM 一律用 FP16，不加 `--compress_conf`**。
-   Kirin9030 上 W8A8 `compress_conf` 的产物真机数值错误（回答与图片无关），原因未定位。
+2. **FP16（不加 `--compress_conf`）可作为浮点基线；ViT W4A16/group64 已获用户真机初测可用反馈**。
+   W4A16 发布包使用配套 UINT4/LUT 权重与 `compress_conf`，详见下方及 notes §13。
+   Kirin9030 上原 W8A8 `compress_conf` 的图文无关问题仍未修复，不能把 W4A16 的结果推广到 W8A8。
 3. **Kirin9030 必须加载 AscendC 环境**。只设 `--platform` 不加载 AscendC，MatMul 会被拒并回退 CPU；
    即使产出文件也不算成功。
 4. **FP16 必须直接从原始 HF 浮点权重导出**，不能先加载 DOPT `fake_quant_weight.pth` 再转 FP16
    （后者是伪量化/反量化后的权重，会改变数值）。
 5. **`visual_blocks_om_deepstack_dup` 必须配对**，否则真机闪退（见下「配置深坑」）。
+
+### W4A16 已发布配置（2026-10-08 更新）
+
+完整模型包：[`fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64`](https://www.modelscope.cn/models/fengerhu1/mnn_mobi_2B_visual6_npu_kirin9030_w4a16_g64)。用户在手机运行后反馈能区分不同图片，暂按图文功能可用记录。此次没有提供数值输出或运行日志，不能宣称 NPU 数值与 CPU 参考对齐，也不能宣称 W4A16 的量化精度优于 W8A8。
+
+该版本仅将六张 ViT block 离线图改为 `Quant_act_weight_eco`、W4/group64、signed INT16 输入及逐通道 INT16 输出；LLM 和视觉前后处理保持原样。序列化必须使用 SDK 的 `quant_param_2=True`，并按配套 `fake_quant_weight.pth` 中的 UINT4/LUT 索引重新导出 ONNX；不能只将新参数文件配到旧浮点权重 ONNX。现在可使用 [`build_kirin_offline.py`](transformers/llm/export/plugin_quant_visual_matmul_route_v1/build_kirin_offline.py) 执行该配置的完整流程，参数与分阶段用法见 [README §2.6](README.md#26-kirin9030-完整离线编译vit-w4a16--llm-cpu)。单段导出器保留旧序列化默认值，原生编码需要显式 `--quant_param_2`。发布包的隔离构建、电脑端误差与验证边界见 [`visual-npu-notes.md` §13](docs/inference/visual-npu-notes.md#13-vit-w4a16group64-真机初测可用2026-10-08)。
+
+现有 App 不需要更新。清空旧仓库地址后下载上述独立模型，选择“离线 NPU 图”并重新加载；保留 `visual_blocks_om_deepstack_dup=[2]`。本次每段使用 192 份真实路径 A 输入校准，没有运行完整 CUDA GPTQ/QAT 三段式权重优化。
 
 ### 环境准备
 
@@ -164,7 +173,7 @@ make -j$(nproc) MNNConvert llm_demo
 
 ### 步骤 1：导出 chunk ONNX
 
-两种精度，**二选一**：
+以下是原有 FP16 与 W8A8 导出入口。W4A16 发布包使用上述配套 LUT 重导流程，不能仅修改以下命令的位宽来复现：
 
 ```bash
 cd transformers/llm/export/plugin_quant_visual_matmul_route_v1
