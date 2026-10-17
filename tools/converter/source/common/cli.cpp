@@ -35,6 +35,9 @@
 #include "CommonUtils.hpp"
 #include "PostConverter.hpp"
 #include "Json2Flatbuffer.hpp"
+#ifdef ENABLE_RKNN_CONVERT_MODE
+#include "RKNNBundle.hpp"
+#endif
 #include <fstream>
 #include <sstream>
 #include <cmath>
@@ -144,212 +147,113 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
 
     options.positional_help("[optional args]").show_positional_help();
 
-    options.allow_unrecognised_options().add_options()(std::make_pair("h", "help"), "Convert Other Model Format To MNN Model\n")(
-                                                                                                                                 std::make_pair("v", "version"), "show current version")
-    (std::make_pair("f", "framework"),
+    options.allow_unrecognised_options().add_options()(std::make_pair("h", "help"),
+                                                       "Convert Other Model Format To MNN Model\n")(
+        std::make_pair("v", "version"), "show current version")(std::make_pair("f", "framework"),
 #ifdef MNN_BUILD_TORCH
-     "model type, ex: [TF,CAFFE,ONNX,TFLITE,MNN,TORCH,JSON]",
+                                                                "model type, ex: [TF,CAFFE,ONNX,TFLITE,MNN,TORCH,JSON]",
 #else
-     "model type, ex: [TF,CAFFE,ONNX,TFLITE,MNN,JSON]",
+                                                                "model type, ex: [TF,CAFFE,ONNX,TFLITE,MNN,JSON]",
 #endif
-     cxxopts::value<std::string>())
-    (
-     "modelFile",
-     "tensorflow Pb or caffeModel, ex: *.pb,*caffemodel",
-     cxxopts::value<std::string>()
-     )
-    (
-     "batch",
-     "if model input's batch is not set, set as the batch size you set",
-     cxxopts::value<int>()
-     )
-    (
-     "keepInputFormat",
-     "keep input dimension format or not, default: true",
-     cxxopts::value<bool>()
-     )
-    (
-     "optimizeLevel",
-     "graph optimize option, 0: don't run optimize(only support for MNN source), 1: use graph optimize only for every input case is right, 2: normally right but some case may be wrong, default 1",
-     cxxopts::value<int>()
-     )
-    (
-     "optimizePrefer",
-     "graph optimize option, 0 for normal, 1 for smalleset, 2 for fastest",
-     cxxopts::value<int>()
-     )
-    (
-     "prototxt",
-     "only used for caffe, ex: *.prototxt",
-     cxxopts::value<std::string>())
-    (
-     "MNNModel",
-     "MNN model, ex: *.mnn",
-     cxxopts::value<std::string>())
-    (
-     "fp16",
-     "save Conv's weight/bias in half_float data type")
-    (
-     "benchmarkModel",
-     "Do NOT save big size data, such as Conv's weight,BN's gamma,beta,mean and variance etc. Only used to test the cost of the model")
-    (
-     "bizCode",
-     "MNN Model Flag, ex: MNN",
-     cxxopts::value<std::string>())
-    (
-     "debug",
-     "Enable debugging mode."
-     )
-    (
-     "forTraining",
-     "whether or not to save training ops BN and Dropout, default: false",
-     cxxopts::value<bool>()
-     )
-    (
-     "weightQuantBits",
-     "save conv/matmul/LSTM float weights to int8 type, only optimize for model size, 2-8 bits, default: 0, which means no weight quant",
-     cxxopts::value<int>()
-     )
-    (
-     "weightQuantAsymmetric",
-     "the default weight-quant uses SYMMETRIC quant method, which is compatible with old MNN versions. "
-     "you can try set --weightQuantAsymmetric to use asymmetric quant method to improve accuracy of the weight-quant model in some cases, "
-     "but asymmetric quant model cannot run on old MNN versions. You will need to upgrade MNN to new version to solve this problem. default: false",
-     cxxopts::value<bool>()
-     )
-    (
-     "weightQuantBlock",
-     "using block-wise weight quant, set block size, defaut: -1, which means channel-wise weight quant",
-     cxxopts::value<int>()
-     )
-    (
-     "hqq",
-     "using hqq quant method to improve accuracy, default: false, if use hqq, weightQuantAsymmetric is set as true"
-     )
-    (
-     "compressionParamsFile",
-     "The path of the compression parameters that stores activation, "
-     "weight scales and zero points for quantization or information "
-     "for sparsity. "
-     "if the file does not exist, will create file base on user's option",
-     cxxopts::value<std::string>()
-     )
-    (
-     "OP",
-     "print framework supported op",
-     cxxopts::value<bool>()
-     )
-    (
-     "saveStaticModel",
-     "save static model with fix shape, default: false",
-     cxxopts::value<bool>()
-     )
-    (
-     "targetVersion",
-     "compability for old mnn engine, default the same as converter",
-     cxxopts::value<float>()
-     )
-    (
-     "customOpLibs",
-     "custom op libs ex: libmy_add.so;libmy_sub.so",
-     cxxopts::value<std::string>()
-     )
-    (
-     "info",
-     "dump MNN's model info"
-     )
-    (
-     "authCode",
-     "code for model authentication.",
-     cxxopts::value<std::string>()
-     )
-    (
-     "inputConfigFile",
-     "set input config file for static model, ex: ~/config.txt",
-     cxxopts::value<std::string>()
-     )
-    (
-     "testdir",
-     "set test dir, mnn will convert model and then check the result",
-     cxxopts::value<std::string>()
-     )
-    (
-     "testconfig",
-     "set test config json, example: tools/converter/forward.json",
-     cxxopts::value<std::string>()
-     )
-    (
-     "thredhold",
-     "if set test dir, thredhold mean the max rate permit for run MNN model and origin error",
-     cxxopts::value<float>()
-     )
-    (
-     "JsonFile",
-     "if input model is MNN and give jsonfile, while Dump MNN model to the JsonFile.",
-     cxxopts::value<std::string>()
-     )
-    (
-     "alignDenormalizedValue",
-     "if 1, converter would align denormalized float(|x| < 1.18e-38) as zero, because of in ubuntu/protobuf or android/flatbuf, system behaviors are different. default: 1, range: {0, 1}",
-     cxxopts::value<int>()
-     )
-    (
-     "detectSparseSpeedUp",
-     "if add the flag converter would detect weights sparsity and check sparse speedup, may decrease model size, but will cause more time for convert."
-     )
-    (
-     "saveExternalData",
-     "save weight to extenal bin file.",
-     cxxopts::value<bool>()
-     )
-    (
-     "useGeluApproximation",
-     "Use Gelu Approximation Compute Instead of use ERF",
-     cxxopts::value<int>()
-     )
-    (
-     "convertMatmulToConv",
-     "if 1, converter matmul with constant input to convolution. default: 1, range: {0, 1}",
-     cxxopts::value<int>()
-     )
-    (
-     "transformerFuse",
-     "fuse key transformer op, like attention. default: false",
-     cxxopts::value<bool>()
-     )
-    (
-     "groupConvNative",
-     "keep native group convolution. default: false",
-     cxxopts::value<bool>()
-     )
-     (
-     "allowCustomOp",
-     "allow custom op when convert. default: false",
-     cxxopts::value<bool>()
-     )
-     (
-      "useOriginRNNImpl",
-      "Don't use While Module to Implement LSTM or GRU, use origin OP, if open it, LSTM and GRU can't be quantized or use other compress method",
-      cxxopts::value<bool>()
-     )
-    (
-     "splitBlockQuant",
-     "Split Block Quant Convolution"
-     )
-    (
-     "dumpPass",
-     "Enable verbose output for each optimization pass, showing what changes each pass made (like LLVM's -debug-pass)"
-     )
-    ;
+                                                                cxxopts::value<std::string>())(
+        "modelFile", "tensorflow Pb or caffeModel, ex: *.pb,*caffemodel", cxxopts::value<std::string>())(
+        "batch", "if model input's batch is not set, set as the batch size you set", cxxopts::value<int>())(
+        "keepInputFormat", "keep input dimension format or not, default: true", cxxopts::value<bool>())(
+        "optimizeLevel",
+        "graph optimize option, 0: don't run optimize(only support for MNN source), 1: use graph optimize only for "
+        "every input case is right, 2: normally right but some case may be wrong, default 1",
+        cxxopts::value<int>())("optimizePrefer", "graph optimize option, 0 for normal, 1 for smalleset, 2 for fastest",
+                               cxxopts::value<int>())("prototxt", "only used for caffe, ex: *.prototxt",
+                                                      cxxopts::value<std::string>())("MNNModel", "MNN model, ex: *.mnn",
+                                                                                     cxxopts::value<std::string>())(
+        "fp16", "save Conv's weight/bias in half_float data type")(
+        "benchmarkModel",
+        "Do NOT save big size data, such as Conv's weight,BN's gamma,beta,mean and variance etc. Only used to test the "
+        "cost of the model")("bizCode", "MNN Model Flag, ex: MNN",
+                             cxxopts::value<std::string>())("debug", "Enable debugging mode.")(
+        "forTraining", "whether or not to save training ops BN and Dropout, default: false",
+        cxxopts::value<bool>())("weightQuantBits",
+                                "save conv/matmul/LSTM float weights to int8 type, only optimize for model size, 2-8 "
+                                "bits, default: 0, which means no weight quant",
+                                cxxopts::value<int>())(
+        "weightQuantAsymmetric",
+        "the default weight-quant uses SYMMETRIC quant method, which is compatible with old MNN versions. "
+        "you can try set --weightQuantAsymmetric to use asymmetric quant method to improve accuracy of the "
+        "weight-quant model in some cases, "
+        "but asymmetric quant model cannot run on old MNN versions. You will need to upgrade MNN to new version to "
+        "solve this problem. default: false",
+        cxxopts::value<bool>())(
+        "weightQuantBlock",
+        "using block-wise weight quant, set block size, defaut: -1, which means channel-wise weight quant",
+        cxxopts::value<int>())(
+        "hqq",
+        "using hqq quant method to improve accuracy, default: false, if use hqq, weightQuantAsymmetric is set as true")(
+        "weightQuantScaleBit",
+        "bit-width for quant scale/zero-point storage. 32=fp32 (default), 16=fp16; 8/4 reserved for future",
+        cxxopts::value<int>())("compressionParamsFile",
+                               "The path of the compression parameters that stores activation, "
+                               "weight scales and zero points for quantization or information "
+                               "for sparsity. "
+                               "if the file does not exist, will create file base on user's option",
+                               cxxopts::value<std::string>())("OP", "print framework supported op",
+                                                              cxxopts::value<bool>())(
+        "saveStaticModel", "save static model with fix shape, default: false", cxxopts::value<bool>())(
+        "targetVersion", "compability for old mnn engine, default the same as converter", cxxopts::value<float>())(
+        "customOpLibs", "custom op libs ex: libmy_add.so;libmy_sub.so", cxxopts::value<std::string>())(
+        "info", "dump MNN's model info")("authCode", "code for model authentication.", cxxopts::value<std::string>())(
+        "inputConfigFile", "set input config file for static model, ex: ~/config.txt", cxxopts::value<std::string>())(
+        "testdir", "set test dir, mnn will convert model and then check the result", cxxopts::value<std::string>())(
+        "testconfig", "set test config json, example: tools/converter/forward.json", cxxopts::value<std::string>())(
+        "thredhold", "if set test dir, thredhold mean the max rate permit for run MNN model and origin error",
+        cxxopts::value<float>())("JsonFile",
+                                 "if input model is MNN and give jsonfile, while Dump MNN model to the JsonFile.",
+                                 cxxopts::value<std::string>())(
+        "alignDenormalizedValue",
+        "if 1, converter would align denormalized float(|x| < 1.18e-38) as zero, because of in ubuntu/protobuf or "
+        "android/flatbuf, system behaviors are different. default: 1, range: {0, 1}",
+        cxxopts::value<int>())("detectSparseSpeedUp",
+                               "if add the flag converter would detect weights sparsity and check sparse speedup, may "
+                               "decrease model size, but will cause more time for convert.")(
+        "saveExternalData", "save weight to extenal bin file.", cxxopts::value<bool>())(
+        "useGeluApproximation", "Use Gelu Approximation Compute Instead of use ERF", cxxopts::value<int>())(
+        "convertMatmulToConv", "if 1, converter matmul with constant input to convolution. default: 1, range: {0, 1}",
+        cxxopts::value<int>())("transformerFuse", "fuse key transformer op, like attention. default: false",
+                               cxxopts::value<bool>())(
+        "transformerFuseC4",
+        "fuse LLM transformer tensors to C4 format for faster runtime. default: true, set 0 to disable",
+        cxxopts::value<int>())(
+        "transformerFuseQkvProj",
+        "fuse shared-input attention projections into one FusedLinear at convert time. default: true, set 0 to disable",
+        cxxopts::value<int>())(
+        "transformerFuseGateUpProj",
+        "fuse dense SwiGLU gate/up projections into one FusedLinear at convert time. default: true, set 0 to disable",
+        cxxopts::value<int>())(
+        "transformerFuseLnProj",
+        "allow folding the block-input RMSNorm into convert-time FusedLinear ops. default: true, set 0 to disable",
+        cxxopts::value<int>())("groupConvNative", "keep native group convolution. default: false",
+                               cxxopts::value<bool>())("allowCustomOp", "allow custom op when convert. default: false",
+                                                       cxxopts::value<bool>())(
+        "useOriginRNNImpl",
+        "Don't use While Module to Implement LSTM or GRU, use origin OP, if open it, LSTM and "
+        "GRU can't be quantized or use other compress method",
+        cxxopts::value<bool>())("splitBlockQuant", "Split Block Quant Convolution")(
+        "dumpPass",
+        "Enable verbose output for each optimization pass, showing what changes each pass made (like LLVM's "
+        "-debug-pass)");
+#ifdef ENABLE_RKNN_CONVERT_MODE
+    options.add_options()("rknn", "generate RKNN sidecar from source ONNX and environment variables");
+#endif
 
     auto result = options.parse(argc, argv);
 
     if (result.count("help")) {
+        modelPath.cliExitCode = 0;
         std::cout << options.help({""}) << std::endl;
         return false;
     }
 
     if (result.count("version")) {
+        modelPath.cliExitCode = 0;
         std::cout << MNN_VERSION << std::endl;
         return false;
     }
@@ -385,6 +289,7 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
         return false;
     }
     if (result.count("OP")) {
+        modelPath.cliExitCode = 0;
         MNN_PRINT("Dump %s support Ops\n", frameWork.c_str());
         const auto& res = OpCount::get()->getMap().find(frameWork);
         if (res == OpCount::get()->getMap().end()) {
@@ -502,6 +407,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     if (result.count("weightQuantBlock")) {
         modelPath.weightQuantBlock = result["weightQuantBlock"].as<int>();
     }
+    if (result.count("weightQuantScaleBit")) {
+        modelPath.weightQuantScaleBit = result["weightQuantScaleBit"].as<int>();
+    }
     if (result.count("saveStaticModel")) {
         modelPath.saveStaticModel = true;
     }
@@ -549,6 +457,18 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     if (result.count("transformerFuse")) {
         modelPath.transformerFuse = true;
     }
+    if (result.count("transformerFuseC4")) {
+        modelPath.transformerFuseC4 = result["transformerFuseC4"].as<int>() != 0;
+    }
+    if (result.count("transformerFuseQkvProj")) {
+        modelPath.transformerFuseQkvProj = result["transformerFuseQkvProj"].as<int>() != 0;
+    }
+    if (result.count("transformerFuseGateUpProj")) {
+        modelPath.transformerFuseGateUpProj = result["transformerFuseGateUpProj"].as<int>() != 0;
+    }
+    if (result.count("transformerFuseLnProj")) {
+        modelPath.transformerFuseLnProj = result["transformerFuseLnProj"].as<int>() != 0;
+    }
     if (result.count("groupConvNative")) {
         modelPath.groupConvNative = true;
     }
@@ -561,6 +481,14 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     if (result.count("dumpPass")) {
         modelPath.dumpPass = true;
     }
+#ifdef ENABLE_RKNN_CONVERT_MODE
+    if (result.count("rknn")) {
+        modelPath.rknnSidecar = true;
+        if (!PopulateRKNNConfigFromEnv(modelPath)) {
+            return false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -758,29 +686,56 @@ bool Cli::convertModel(modelConfig& modelPath) {
             "TranslateJsonOp",
             "FuseDupOp",
             "RemoveInvalidCast",
+            "RemoveDeadShapeOp",
         };
+        if (modelPath.transformerFuseC4) {
+            expectedPass.insert(expectedPass.begin() + 1, "FuseTransformerC4");
+        }
     }
     if (modelPath.splitQuantBlock) {
         expectedPass.emplace_back("SplitBlockQuantConvolution");
     }
     CommonKit::loadCompress(modelPath);
+    std::unique_ptr<MNN::NetT> finalNet;
     if (needOptimize) {
         std::cout << "Start to Optimize the MNN Net..." << std::endl;
-        std::unique_ptr<MNN::NetT> newNet = optimizeNet(netT, modelPath.forTraining, modelPath, expectedPass);
-        if (newNet->extraTensorDescribe.size()>0 && expectedPass.empty()) {
-            MNN_PRINT("MNN net has tensor quant info\n");
-            computeUnaryBuffer(newNet.get());
+        finalNet = optimizeNet(netT, modelPath.forTraining, modelPath, expectedPass);
+        if (nullptr == finalNet) {
+            MNN_ERROR("[ERROR] Optimize failed.\n");
+            return false;
         }
-        _reorderInputs(inputNames, newNet.get());
-        error = writeFb(newNet, modelPath, std::move(metaOp));
+        if (finalNet->extraTensorDescribe.size()>0 && expectedPass.empty()) {
+            MNN_PRINT("MNN net has tensor quant info\n");
+            computeUnaryBuffer(finalNet.get());
+        }
+        _reorderInputs(inputNames, finalNet.get());
     } else {
         _reorderInputs(inputNames, netT.get());
-        error = writeFb(netT, modelPath, std::move(metaOp));
+        finalNet = std::move(netT);
     }
+
+#ifdef ENABLE_RKNN_CONVERT_MODE
+    if (modelPath.rknnSidecar) {
+        RKNNBundlePaths bundlePaths;
+        if (!GenerateRKNNBundle(modelPath, &bundlePaths)) {
+            return false;
+        }
+        auto wrapperNet = BuildRKNNWrapperNet(*finalNet, modelPath, bundlePaths);
+        if (nullptr == wrapperNet) {
+            return false;
+        }
+        error = writeFb(wrapperNet, modelPath, std::move(metaOp));
+    } else {
+        error = writeFb(finalNet, modelPath, std::move(metaOp));
+    }
+#else
+    error = writeFb(finalNet, modelPath, std::move(metaOp));
+#endif
     if (0 == error) {
         std::cout << "Converted Success!" << std::endl;
     } else {
         std::cout << "Converted Failed!" << std::endl;
+        return false;
     }
     if (modelPath.testDir.size() > 0) {
         std::cout << "Check convert result by " << modelPath.testDir << ", thredhold is " << modelPath.testThredhold << std::endl;

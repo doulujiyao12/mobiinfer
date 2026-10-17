@@ -91,6 +91,23 @@
     fcvtn2 \d1\().8h, \s3\().4s
 .endm
 
+// Expand fp16 scale/sourceBias metadata (weightQuantInfoMode=1) into fp32 scale
+// (\sLo/\sHi) and final offset (\zLo/\zHi) = sourceBias + (-8)*scale, replicating
+// the pack-time rounding (fmul then fadd, no fma). \tH/\tC are scratch; \wp advances.
+.macro EXPAND_QUANT_INFO_FP16 sLo, sHi, zLo, zHi, tH, tC, wp
+    ld1 {\tH\().8h}, [\wp], #16 // UNIT half scales
+    fcvtl \sLo\().4s, \tH\().4h
+    fcvtl2 \sHi\().4s, \tH\().8h
+    ld1 {\tH\().8h}, [\wp], #16 // UNIT half sourceBias (not final offsets)
+    fcvtl \zLo\().4s, \tH\().4h
+    fcvtl2 \zHi\().4s, \tH\().8h
+    fmov \tC\().4s, #-8.0
+    fmul \tH\().4s, \tC\().4s, \sLo\().4s
+    fadd \zLo\().4s, \zLo\().4s, \tH\().4s
+    fmul \tH\().4s, \tC\().4s, \sHi\().4s
+    fadd \zHi\().4s, \zHi\().4s, \tH\().4s
+.endm
+
 .macro REVERT_INPUT_DEQUANT_BIAS rg0, rg1, rg2, rg3
 mul \rg1, \rg2, \rg3
 sub \rg0, \rg0, \rg1
@@ -101,7 +118,8 @@ mul \rg1, \rg2, \rg3 // blocknum * ocUp8 * sizeof(float)
 sub \rg0, \rg0, \rg1, LSL #5 // revert weight kernel sum
 .endm
 asm_function MNNGemmInt8AddBiasScale_ARMV86_w4_Unit_FP16
-/* 
+/*
+Mirror of QuanPostTreatParameters in source/backend/cpu/compute/Int8FunctionsOpt.h; keep in sync.
 struct QuanPostTreatParameters {
     const float* scale;
     const float* biasFloat;
@@ -111,11 +129,15 @@ struct QuanPostTreatParameters {
     float roundValuePos = 0.5f;
     float roundValueNeg = -0.5f;
     float* srcKernelSum;
-    float* weightQuanBias;
+    float* weightKernelSum;
     float* fp32minmax;
     ssize_t blockNum = 1;
-    const int32_t* bias;
-    const float* extraScale = nullptr;
+    const int32_t* bias = nullptr;
+    const float* inputScale = nullptr;
+    const float* inputBias = nullptr;
+    float* accumBuffer = nullptr;
+    int32_t* indices = nullptr;
+    int32_t weightQuantInfoMode = 0; // #112: 0 FP32 scale/offset, 1 FP16 scale/sourceBias.
 };
 */
 //void MNNGemmInt8AddBiasScale_ARMV86_w4_Unit(int8_t* dst, const int8_t* src,
@@ -125,7 +147,7 @@ struct QuanPostTreatParameters {
 //Auto: x0:dst, x1:src, x2:weight, x3:src_depth_quad, x4:dst_step
 //x5:dst_depth_quad, x6: parameters, x7: realDstCount
 
-//Load from x6: x9: biasFloat, x8: srcKernelSum, x28: weightQuanBias, x14: fp32minmax
+//Load from x6: x9: biasFloat, x8: srcKernelSum, x28: weightKernelSum, x14: fp32minmax
 /* For FP16
 UNIT = 8;
 SRC_UNIT = 8;
@@ -150,6 +172,9 @@ lsl x22, x7, #3 // eDest * GEMM_INT8_SRC_UNIT
 ldr x23, [x6, #80]  // input scale
 ldr x27, [x6, #88]  // input bias
 ldr x10, [x6, #96]  // accumbuffer
+
+ldr w13, [x6, #112] // Metadata mode; keep it on the stack, x13 is the lu counter.
+str w13, [sp, #(16 * 9)]
 
 mov x15, x8      // input kernel sum
 mov x21, x23     // input dequant scale
@@ -247,10 +272,18 @@ LoopSzEnd_TILE_10:
     Int32ToFloat v16, v17, v18, v19
 
 Tile10Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (lu counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile10MetadataFP32
+    // v0-v19 accumulators stay live; v30/v31 are scratch.
+    EXPAND_QUANT_INFO_FP16 v20, v21, v25, v26, v30, v31, x2
+    b .LTile10MetadataReady
+.LTile10MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x2], #32  // scale
+    ld1 {v25.4s, v26.4s}, [x2], #32 // weight quan zeropoint
+.LTile10MetadataReady:
     ld1 {v22.4s, v23.4s}, [x8], #32 // x kernel sum
     ld1 {v24.d}[0], [x8], #8
-    ld1 {v25.4s, v26.4s}, [x2], #32 // weight quan zeropoint
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     MUL_SCALE v20, v8, v9, v12, v13
@@ -483,9 +516,18 @@ LoopSzEnd_TILE_8:
     Int32ToFloat v12, v13, v14, v15
 
 Tile8Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (lu counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile8MetadataFP32
+    // v0-v15 accumulators stay live; v29/v30/v31 are cross-block clamp/mask
+    // constants, so the expansion uses v16/v17 as scratch.
+    EXPAND_QUANT_INFO_FP16 v20, v21, v25, v26, v16, v17, x12
+    b .LTile8MetadataReady
+.LTile8MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.4s, v23.4s}, [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile8MetadataReady:
+    ld1 {v22.4s, v23.4s}, [x8] // x kernel sum
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     MUL_SCALE v20, v8, v9, v12, v13
@@ -659,9 +701,18 @@ LoopSzEnd_TILE_4:
     Int32ToFloat v4, v5, v6, v7
 
 Tile4Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (lu counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile4MetadataFP32
+    // v0-v7 accumulators stay live; v29/v30/v31 are cross-block clamp/mask
+    // constants, so the expansion uses v16/v17 as scratch.
+    EXPAND_QUANT_INFO_FP16 v20, v21, v25, v26, v16, v17, x12
+    b .LTile4MetadataReady
+.LTile4MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.4s}, [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile4MetadataReady:
+    ld1 {v22.4s}, [x8] // x kernel sum
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     add x8, x8, x22, LSR #1
@@ -786,9 +837,18 @@ LoopSz_TILE_2:
     Int32ToFloat v0, v1, v2, v3
 
 Tile2Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (lu counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile2MetadataFP32
+    // v0-v3 accumulators stay live; v29/v30/v31 are cross-block clamp/mask
+    // constants, so the expansion uses v16/v17 as scratch.
+    EXPAND_QUANT_INFO_FP16 v20, v21, v25, v26, v16, v17, x12
+    b .LTile2MetadataReady
+.LTile2MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.d}[0], [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile2MetadataReady:
+    ld1 {v22.d}[0], [x8] // x kernel sum
     fmul v0.4s, v0.4s, v20.4s
     fmul v1.4s, v1.4s, v20.4s
     fmul v2.4s, v2.4s, v21.4s
@@ -990,49 +1050,70 @@ LoopSzEnd_TILE_1:
     scvtf v26.4s, v26.4s
 
 Tile1Quan:
+    // v16/v17 hold the per-OC-chunk running fp32 accumulator across blocks.  The
+    // [x10] buffer carries the running sum across blocks within ONE OC chunk; conv
+    // exec only memsets accumbuff once per kernel call (or not at all for blockNum=1)
+    // so the FIRST block of each OC chunk must zero-init v16/v17 explicitly instead
+    // of loading from [x10] (which still holds the previous OC chunk's tail).
+    ldr w13, [sp, #(16 * 9)] // x13 (lu counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile1MetadataFP32
+    // v16/v17 running accumulators, v25/v26 dot results and v29/v30/v31 clamp/mask
+    // constants stay live; v3/v6 are scratch.
+    EXPAND_QUANT_INFO_FP16 v0, v1, v8, v9, v3, v6, x12
+    b .LTile1MetadataReady
+.LTile1MetadataFP32:
     ld1 {v0.4s, v1.4s}, [x12], #32  // scale
-    ld1 {v6.s}[0], [x8] // x kernel sum
-    ld1 {v8.4s, v9.4s}, [x12], #32 // weight quan zeropoint
-    fmul v25.4s, v25.4s, v0.4s
-    fmul v26.4s, v26.4s, v1.4s
+    ld1 {v8.4s, v9.4s}, [x12], #32  // weight quan zeropoint
+.LTile1MetadataReady:
+    ld1 {v4.s}[0], [x23], x25       // input scale
+    ld1 {v6.s}[0], [x8]             // x kernel sum
+    cbz x19, _w4_first_block_zero
+    ld1 {v16.4s, v17.4s}, [x10]     // running fp32 accum from prior block
+    b _w4_init_done
+_w4_first_block_zero:
+    movi v16.4s, #0                 // first block of this OC chunk
+    movi v17.4s, #0
+_w4_init_done:
     add x8, x8, x22, LSR #1
 
-    ld1 {v4.s}[0], [x23], x25
-    fmul v25.4s, v25.4s, v4.s[0]
-    fmul v26.4s, v26.4s, v4.s[0]
+    // P1.2 scale_eff fusion: scale * input_scale off the v16/v17 critical path.
+    fmul v0.4s, v0.4s, v4.s[0]
+    fmul v1.4s, v1.4s, v4.s[0]
+
+    // Per-block dequant chain into v16/v17 directly (replaces fmul v25 + fadd v16 + ...).
+    fmla v16.4s, v25.4s, v0.4s      // v16 += accum_fp * scale_eff
+    fmla v17.4s, v26.4s, v1.4s
     TILE1_MLA:
-    MLA_WEIGHTZERO v25, v6, v8, 0 // tile:0, oc:0-3
-    MLA_WEIGHTZERO v26, v6, v9, 0 // tile:0, oc:4-7
+    MLA_WEIGHTZERO v16, v6, v8, 0   // v16 += zp * xks
+    MLA_WEIGHTZERO v17, v6, v9, 0
 
     cbz x27, TILE1_ADD_DSTV
-    ld1 {v6.s}[0], [x27], x25 // input dequant bias
-    ld1 {v8.4s, v9.4s}, [x28], #32 // weight kernel sum
-    MLA_WEIGHTZERO v25, v6, v8, 0 // tile:0, oc:0-3
-    MLA_WEIGHTZERO v26, v6, v9, 0 // tile:0, oc:4-7
+    ld1 {v6.s}[0], [x27], x25       // input dequant bias
+    ld1 {v8.4s, v9.4s}, [x28], #32  // weight kernel sum
+    MLA_WEIGHTZERO v16, v6, v8, 0   // v16 += wks * inputBias
+    MLA_WEIGHTZERO v17, v6, v9, 0
 
     TILE1_ADD_DSTV:
-    cbz x19, TILE1_TEMP_BUFFER
-    ld1 {v16.4s, v17.4s}, [x10]
-    fadd v25.4s, v25.4s, v16.4s
-    fadd v26.4s, v26.4s, v17.4s
+    // v16/v17 already hold the updated running accum; nothing more to do.
 
     TILE1_TEMP_BUFFER:
     add x19, x19, #1
     cmp x19, x26
     beq TILE1_POST
-    st1 {v25.4s, v26.4s}, [x10]
+    st1 {v16.4s, v17.4s}, [x10]
     b TILE1_BLOCKNUM
 
     TILE1_POST:
     sub x24, x24, #1
     cbz x9, TILE1_CVT_FP16
-    ld1 {v16.4s, v17.4s}, [x20], #32 // bias
-    fadd v25.4s, v25.4s, v16.4s
-    fadd v26.4s, v26.4s, v17.4s
+    ld1 {v8.4s, v9.4s}, [x20], #32  // bias (use v8/v9 since v16/v17 hold result)
+    fadd v16.4s, v16.4s, v8.4s
+    fadd v17.4s, v17.4s, v9.4s
 
     TILE1_CVT_FP16:
-    fcvtn v0.4h, v25.4s
-    fcvtn2 v0.8h, v26.4s
+    fcvtn v0.4h, v16.4s
+    fcvtn2 v0.8h, v17.4s
     cbz x14, TILE1_STORE
     fmax v0.8h, v0.8h, v29.8h
     fmin v0.8h, v0.8h, v31.8h

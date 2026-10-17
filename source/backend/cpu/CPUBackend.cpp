@@ -51,12 +51,16 @@ ErrorCode CastWrapExecution::onExecute(const std::vector<Tensor*>& inputs, const
     CPUCastCreator::cast(inputs[0], outputs[0], cpuBackend, convertType);
     return NO_ERROR;
 }
-void CPUBackend::computeDivideSizes(int size, int* dst, float avgDiv) const {
-    if (mGroupWithComputeRate.size() <= 1 || (avgDiv > 0 && avgDiv < mComputeI)) {
+void CPUBackend::computeDivideSizes(int size, int* dst, float avgDiv, int threads) const {
+    if (threads <= 0 || threads > mThreadNumber) {
+        threads = mThreadNumber;
+    }
+    // Group rates are defined over the full thread set; a capped caller needs an even split.
+    if (mGroupWithComputeRate.size() <= 1 || (avgDiv > 0 && avgDiv < mComputeI) || threads != mThreadNumber) {
         // Avg divide
-        int length = UP_DIV(size, mThreadNumber);
+        int length = UP_DIV(size, threads);
         int cur = length;
-        for (int i=0; i<mThreadNumber; ++i) {
+        for (int i=0; i<threads; ++i) {
             dst[i] = cur;
             cur = cur + length;
             cur = ALIMIN(cur, size);
@@ -257,13 +261,6 @@ bool CPURuntime::onCheckInfo(Backend::Info& info) const {
     info.numThread = mThreadNumber;
     return true;
 }
-SingleBufferWithAllocator* CPURuntime::buffer(int index) const {
-    if (mDynamicMmap.empty()) {
-        return mDynamic.data() + index;
-    }
-    return mDynamicMmap.data() + index;
-}
-
 Backend* CPURuntime::onCreate(const BackendConfig* config, Backend* origin) const {
     {
         mCpuIds = hint().cpuIds;
@@ -288,16 +285,22 @@ Backend* CPURuntime::onCreate(const BackendConfig* config, Backend* origin) cons
         prefix[4] += mMemory;
         prefix[6] += mPower;
         // prefix += hint().modelUUID + "_";
-        bool autoRemove = true;
-        bool syncValid = false;
-        if (hint().useCachedMmap) {
-            autoRemove = false;
-            std::string fileName = MNNFilePathConcat(hint().weightMemoryPath, prefix + "sync.static");
-            syncValid = MNNFileExist(fileName.c_str());
-            const_cast<RuntimeHint&>(hint()).useCachedMmap += syncValid;
-        }
         if (nullptr == mStaticAllocatorMMap.get()) {
-            // Only support set weightmap dir once
+            // Only support set weightmap dir once. The sync.static marker must
+            // also be evaluated only once, here: later calls would see the
+            // sync file this very run wrote at its first onClearBuffer and
+            // flip useCachedMmap into trust-cache mode mid-run, so executions
+            // created after that (e.g. resize-time re-creations) would skip
+            // weight loading while their STATIC buffers no longer come from
+            // the mmap pool.
+            bool autoRemove = true;
+            bool syncValid = false;
+            if (hint().useCachedMmap) {
+                autoRemove = false;
+                std::string fileName = MNNFilePathConcat(hint().weightMemoryPath, prefix + "sync.static");
+                syncValid = MNNFileExist(fileName.c_str());
+                const_cast<RuntimeHint&>(hint()).useCachedMmap += syncValid;
+            }
             mStaticAllocatorRaw = mStaticAllocator;
             auto mmapMem = BufferAllocator::Allocator::createMmap(hint().weightMemoryPath.c_str(), prefix.c_str(), "static", autoRemove, syncValid);
             size_t mmapSize = static_cast<size_t>(hint().mmapFileSize) * 1024 * 1024;
@@ -366,6 +369,11 @@ int CPURuntime::onGetRuntimeStatus(RuntimeStatus statusEnum) const {
             return MNNGetCoreFunctions()->supportSDot;
             break;
         }
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+        case STATUS_SUPPORT_FUSED_PROJ: {
+            return 1;
+        }
+#endif
         default: {
             MNN_ERROR("unsupported interface");
             break;
@@ -519,19 +527,44 @@ CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode p
 CPUBackend::~CPUBackend() {
     // Do nothing
 }
-void CPUBackend::_resetDynamicMemory() const {
-    mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocator->apply();
-    if (NO_ERROR != mRuntime->pCurrentStatus) {
-        return;
+
+int CPUBackend::computeThreadNumber(int workItems) const {
+    int perfCores = mCoreFunctions->perfCoreNumber;
+    if (workItems > 1 && perfCores > 0 && mThreadNumber > perfCores) {
+        return perfCores;
     }
-    if (nullptr != mDmaInfo->mDynamicAllocatorBackup.get()) {
-        mRuntime->pCurrentStatus  = mDmaInfo->mDynamicAllocatorBackup->apply();
+    return mThreadNumber;
+}
+void CPUBackend::_prepareTensorMemory(const Tensor* srcTensor, const Tensor* dstTensor) const {
+    // Only prepare the plans backing these tensors. Applying this backend's
+    // unrelated plans can replace another graph's live shared arena.
+    DeferBufferAllocator* previous = nullptr;
+    for (auto tensor : {srcTensor, dstTensor}) {
+        auto node = TensorUtils::getDescribeOrigin(tensor)->cpuDynamicNode;
+        if (node == nullptr) {
+            continue;
+        }
+        if (node->allocator != previous) {
+            mRuntime->pCurrentStatus = node->allocator->apply();
+            if (mRuntime->pCurrentStatus != NO_ERROR) {
+                return;
+            }
+            previous = node->allocator;
+        }
+        // refTensorContent / clone may not be in the allocator's attached tensor list.
+        const_cast<Tensor*>(tensor)->buffer().host = static_cast<uint8_t*>(node->base) + node->offset;
     }
 }
 
 void CPUBackend::onExecuteBegin() const {
     mInitWorkQueue.reset();
-    _resetDynamicMemory();
+    mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocator->apply();
+    if (NO_ERROR != mRuntime->pCurrentStatus) {
+        return;
+    }
+    if (nullptr != mDmaInfo->mDynamicAllocatorBackup.get()) {
+        mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocatorBackup->apply();
+    }
 }
 
 void CPUBackend::onExecuteEnd() const {
@@ -576,6 +609,7 @@ Backend::MemObj* CPUBackend::allocBuffer(size_t size, Tensor* dest, StorageType 
             TensorUtils::getDescribeOrigin(dest)->mem = nullptr;
         }
     }
+    TensorUtils::getDescribeOrigin(dest)->cpuDynamicNode = nullptr;
     // MNN_PRINT("Acquire size = %d\n", size);
     if (size <= 0) {
         MNN_PRINT("Acquire buffer size = %lu\n", size);
@@ -588,9 +622,14 @@ Backend::MemObj* CPUBackend::allocBuffer(size_t size, Tensor* dest, StorageType 
     auto& buffer = dest->buffer();
     auto des = TensorUtils::getDescribe(dest);
     MemChunk chunk;
+    BufferAllocator* staticAllocator = mRuntime->mStaticAllocator.get();
     switch (storageType) {
         case STATIC: {
             chunk = mRuntime->mStaticAllocator->alloc(size, false);
+            if (chunk.invalid() && nullptr != mRuntime->mStaticAllocatorRaw.get()) {
+                chunk = mRuntime->mStaticAllocatorRaw->alloc(size, false);
+                staticAllocator = mRuntime->mStaticAllocatorRaw.get();
+            }
             break;
         }
         case DYNAMIC: {
@@ -613,8 +652,11 @@ Backend::MemObj* CPUBackend::allocBuffer(size_t size, Tensor* dest, StorageType 
 
     Backend::MemObj* res = nullptr;
 
+    // CPU tensor allocation uses a whole chunk; sub-chunk offsets are not introduced here.
+    MNN_ASSERT(chunk.node() == nullptr || chunk.second == 0);
+    TensorUtils::getDescribeOrigin(dest)->cpuDynamicNode = storageType == STATIC ? nullptr : chunk.node();
     if (storageType == STATIC) {
-        res = new CPUMemObj(mRuntime->mStaticAllocator.get(), chunk, size);
+        res = new CPUMemObj(staticAllocator, chunk, size);
     } else {
         res = new CPUMemObj(mDmaInfo->mCurrentDynamicAllocator, chunk, size);
         chunk.attach(dest);
@@ -654,6 +696,31 @@ static OpType _getRealOpType(OpType opType) {
             return opType;
     }
 }
+
+// A Conv / DepthwiseConv may be promoted to Int8 execution purely based on the
+// int8 quantAttr of its input/output tensors. Guard against promoting an op that
+// carries no quantized weight data (e.g. a Conv listed in skip_quant_op_names but
+// still surrounded by int8 tensors): the ConvInt8 executor would later dereference
+// a missing quan weight (null symmetricQuan) and crash. Non-conv ops are unaffected.
+static bool _convHasQuantWeight(const MNN::Op* op) {
+    auto opType = op->type();
+    if (opType != OpType_Convolution && opType != OpType_ConvolutionDepthwise) {
+        return true;
+    }
+    auto conv2d = op->main_as_Convolution2D();
+    if (nullptr == conv2d) {
+        return false;
+    }
+    auto quan = conv2d->quanParameter();
+    if (nullptr != quan && (nullptr != quan->buffer() || nullptr != conv2d->external())) {
+        return true;
+    }
+    auto symmetric = conv2d->symmetricQuan();
+    if (nullptr != symmetric && nullptr != symmetric->weight()) {
+        return true;
+    }
+    return false;
+}
 void* CPUBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* srcTensor) {
     if (static_cast<int>(getBytes(this, srcTensor)) != srcTensor->getType().bytes()) {
         return nullptr;
@@ -661,7 +728,7 @@ void* CPUBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype
     if (OpCommonUtils:: convertDimType(TensorUtils::getDescribe(srcTensor)->dimensionFormat) != dtype) {
         return nullptr;
     }
-    _resetDynamicMemory();
+    _prepareTensorMemory(srcTensor, srcTensor);
     if (mRuntime->pCurrentStatus != NO_ERROR) {
         // Out of memory
         return nullptr;
@@ -732,7 +799,7 @@ Execution* CPUBackend::onCreate(const std::vector<Tensor*>& inputs, const std::v
     if (outputs.size() > 0 && inputs.size() > 0) {
         bool outputQuant = TensorUtils::getDescribe(outputs[0])->quantAttr != nullptr && TensorUtils::getDescribe(outputs[0])->quantAttr->type == DataType_DT_INT8;
         bool inputQuant = TensorUtils::getDescribe(inputs[0])->quantAttr != nullptr && TensorUtils::getDescribe(inputs[0])->quantAttr->type == DataType_DT_INT8;
-        if (inputQuant && outputQuant) {
+        if (inputQuant && outputQuant && _convHasQuantWeight(op)) {
             opType = _getRealOpType(opType);
         }
     }
@@ -760,6 +827,13 @@ bool CPUBackend::onClearBuffer() {
         mRuntime->mStaticAllocator->sync();
         mRuntime->mStaticAllocator = mRuntime->mStaticAllocatorRaw;
         mRuntime->mStaticAllocatorRaw = nullptr;
+        // The weight-mmap pool is sealed from here on: STATIC buffers acquired
+        // later come from the raw allocator and are not backed by the cache
+        // files, so executions created later (e.g. resize-time re-creations)
+        // must load their weights instead of trusting the cache.
+        if (mRuntime->hint().useCachedMmap > 1) {
+            const_cast<RuntimeHint&>(mRuntime->hint()).useCachedMmap = 1;
+        }
     }
     mCache->reset();
     mDmaInfo->mCurrentDynamicAllocator->release(true);
@@ -776,7 +850,7 @@ std::pair<int, int> CPUBackend::multiThreadDivide(int size) const {
     return std::make_pair(sizeDivide, scheduleNumber);
 }
 void CPUBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const {
-    _resetDynamicMemory();
+    _prepareTensorMemory(srcTensor, dstTensor);
     if (mRuntime->pCurrentStatus != NO_ERROR) {
         // Out of memory
         return;

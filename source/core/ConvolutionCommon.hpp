@@ -16,17 +16,26 @@ class MNN_PUBLIC ConvolutionCommon : public Execution {
 public:
     struct Int8Common {
         AutoStorage<int8_t> weight;
+        // When present, alpha takes precedence over alphaHalf because it may include fp32 corrections.
         AutoStorage<float> alpha;
+        AutoStorage<int16_t> alphaHalf;
         AutoStorage<float> weightFloat;
         const IDSTQuan* quan;
         bool asymmetric;
+        bool alphaIsFp16 = false;
         std::vector<int8_t> weightMap;
         bool canUseInt4 = false;
+        bool canUseInt3 = false;
+        bool canUseInt2 = false;
         Backend* backend = nullptr;
         int originBits = 8;
         int alphaSize;
+        // Lazy accessors. Element count is alphaSize.
+        const float* getAlphaFloat();
+        const int16_t* getAlphaHalf();
     };
-    static std::shared_ptr<Int8Common> load(const Op* op, Backend* backend = nullptr, bool forceFloat = false, bool forceInt8 = false, void* weightPtr = nullptr);
+    static std::shared_ptr<Int8Common> load(const Op* op, Backend* backend = nullptr, bool forceFloat = false,
+                                          bool forceInt8 = false, void* weightPtr = nullptr, bool allowFp16Alpha = false);
     // if can not get quant bits, return 0
     static int getQuantBitFromExternalFile(const Op* op);
     static void getConvParameters(std::shared_ptr<ConvolutionCommon::Int8Common> *quanCommon, Backend* backend, const MNN::Op *op, const float** originWeight, int* originWeightSize);

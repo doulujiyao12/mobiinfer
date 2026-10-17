@@ -56,6 +56,7 @@ extern void ___CPUConvolutionDepthwiseCreator__OpType_ConvolutionDepthwise__();
 extern void ___CPURangeCreator__OpType_Range__();
 extern void ___CPUTFQuantizedConv2DCreator__OpType_TfQuantizedConv2D__();
 extern void ___CPUInterp3DCreator__OpType_Interp3D__();
+extern void ___CPURoPECreator__OpType_RoPE__();
 extern void ___CPUQuantizedAvgPoolCreator__OpType_QuantizedAvgPool__();
 extern void ___ConvolutionFactory__OpType_Convolution__();
 extern void ___CPUConvInt8Creator__OpType_ConvInt8__();
@@ -77,6 +78,7 @@ extern void ___CPUTextureCreator__OpType_Texture__();
 #endif
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 extern void ___CPUAttentionCreator__OpType_Attention__();
+extern void ___CPUFusedProjCreator__OpType_FusedLinear__();
 extern void ___CPULinearAttentionCreator__OpType_LinearAttention__();
 #endif
 void registerCPUOps() {
@@ -136,6 +138,7 @@ ___CPUConvolutionDepthwiseCreator__OpType_ConvolutionDepthwise__();
 ___CPURangeCreator__OpType_Range__();
 ___CPUTFQuantizedConv2DCreator__OpType_TfQuantizedConv2D__();
 ___CPUInterp3DCreator__OpType_Interp3D__();
+___CPURoPECreator__OpType_RoPE__();
 ___CPUQuantizedAvgPoolCreator__OpType_QuantizedAvgPool__();
 ___ConvolutionFactory__OpType_Convolution__();
 ___CPUConvInt8Creator__OpType_ConvInt8__();
@@ -156,6 +159,7 @@ ___CPUTextureCreator__OpType_Texture__();
 #endif
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 ___CPUAttentionCreator__OpType_Attention__();
+___CPUFusedProjCreator__OpType_FusedLinear__();
 ___CPULinearAttentionCreator__OpType_LinearAttention__();
 #endif
 }

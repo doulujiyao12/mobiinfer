@@ -135,13 +135,19 @@ class GPTQ:
     def apply(self, graph_path, weight_path):
         # parse mnn graph
         mnn_weights = []
-        mnn_graph = json.load(open(graph_path, 'rt'))
+        with open(graph_path, 'rt') as graph_file:
+            mnn_graph = json.load(graph_file)
+        if any(op['type'] == 'FusedLinear' for op in mnn_graph['oplists']):
+            raise ValueError('GPTQ import requires unfused projections; disable Transformer C4 fusion before conversion.')
         for op in mnn_graph['oplists']:
             if op['type'] == 'Convolution':
                 name = op['name']
                 external = op['main']['external']
                 weight_elements = op['main']['common']['outputCount'] * op['main']['common']['inputCount']
-                mnn_weights.append(MNNWeight(name, external, weight_elements))
+                weight = MNNWeight(name, external, weight_elements)
+                if self.get(weight.key()) is not None and op['main']['quanParameter'].get('scaleStorage', 'FP32') != 'FP32':
+                    raise ValueError('GPTQ import requires FP32 scale storage; export with --scale_bit 32.')
+                mnn_weights.append(weight)
         # load mnn weight
         external_weight = open(weight_path, 'r+b')
         for mnn_weight in mnn_weights:
@@ -436,7 +442,10 @@ class VisualGPTQ(GPTQ):
         layer_offset is added to block indices from hierarchical naming so
         chunk-relative indices map to global GPTQ safetensor keys.
         """
-        mnn_graph = json.load(open(graph_path, 'rt'))
+        with open(graph_path, 'rt') as graph_file:
+            mnn_graph = json.load(graph_file)
+        if any(op['type'] == 'FusedLinear' for op in mnn_graph['oplists']):
+            raise ValueError('Visual GPTQ import requires unfused projections; disable Transformer C4 fusion before conversion.')
         block_weights = self.classify_visual_conv_ops(mnn_graph, layer_offset)
 
         # Build a lookup: op_name -> (VisualMNNWeight, gptq_data)

@@ -7,6 +7,10 @@
 //
 
 #include "NPUBackend.hpp"
+#include "HiAIDynamicLoader.hpp"
+
+#include <atomic>
+#include <cstdio>
 #include <fstream>
 #include <algorithm>
 #include <cstdint>
@@ -17,15 +21,22 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <errno.h>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+
 #include <core/Macro.h>
 #include <core/TensorUtils.hpp>
+#include "HiAIBackendConfig.hpp"
 #include <stdlib.h>
-//#define MNN_OPEN_TIME_TRACE
+#include <unistd.h>
+// #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 
 #ifdef HIAI_DEBUG
-    #include <android/log.h>
-    #include <sys/time.h>
+#include <android/log.h>
+#include <sys/time.h>
 #endif
 namespace MNN {
     static const char* usageName(Tensor::InsideDescribe::Usage usage) {
@@ -89,6 +100,117 @@ namespace MNN {
         }
         return true;
     }
+
+namespace {
+
+constexpr std::uint64_t kMaximumHiaiCacheBytes = 256ull * 1024ull * 1024ull;
+constexpr char kHiaiCacheMarker[] = "MNN_HIAI_CACHE_PATH_V1\n";
+constexpr char kHiaiV600CacheSuffix[] = ".hiai_v600_cache_v1.om";
+constexpr char kHiaiV320CacheSuffix[] = ".hiai_v320_cache_v1.om";
+
+std::string HiaiModelIdentity(const void* data, std::size_t size) {
+    if (data == nullptr || size == 0) {
+        return std::string();
+    }
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    std::uint64_t hash = kFnvOffset;
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= kFnvPrime;
+    }
+    char identity[48] = {};
+    std::snprintf(identity, sizeof(identity), "%016llx-%zu", static_cast<unsigned long long>(hash), size);
+    return identity;
+}
+
+std::string HiaiCacheFile(const std::string& basePath, const std::string& modelIdentity, const char* suffix) {
+    return basePath.empty() || modelIdentity.empty() ? std::string() : basePath + "." + modelIdentity + suffix;
+}
+
+std::string HiaiTemporaryCacheFile(const std::string& path) {
+    static std::atomic<std::uint64_t> sequence{0};
+    return path + ".tmp-" + std::to_string(getpid()) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+}
+
+bool ReadHiaiCacheFile(const std::string& path, std::vector<std::uint8_t>* bytes) {
+    if (path.empty() || bytes == nullptr) {
+        return false;
+    }
+    bytes->clear();
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) {
+        return false;
+    }
+    const std::streamoff size = stream.tellg();
+    if (size <= 0 || static_cast<std::uint64_t>(size) > kMaximumHiaiCacheBytes) {
+        return false;
+    }
+    bytes->resize(static_cast<std::size_t>(size));
+    stream.seekg(0, std::ios::beg);
+    return static_cast<bool>(stream.read(reinterpret_cast<char*>(bytes->data()), static_cast<std::streamsize>(size)));
+}
+
+bool WriteHiaiCacheFileAtomic(const std::string& path, const void* data, std::size_t size) {
+    if (path.empty() || data == nullptr || size == 0 || size > kMaximumHiaiCacheBytes) {
+        return false;
+    }
+    const std::string temporaryPath = HiaiTemporaryCacheFile(path);
+    (void)std::remove(temporaryPath.c_str());
+    std::ofstream stream(temporaryPath, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        return false;
+    }
+    stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    stream.close();
+    if (!stream || std::rename(temporaryPath.c_str(), path.c_str()) != 0) {
+        (void)std::remove(temporaryPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool EnsureHiaiCachePathMarker(const std::string& path) {
+    if (path.empty() || access(path.c_str(), F_OK) == 0) {
+        return true;
+    }
+    return WriteHiaiCacheFileAtomic(path, kHiaiCacheMarker, sizeof(kHiaiCacheMarker) - 1);
+}
+
+MNNHiAINativeHandleIoContext* HiaiNativeIoContext(
+    const Backend::Info& info,
+    bool explicitlyRequestedHiAI) {
+    if (!explicitlyRequestedHiAI || info.user == nullptr ||
+        info.user->sharedContext == nullptr) {
+        return nullptr;
+    }
+    const auto* config = static_cast<const MNNHiAIBackendConfigV1*>(info.user->sharedContext);
+    if (validateHiAIConfig(config) != MNN_HIAI_STATUS_SUCCESS) {
+        return nullptr;
+    }
+    auto* context = config->nativeIoContext;
+    if (context == nullptr) {
+        return nullptr;
+    }
+    if (context->magic != MNN_HIAI_NATIVE_HANDLE_IO_MAGIC ||
+        context->version != MNN_HIAI_NATIVE_HANDLE_IO_VERSION ||
+        context->struct_size < sizeof(MNNHiAINativeHandleIoContext)) {
+        return nullptr;
+    }
+    return context;
+}
+
+bool HiaiForceV320(const Backend::Info& info,
+                   bool explicitlyRequestedHiAI) {
+    const auto* context = HiaiNativeIoContext(info, explicitlyRequestedHiAI);
+    return context != nullptr &&
+           (context->reserved[MNN_HIAI_SESSION_CONTROL_INDEX] &
+            MNN_HIAI_SESSION_FORCE_V320) != 0;
+}
+
+} // namespace
 
     void MNNPackC4Uint8(uint8_t* dst, const uint8_t* src, size_t area, size_t depth) {
         int z, x;
@@ -318,7 +440,7 @@ namespace MNN {
             return nullptr;
         }
 
-        shared_ptr<hiai::AiModelDescription> desc = make_shared<hiai::AiModelDescription>(model_name, 3, 0, 0, 0);
+        shared_ptr<hiai::AiModelDescription> desc = make_shared<hiai::AiModelDescription>(model_name, 4, 0, 0, 0);
         desc->SetModelBuffer(buffer->GetMemBufferData(), buffer->GetMemBufferSize());
 
         vector<shared_ptr<hiai::AiModelDescription>> model_desc;
@@ -355,6 +477,46 @@ namespace MNN {
     NPUBackend::NPUBackend(const NPURuntime* runtime) : Backend(MNN_FORWARD_USER_0) {
         mNPURuntime = runtime;
         mPrecision  = mNPURuntime->mPrecision;
+        const bool explicitlyRequestedHiAI = isExplicitHiAISession();
+        mNativeIoContext = HiaiNativeIoContext(mNPURuntime->mInfo,
+                                               explicitlyRequestedHiAI);
+        if (mNativeIoContext != nullptr) {
+            mForceV320 =
+                (mNativeIoContext->reserved[MNN_HIAI_SESSION_CONTROL_INDEX] &
+                 MNN_HIAI_SESSION_FORCE_V320) != 0;
+        }
+        if (!mForceV320 && explicitlyRequestedHiAI) {
+            bool enableAutoTuning = false;
+            std::string tuningCacheDirectory;
+            enableAutoTuning = mNPURuntime->mHiAIOptions->autoTuning;
+            tuningCacheDirectory = mNPURuntime->mHiAIOptions->acceleratorCacheDirectory;
+            mHclV600Runtime = HiaiHclV600Runtime::CreateIfSupported(enableAutoTuning, tuningCacheDirectory);
+        }
+        if (mHclV600Runtime != nullptr) {
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] =
+                    MNN_HIAI_SESSION_HCL_V600_SELECTED;
+            }
+            MNN_PRINT("MNN_HIAI_HCL_V600_AUDIT: selected version=%s api=BuildV2/InitV2/RunV3\n",
+                      mHclV600Runtime->version().c_str());
+        } else if (!mForceV320 && explicitlyRequestedHiAI) {
+            mRequiresV320SessionRebuild = true;
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] =
+                    MNN_HIAI_SESSION_HCL_V600_FAILED;
+            }
+            MNN_ERROR("MNN_HIAI_SESSION_REBUILD_AUDIT: HCL V600 unavailable; "
+                      "the initial MNN session must be destroyed before "
+                      "building V320\n");
+        } else if (explicitlyRequestedHiAI) {
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] =
+                    MNN_HIAI_SESSION_V320_SELECTED;
+            }
+            MNN_PRINT("MNN_HIAI_SESSION_REBUILD_AUDIT: selected=V320 force=%d runtime=%s\n",
+                      mForceV320 ? 1 : 0,
+                      mNPURuntime->mHiaiRuntimeVersion.c_str());
+        }
 #ifdef HIAI_DEBUG
         // Retrieve a handle to libandroid.
         void *lib = dlopen("libandroid.so", RTLD_NOW || RTLD_LOCAL);
@@ -371,7 +533,22 @@ namespace MNN {
 #endif
     }
     NPUBackend::~NPUBackend() {
-
+        if (!isExplicitHiAISession()) {
+            return;
+        }
+        bool released = releaseModelResources(true);
+        if (mLibAndroid != nullptr) {
+            if (dlclose(mLibAndroid) != 0) released = false;
+            mLibAndroid = nullptr;
+        }
+        if (mNativeIoContext != nullptr) {
+            mNativeIoContext->reserved
+                [MNN_HIAI_SESSION_RELEASE_STATUS_INDEX] =
+                    released ? MNN_HIAI_SESSION_RELEASE_SUCCESS
+                             : MNN_HIAI_SESSION_RELEASE_FAILED;
+        }
+        MNN_PRINT("MNN_HIAI_RELEASE_AUDIT: %s\n",
+                  released ? "PASS" : "FAIL");
     }
 
     void NPUBackend::setNetworkInput(const std::vector<Tensor *> &inputs, const Op* op) {
@@ -413,8 +590,11 @@ namespace MNN {
        }
        for (size_t i = 0; i < idxCount && i < inputs.size(); i++) {
             auto inputIndex = op->inputIndexes()->data()[i];
-            auto outputIndex = (op->outputIndexes() && i < op->outputIndexes()->size())
-                                ? op->outputIndexes()->data()[i] : -1;
+            auto inputOpsIndex = inputIndex;
+            if (!isExplicitHiAISession() && op->outputIndexes() != nullptr &&
+                i < op->outputIndexes()->size()) {
+                inputOpsIndex = op->outputIndexes()->data()[i];
+            }
             Tensor *inputTensor = inputs[i];
             if (inputTensor == nullptr) {
                 MNN_HIAI_LOG("setNetworkInput: ABORT inputs[%zu] is null (op=%s)", i, opName);
@@ -487,7 +667,7 @@ namespace MNN {
                                        (unsigned long)(const_cast<Tensor*>(inputTensor)),
                                        elemBytes});
 #else
-                std::pair<int, std::vector<ge::Operator>> item(outputIndex, {*data.get()});
+                std::pair<int, std::vector<ge::Operator>> item(inputOpsIndex, {*data.get()});
                 mInputOps.insert(item);
 #endif
 #if HIAI_VERBOSE
@@ -552,7 +732,7 @@ namespace MNN {
 
     void NPUBackend::addConstRef(const Tensor* tensor) {
         if (tensor == nullptr) return;
-        if (TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT || 
+        if (TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT ||
             TensorUtils::getDescribeOrigin(tensor)->mem.get() != nullptr) {
             mConstRefCounts[tensor]++;
         }
@@ -568,7 +748,7 @@ namespace MNN {
             if (iter->second <= 0) {
                 auto des = TensorUtils::getDescribeOrigin(tensor);
                 if (des->mem.get() != nullptr) {
-                    des->mem = nullptr; 
+                    des->mem = nullptr;
                     const_cast<Tensor*>(tensor)->buffer().host = nullptr;
                 }
                 mConstRefCounts.erase(iter);
@@ -589,9 +769,7 @@ namespace MNN {
                     MNN_PRINT("[NPU] Don't support type %d, %s\n", op->type(), op->name()->c_str());
                 }
             }
-            MNN_HIAI_LOG("onCreate MISS: op_ptr=%p op_type=%d op_name=%s (no creator registered — fallback to CPU)",
-                         (const void*)op, (int)op->type(), opName);
-            return nullptr;
+            return new HiAIRejectedExecution(this, NOT_SUPPORT);
         }
 
         MNN_HIAI_LOGV2("onCreate HIT : op_ptr=%p op_type=%d op_name=%s inputs=%zu outputs=%zu",
@@ -614,23 +792,41 @@ namespace MNN {
                     MNN_PRINT("[NPU] The Creator Don't support type %d, %s\n", op->type(), op->name()->c_str());
                 }
             }
-            MNN_HIAI_LOG("onCreate FAIL: op_ptr=%p creator returned null for op_type=%d op_name=%s",
-                         (const void*)op, (int)op->type(), opName);
-            return nullptr;
+            return new HiAIRejectedExecution(this, NOT_SUPPORT);
         }
 
         return exe;
     }
 
-    void NPUBackend::NPUBackend::onExecuteBegin() const {
-        MNN_HIAI_LOG("onExecuteBegin");
+    void NPUBackend::onExecuteBegin() const {
+        mGraphExecuted = false;
+        // Pipeline stages host inputs before this hook. If no input needed a
+        // fresh copy, reset the previous frame here; otherwise onCopyBuffer
+        // already reset it before staging and any copy error must survive.
+        if (mResetStatusOnNextExecute) {
+            mExecutionStatus = NO_ERROR;
+            mResetStatusOnNextExecute = false;
+        } else if (mExecutionStatus != NO_ERROR) {
+            // Preserve this frame's staging error for Pipeline::_enterExecute,
+            // but allow a following frame with unchanged inputs to retry.
+            mResetStatusOnNextExecute = true;
+        }
+    }
+
+    ErrorCode NPUBackend::runGraphOnce() const {
+        if (!mGraphExecuted) {
+            mGraphExecuted = true;
+            const int nativeCode = mExecutionStatus == NO_ERROR ? process(0) : -1;
+            if (nativeCode != 0 && mExecutionStatus == NO_ERROR) mExecutionStatus = INVALID_VALUE;
+            if (mNPURuntime->mHiAIOptions) mNPURuntime->mHiAIOptions->report(
+                MNN_HIAI_STAGE_EXECUTE, mExecutionStatus, mExecutionStatus == NO_ERROR ?
+                "HiAI execution completed" : "HiAI execution or input copy failed", nativeCode);
+        }
+        return mExecutionStatus;
     }
 
     void NPUBackend::onExecuteEnd() const {
-        MNN_HIAI_LOG("onExecuteEnd: -> process()");
-        int ret = process(0);
-        MNN_HIAI_LOG("onExecuteEnd: process ret=%d (%s)",
-                     ret, ret == 0 ? "OK" : "FAILED");
+        mResetStatusOnNextExecute = true;
     }
 
     Backend::MemObj* NPUBackend::onAcquire(const Tensor* tensor, StorageType storageType) {
@@ -646,6 +842,7 @@ namespace MNN {
     }
 
     void NPUBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const {
+        HiAICopyDiagnostic diagnostic(mNPURuntime->mHiAIOptions.get(), mExecutionStatus);
 #ifdef HIAI_DEBUG
         ATrace_beginSection("onCopy");
 #endif
@@ -658,63 +855,79 @@ namespace MNN {
             tmpTensor->buffer().host = srcTensor->buffer().host;
             return;
         }
-        
+
         if (isInputCopy) {
-            auto index = mInputMap.find((unsigned long)(const_cast<Tensor*>(dstTensor)));
-            MNN_ASSERT(index != mInputMap.end());
-            shared_ptr<hiai::AiTensor> input = mInputTensors[index->second];
-#if MNN_HIAI_USE_LOCAL_NPU_FIXES
-            if (srcTensor->host<void>() == nullptr) {
-                // Upstream (usually an earlier NPU chunk) did not materialize its
-                // output to host before this input-copy; without this guard we would
-                // memcpy(npu_buf, NULL, size) and crash. Caller should readMap the
-                // producer VARP between chunks.
-                MNN_ERROR("[NPU] onCopyBuffer: src host is NULL (size=%d). "
-                          "Zero-filling input buffer to avoid stale data.\n",
-                          (int)input->GetSize());
-                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, zero fill\n",
-                             (int)input->GetSize());
-                MNN_HIAI_LOG("[NPU] null-src detail: src=%p dst=%p hiaiSlot=%d srcUsage=%s dstUsage=%s srcShape=[%s] dstShape=[%s] srcElem=%d dstElem=%d srcFmt=%d dstFmt=%d",
-                             srcTensor, dstTensor, index->second,
-                             usageName(TensorUtils::getDescribe(srcTensor)->usage),
-                             usageName(TensorUtils::getDescribe(dstTensor)->usage),
-                             tensorShapeString(srcTensor).c_str(), tensorShapeString(dstTensor).c_str(),
-                             srcTensor->elementSize(), dstTensor->elementSize(),
-                             (int)TensorUtils::getDescribe(srcTensor)->dimensionFormat,
-                             (int)TensorUtils::getDescribe(dstTensor)->dimensionFormat);
-                
+            if (mResetStatusOnNextExecute) {
+                mExecutionStatus = NO_ERROR;
+                mResetStatusOnNextExecute = false;
+            }
+            if (mNativeIoContext != nullptr &&
+                srcTensor->buffer().flags == MNN_MEMORY_AHARDWAREBUFFER) {
+                // Binding happens before the small audio memcpy and before
+                // Process(), so both input and output ION handles are ready
+                // for this frame. The caller checks result_code immediately.
+                if (!const_cast<NPUBackend*>(this)->bindNativeHandleIo()) {
+                    mExecutionStatus = INPUT_DATA_ERROR;
+                }
                 return;
             }
-            // Use MNNCPUCopyBuffer to securely handle potential NC4HW4 -> NCHW unpack
+            auto index = mInputMap.find((unsigned long)(const_cast<Tensor*>(dstTensor)));
+            if (index == mInputMap.end() || srcTensor->buffer().host == nullptr) {
+                MNN_ERROR("MNN_HIAI: invalid input copy binding\n");
+                mExecutionStatus = INPUT_DATA_ERROR;
+                return;
+            }
+            if (mHclV600Runtime != nullptr) {
+                void* destination = mHclV600Runtime->inputData(index->second);
+                const size_t destinationSize =
+                    mHclV600Runtime->inputSize(index->second);
+                if (destination == nullptr || destinationSize != srcTensor->size()) {
+                    MNN_ERROR("MNN_HIAI_HCL_V600_AUDIT: input copy mismatch index=%d hcl=%lu mnn=%d\n",
+                              index->second, destinationSize, srcTensor->size());
+                    mExecutionStatus = INPUT_DATA_ERROR;
+                    return;
+                }
+                memcpy(destination, srcTensor->host<void>(), destinationSize);
+                return;
+            }
+            if (index->second < 0 || static_cast<size_t>(index->second) >= mInputTensors.size()) {
+                mExecutionStatus = INPUT_DATA_ERROR;
+                return;
+            }
+            auto input = mInputTensors[index->second];
+            if (input->GetBuffer() == nullptr) {
+                mExecutionStatus = INPUT_DATA_ERROR;
+                return;
+            }
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
             Tensor nchwView(dstTensor, Tensor::CAFFE, false);
-            nchwView.buffer().host = (uint8_t*)input->GetBuffer();
+            nchwView.buffer().host = static_cast<uint8_t*>(input->GetBuffer());
             MNNCPUCopyBuffer(srcTensor, &nchwView);
 #else
-            if (srcTensor->host<void>() == nullptr) {
-                // Upstream (usually an earlier NPU chunk) did not materialize its
-                // output to host before this input-copy; without this guard we would
-                // memcpy(npu_buf, NULL, size) and crash. Caller should readMap the
-                // producer VARP between chunks.
-                MNN_ERROR("[NPU] onCopyBuffer: src host is NULL (size=%d). "
-                          "Zero-filling input buffer to avoid stale data.\n",
-                          (int)input->GetSize());
-                MNN_HIAI_LOG("[NPU] onCopyBuffer isInputCopy: src host is NULL, size=%d, zero fill\n",
-                             (int)input->GetSize());
-                MNN_HIAI_LOG("[NPU] null-src detail: src=%p dst=%p hiaiSlot=%d srcUsage=%s dstUsage=%s srcShape=[%s] dstShape=[%s] srcElem=%d dstElem=%d srcFmt=%d dstFmt=%d",
-                             srcTensor, dstTensor, index->second,
-                             usageName(TensorUtils::getDescribe(srcTensor)->usage),
-                             usageName(TensorUtils::getDescribe(dstTensor)->usage),
-                             tensorShapeString(srcTensor).c_str(), tensorShapeString(dstTensor).c_str(),
-                             srcTensor->elementSize(), dstTensor->elementSize(),
-                             (int)TensorUtils::getDescribe(srcTensor)->dimensionFormat,
-                             (int)TensorUtils::getDescribe(dstTensor)->dimensionFormat);
-                
-            
-                return;
-            }
-            memcpy(input->GetBuffer(), srcTensor->host<void>(), (size_t)input->GetSize());
+            memcpy(input->GetBuffer(), srcTensor->host<void>(), static_cast<size_t>(input->GetSize()));
 #endif
         } else if(isOutputCopy){
+            if (mHclV600Runtime != nullptr) {
+                int outputIndex = -1;
+                for (size_t i = 0; i < mMNNOutTensors.size(); ++i) {
+                    if (srcTensor == mMNNOutTensors[i]) outputIndex = static_cast<int>(i);
+                }
+                void* source = outputIndex < 0 ? nullptr : mHclV600Runtime->outputData(outputIndex);
+                if (source == nullptr || dstTensor->host<void>() == nullptr ||
+                    mHclV600Runtime->outputSize(outputIndex) != static_cast<size_t>(dstTensor->size())) {
+                    mExecutionStatus = INVALID_VALUE;
+                    return;
+                }
+                memcpy(dstTensor->host<void>(), source, dstTensor->size());
+                return;
+            }
+            if (mNativeIoContext != nullptr &&
+                dstTensor->buffer().flags == MNN_MEMORY_AHARDWAREBUFFER &&
+                mNativeIoContext->result_code ==
+                    MNN_HIAI_NATIVE_HANDLE_IO_SUCCESS) {
+                // Process() already wrote directly into the output dma-buf.
+                return;
+            }
 #if MNN_HIAI_USE_LOCAL_NPU_FIXES
             int matchIndex = -1;
             // Primary: match by Backend::MemObj pointer, which is shared between
@@ -745,6 +958,7 @@ namespace MNN {
             if (matchIndex == -1 || matchIndex >= (int)mOutputTensors.size()) {
                 MNN_HIAI_LOG("  -> Cannot recover output mapping (match=%d, npuOut=%zu)! Aborting copy.",
                              matchIndex, mOutputTensors.size());
+                mExecutionStatus = INVALID_VALUE;
                 return;
             }
 
@@ -753,9 +967,10 @@ namespace MNN {
             if (tmpTensor->buffer().host == nullptr) {
                 MNN_HIAI_LOG("[NPU] onCopyBuffer isOutputCopy: dst host is NULL, size=%d, skip memcpy\n",
                           (int)output->GetSize());
+                mExecutionStatus = INVALID_VALUE;
                 return;
             }
-            
+
             if (output->GetBuffer() != nullptr) {
                 // Use MNNCPUCopyBuffer to securely handle NCHW -> NC4HW4 repack if requested by MNN
                 Tensor nchwView(srcTensor, Tensor::CAFFE, false);
@@ -771,12 +986,23 @@ namespace MNN {
                     break;
                 }
             }
-            if(flag == false) {
-                MNN_HIAI_LOG("MNNTensor and HIAITensor mismatch! srcTensor=%p dstTensor=%p mMNNOutTensors.size=%zu", 
-                             srcTensor, dstTensor, mMNNOutTensors.size());
-                for(size_t i=0; i<mMNNOutTensors.size(); i++) {
-                    MNN_HIAI_LOG("  mMNNOutTensors[%zu]=%p usage=%d", i, mMNNOutTensors[i], TensorUtils::getDescribe(mMNNOutTensors[i])->usage);
+            if (flag == false) {
+                MNN_PRINT("MNNTensor and HIAITensor mismatch!");
+                mExecutionStatus = INVALID_VALUE;
+                return;
+            }
+
+            if (mHclV600Runtime != nullptr) {
+                void* source = mHclV600Runtime->outputData(index);
+                const size_t sourceSize = mHclV600Runtime->outputSize(index);
+                if (source == nullptr || sourceSize != dstTensor->size()) {
+                    MNN_ERROR("MNN_HIAI_HCL_V600_AUDIT: output copy mismatch index=%d hcl=%lu mnn=%d\n",
+                              index, sourceSize, dstTensor->size());
+                    mExecutionStatus = INVALID_VALUE;
+                    return;
                 }
+                Tensor* tmpTensor = const_cast<Tensor*>(dstTensor);
+                memcpy(tmpTensor->buffer().host, source, sourceSize);
                 return;
             }
 
@@ -795,12 +1021,56 @@ namespace MNN {
 #endif
     }
 
+    bool NPUBackend::releaseModelResources(bool finalRelease) {
+        mOutputMemToIndex.clear();
+        mInputSqueezedAxes.clear();
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        mInputOrder.clear();
+#endif
+        mConstRefCounts.clear();
+        mKeepConsts.clear();
+        mGrapMap.clear();
+        mOutGEOpMap.clear();
+        mInputOps.clear();
+        mInputTensors.clear();
+        mOutputTensors.clear();
+        mHostInputTensors.clear();
+        mHostOutputTensors.clear();
+        mImageInputIndex = -1;
+        mImageOutputIndex = -1;
+        mBoundInputAhb = nullptr;
+        mBoundOutputAhb = nullptr;
+        mMNNOutTensors.clear();
+        mSclipMap.clear();
+        bool released = true;
+        if (mHclV600Runtime != nullptr) {
+            released = (finalRelease ? mHclV600Runtime->release()
+                                     : mHclV600Runtime->resetModel()) &&
+                       released;
+            if (finalRelease) mHclV600Runtime.reset();
+        }
+        if (mMgrClient != nullptr) {
+            const hiai::AIStatus status = mMgrClient->UnLoadModel();
+            if (status != hiai::AI_SUCCESS) {
+                MNN_ERROR("MNN_HIAI_RELEASE_AUDIT: UnLoadModel failed "
+                          "status=%d\n", static_cast<int>(status));
+                released = false;
+            }
+            mMgrClient.reset();
+        }
+        return released;
+    }
+
     void NPUBackend::onResizeBegin() {
 #if HIAI_VERBOSE
         mResizeTimerStart = std::chrono::steady_clock::now();
 #endif
         MNN_HIAI_LOG("onResizeBegin: clearing existing graph state (was_compiled=%d)",
                      mMgrClient != nullptr ? 1 : 0);
+        if (isExplicitHiAISession()) {
+            (void)releaseModelResources(false);
+            return;
+        }
         mGrapMap.clear();
         mOutGEOpMap.clear();
         mInputOps.clear();
@@ -824,21 +1094,18 @@ namespace MNN {
     }
 
     ErrorCode NPUBackend::onResizeEnd() {
-        MNN_HIAI_LOG("onResizeEnd: start IR build and load");
-#if HIAI_VERBOSE
-        auto t0 = std::chrono::steady_clock::now();
-#endif
-        auto code = bulidIRModelAndLoad();
-#if HIAI_VERBOSE
-        auto t1 = std::chrono::steady_clock::now();
-        double buildMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        double totalMs = std::chrono::duration<double, std::milli>(t1 - mResizeTimerStart).count();
-        MNN_HIAI_LOG("onResizeEnd: %s (code=%d) build_and_load=%.1fms total_resize=%.1fms",
-                     code == NO_ERROR ? "OK" : "FAILED", (int)code, buildMs, totalMs);
-#else
-        MNN_HIAI_LOG("onResizeEnd: %s (code=%d)",
-                     code == NO_ERROR ? "OK" : "FAILED", (int)code);
-#endif
+        if (mRequiresV320SessionRebuild) {
+            mNPURuntime->mHiAIOptions->report(MNN_HIAI_STAGE_RESIZE, INVALID_VALUE, "HiAI V600 failed; recreate with V320");
+            MNN_ERROR(
+                "MNN_HIAI_SESSION_REBUILD_AUDIT: rejecting the initial "
+                "session so the caller can recreate it with V320\n");
+            return INVALID_VALUE;
+        }
+        const auto code = buildIRModelAndLoad();
+        if (mNPURuntime->mHiAIOptions) {
+            if (code == NO_ERROR) mNPURuntime->mHiAIOptions->ready();
+            else mNPURuntime->mHiAIOptions->report(MNN_HIAI_STAGE_RESIZE, code, "HiAI graph build/load failed");
+        }
         return code;
     }
 
@@ -862,7 +1129,7 @@ namespace MNN {
         // It remains stable across App launches while separating graph chunks and all
         // input/output tensor layouts that affect HiAI online compilation.
         std::ostringstream signature;
-        signature << "hiai_om_cache_v2|ops=" << mGrapMap.size();
+        signature << "hiai_om_cache_v3|ops=" << mGrapMap.size();
         auto slashPos = pNPUModelDirPath.find_last_of('/');
         std::string chunkName = slashPos == std::string::npos
                                   ? pNPUModelDirPath
@@ -929,16 +1196,22 @@ namespace MNN {
         MNN_HIAI_LOGV2("getInOutTensorInfo: npuInputs=%zu npuOutputs=%zu",
                      mInputDimension.size(), mOutputDimension.size());
 
-        int idx = 0;
+        int input_index = 0;
         for (auto in_dim : mInputDimension)
         {
             shared_ptr<hiai::AiTensor> input = make_shared<hiai::AiTensor>();
             input->Init(&in_dim);
             mInputTensors.push_back(input);
-            MNN_HIAI_LOG("  npuInput[%d] DIM:%u,%u,%u,%u", idx,
-                         in_dim.GetNumber(), in_dim.GetChannel(),
-                         in_dim.GetHeight(), in_dim.GetWidth());
-            idx++;
+            if (isExplicitHiAISession()) {
+                const uint64_t bytes = static_cast<uint64_t>(in_dim.GetNumber()) *
+                    in_dim.GetChannel() * in_dim.GetHeight() * in_dim.GetWidth() *
+                    sizeof(float);
+                if (mNativeIoContext != nullptr &&
+                    bytes == mNativeIoContext->input_bytes) {
+                    mImageInputIndex = input_index;
+                }
+            }
+            ++input_index;
         }
 #if MNN_HIAI_USE_LOCAL_NPU_FIXES
         // Rebuild mInputMap so that each MNN input tensor ptr maps to the
@@ -1016,7 +1289,20 @@ namespace MNN {
                       out_dim.GetHeight(), out_dim.GetWidth());
             output->Init(&out_dim);
             mOutputTensors.push_back(output);
+            if (isExplicitHiAISession()) {
+                const uint64_t bytes = static_cast<uint64_t>(out_dim.GetNumber()) *
+                    out_dim.GetChannel() * out_dim.GetHeight() * out_dim.GetWidth() *
+                    sizeof(float);
+                if (mNativeIoContext != nullptr &&
+                    bytes == mNativeIoContext->output_bytes) {
+                    mImageOutputIndex = index;
+                }
+            }
             index++;
+        }
+        if (isExplicitHiAISession()) {
+            mHostInputTensors = mInputTensors;
+            mHostOutputTensors = mOutputTensors;
         }
         // Build mMNNOutTensors and match each MNN output tensor to a DDK output slot.
         // We cannot assume 1:1 index correspondence because the DDK may produce a
@@ -1069,7 +1355,145 @@ namespace MNN {
         }
         return outputMappingValid ? 0 : -1;
     }
-    ErrorCode NPUBackend::bulidIRModelAndLoad() {
+
+    bool NPUBackend::bindNativeHandleIo() {
+#if !defined(__ANDROID__)
+        if (mNativeIoContext != nullptr) {
+            mNativeIoContext->result_code = MNN_HIAI_NATIVE_HANDLE_IO_SYMBOL_UNAVAILABLE;
+        }
+        return false;
+#else
+
+        if (mNativeIoContext == nullptr ||
+            mNativeIoContext->input_ahardware_buffer == nullptr ||
+            mNativeIoContext->output_ahardware_buffer == nullptr ||
+            mImageInputIndex < 0 || mImageOutputIndex < 0) {
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->result_code =
+                    MNN_HIAI_NATIVE_HANDLE_IO_INVALID_CONTEXT;
+            }
+            return false;
+        }
+        if (mBoundInputAhb == mNativeIoContext->input_ahardware_buffer &&
+            mBoundOutputAhb == mNativeIoContext->output_ahardware_buffer) {
+            mNativeIoContext->result_code =
+                MNN_HIAI_NATIVE_HANDLE_IO_SUCCESS;
+            return true;
+        }
+
+        if (mGetAhbNativeHandle == nullptr) {
+            if (mLibAndroid == nullptr) {
+                mLibAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+            }
+            if (mLibAndroid != nullptr) {
+                mGetAhbNativeHandle =
+                    reinterpret_cast<const native_handle_t* (*)(const void*)>(
+                        dlsym(mLibAndroid,
+                              "AHardwareBuffer_getNativeHandle"));
+            }
+        }
+        if (mGetAhbNativeHandle == nullptr) {
+            mInputTensors = mHostInputTensors;
+            mOutputTensors = mHostOutputTensors;
+            mNativeIoContext->result_code =
+                MNN_HIAI_NATIVE_HANDLE_IO_SYMBOL_UNAVAILABLE;
+            return false;
+        }
+
+        const native_handle_t* input_handle = mGetAhbNativeHandle(
+            mNativeIoContext->input_ahardware_buffer);
+        const native_handle_t* output_handle = mGetAhbNativeHandle(
+            mNativeIoContext->output_ahardware_buffer);
+        mNativeIoContext->input_native_fd_count =
+            input_handle != nullptr ? input_handle->numFds : 0;
+        mNativeIoContext->output_native_fd_count =
+            output_handle != nullptr ? output_handle->numFds : 0;
+        if (input_handle == nullptr || output_handle == nullptr ||
+            input_handle->numFds < 1 || output_handle->numFds < 1 ||
+            input_handle->data[0] < 0 || output_handle->data[0] < 0 ||
+            mNativeIoContext->input_bytes >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            mNativeIoContext->output_bytes >
+                static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            mInputTensors = mHostInputTensors;
+            mOutputTensors = mHostOutputTensors;
+            mNativeIoContext->result_code =
+                MNN_HIAI_NATIVE_HANDLE_IO_INVALID_BUFFER_HANDLE;
+            return false;
+        }
+
+        if (mHclV600Runtime != nullptr) {
+            const bool bound = mHclV600Runtime->bindNativeHandleIo(
+                static_cast<size_t>(mImageInputIndex), input_handle->data[0],
+                mNativeIoContext->input_bytes,
+                static_cast<size_t>(mImageOutputIndex), output_handle->data[0],
+                mNativeIoContext->output_bytes);
+            if (!bound) {
+                mNativeIoContext->result_code =
+                    MNN_HIAI_NATIVE_HANDLE_IO_INPUT_BIND_FAILED;
+                MNN_ERROR("MNN_HIAI_HCL_V600_AUDIT: NativeHandle bind failed: %s\n",
+                          mHclV600Runtime->lastError().c_str());
+                return false;
+            }
+            mBoundInputAhb = mNativeIoContext->input_ahardware_buffer;
+            mBoundOutputAhb = mNativeIoContext->output_ahardware_buffer;
+            mNativeIoContext->result_code = MNN_HIAI_NATIVE_HANDLE_IO_SUCCESS;
+            MNN_PRINT("MNN_HIAI_HCL_V600_AUDIT: NativeHandle bound input_fd=%d output_fd=%d bytes=%u/%u\n",
+                      input_handle->data[0], output_handle->data[0],
+                      mNativeIoContext->input_bytes,
+                      mNativeIoContext->output_bytes);
+            return true;
+        }
+
+
+        hiai::NativeHandle input_native = {
+            input_handle->data[0],
+            static_cast<int>(mNativeIoContext->input_bytes), 0};
+        hiai::NativeHandle output_native = {
+            output_handle->data[0],
+            static_cast<int>(mNativeIoContext->output_bytes), 0};
+        auto native_input = make_shared<hiai::AiTensor>();
+        const int input_ret = native_input->Init(
+            input_native, &mInputDimension[mImageInputIndex],
+            hiai::HIAI_DATATYPE_FLOAT32);
+        if (input_ret != hiai::AI_SUCCESS) {
+            mInputTensors = mHostInputTensors;
+            mOutputTensors = mHostOutputTensors;
+            mNativeIoContext->result_code =
+                MNN_HIAI_NATIVE_HANDLE_IO_INPUT_BIND_FAILED;
+            MNN_PRINT("MNN_HIAI_NATIVE_HANDLE_IO_AUDIT: input Init failed ret=%d fd_count=%d\n",
+                      input_ret, input_handle->numFds);
+            return false;
+        }
+        auto native_output = make_shared<hiai::AiTensor>();
+        const int output_ret = native_output->Init(
+            output_native, &mOutputDimension[mImageOutputIndex],
+            hiai::HIAI_DATATYPE_FLOAT32);
+        if (output_ret != hiai::AI_SUCCESS) {
+            mInputTensors = mHostInputTensors;
+            mOutputTensors = mHostOutputTensors;
+            mNativeIoContext->result_code =
+                MNN_HIAI_NATIVE_HANDLE_IO_OUTPUT_BIND_FAILED;
+            MNN_PRINT("MNN_HIAI_NATIVE_HANDLE_IO_AUDIT: output Init failed ret=%d fd_count=%d\n", output_ret,
+                      output_handle->numFds);
+            return false;
+        }
+
+        mInputTensors = mHostInputTensors;
+        mOutputTensors = mHostOutputTensors;
+        mInputTensors[mImageInputIndex] = native_input;
+        mOutputTensors[mImageOutputIndex] = native_output;
+        mBoundInputAhb = mNativeIoContext->input_ahardware_buffer;
+        mBoundOutputAhb = mNativeIoContext->output_ahardware_buffer;
+        mNativeIoContext->result_code = MNN_HIAI_NATIVE_HANDLE_IO_SUCCESS;
+        MNN_PRINT("MNN_HIAI_NATIVE_HANDLE_IO_AUDIT: bound input_fd=%d output_fd=%d bytes=%u/%u\n",
+                  input_handle->data[0], output_handle->data[0], mNativeIoContext->input_bytes,
+                  mNativeIoContext->output_bytes);
+        return true;
+
+#endif
+    }
+    ErrorCode NPUBackend::buildLegacyIRModelAndLoad() {
         std::vector<ge::Operator> inputs;
         for (auto input : mInputOps){
             inputs.push_back(input.second[0]);
@@ -1090,7 +1514,7 @@ namespace MNN {
         if (!pNPUModelDirPath.empty() && pNPUModelDirPath != ".") {
             if (ensureDirRecursive(pNPUModelDirPath)) {
                 std::string shapeKey = buildOmCacheShapeKey();
-                std::string cacheDir = pNPUModelDirPath + "/om_cache_v2/" + shapeKey;
+                std::string cacheDir = pNPUModelDirPath + "/om_cache_v3/" + shapeKey;
                 if (ensureDirRecursive(cacheDir)) {
                     omCachePath = cacheDir + "/vision.om";
                     modelName = "v_" + shapeKey.substr(6);
@@ -1234,6 +1658,233 @@ namespace MNN {
         return (result == 0) ? NO_ERROR : INVALID_VALUE;
     }
 
+    ErrorCode NPUBackend::buildIRModelAndLoad() {
+        if (!isExplicitHiAISession()) {
+            return buildLegacyIRModelAndLoad();
+        }
+        std::vector<ge::Operator> inputs;
+        for (auto input : mInputOps) {
+            inputs.push_back(input.second[0]);
+        }
+        std::vector<ge::Operator> outputOps;
+        for (auto outOp : mOutGEOpMap) {
+            outputOps.push_back(*outOp.first.get());
+        }
+        MNN_PRINT("mOutputOps : %lu \n", outputOps.size());
+
+        string graphName = string("Graph1");
+        string version = string("model_v000011");
+        string modelName = to_string(0);
+        mModelName.push_back(modelName);
+        ge::Graph graph(graphName);
+        graph.SetInputs(inputs).SetOutputs(outputOps);
+
+        ge::Model model(modelName, version);
+        model.SetGraph(graph);
+
+        if (isExplicitHiAISession()) {
+#if defined(GRAPH_API_EXPORT)
+            auto streamNumber =
+                ge::AttrValue::CreateFrom(static_cast<int64_t>(1));
+#else
+            auto streamNumber = ge::AttrValue::CreateFrom<ge::AttrValue::INT>(
+                static_cast<int64_t>(1));
+#endif
+            const auto streamStatus =
+                model.SetAttr("stream_num", std::move(streamNumber));
+            if (streamStatus != ge::GRAPH_SUCCESS) {
+                MNN_ERROR("[NPU] failed to set stream_num on GE model\n");
+                return INVALID_VALUE;
+            }
+        }
+
+        ge::Buffer buffer;
+        ge::GraphErrCodeStatus geret = model.Save(buffer);
+        if (geret != ge::GRAPH_SUCCESS) {
+            MNN_ERROR("[NPU] Model save failed \n");
+            if (isExplicitHiAISession()) {
+                return INVALID_VALUE;
+            }
+        }
+        const std::string modelIdentity = HiaiModelIdentity(buffer.GetData(), buffer.GetSize());
+
+        if (mHclV600Runtime != nullptr) {
+            const bool preferFp16 = mPrecision == BackendConfig::Precision_Low;
+            if (!mHclV600Runtime->buildAndLoad(
+                    buffer.GetData(), buffer.GetSize(), modelName, preferFp16,
+                    HiaiCacheFile(mNPURuntime->mCachePath, modelIdentity, kHiaiV600CacheSuffix))) {
+                if (mNativeIoContext != nullptr) {
+                    mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] = MNN_HIAI_SESSION_HCL_V600_FAILED;
+                }
+                MNN_ERROR(
+                    "MNN_HIAI_HCL_V600_AUDIT: BuildV2 path failed; full MNN session rebuild with V320 required: %s\n",
+                    mHclV600Runtime->lastError().c_str());
+                return INVALID_VALUE;
+            } else {
+                for (size_t i = 0; i < mHclV600Runtime->inputCount(); ++i) {
+                    if (mNativeIoContext != nullptr && mHclV600Runtime->inputSize(i) == mNativeIoContext->input_bytes) {
+                        mImageInputIndex = static_cast<int>(i);
+                    }
+                }
+                for (size_t i = 0; i < mHclV600Runtime->outputCount(); ++i) {
+                    if (mNativeIoContext != nullptr &&
+                        mHclV600Runtime->outputSize(i) == mNativeIoContext->output_bytes) {
+                        mImageOutputIndex = static_cast<int>(i);
+                    }
+                }
+                int outputIndex = 0;
+                for (auto opMap : mOutGEOpMap) {
+                    for (auto tensor : opMap.second) {
+                        mMNNOutTensors.push_back(tensor);
+                        MNN_PRINT("%d MNN/HCL output DIM:%d,%d,%d,%d bytes=%d\n", outputIndex, tensor->batch(),
+                                  tensor->channel(), tensor->height(), tensor->width(), tensor->size());
+                        ++outputIndex;
+                    }
+                }
+                MNN_PRINT("MNN_HIAI_HCL_V600_AUDIT: BuildV2/InitV2 PASS model=%s inputs=%lu outputs=%lu precision=%s\n",
+                          modelName.c_str(), mHclV600Runtime->inputCount(), mHclV600Runtime->outputCount(),
+                          preferFp16 ? "FP16" : "DEFAULT");
+                if (!EnsureHiaiCachePathMarker(mNPURuntime->mCachePath)) {
+                    MNN_ERROR(
+                        "MNN_HIAI_CACHE_AUDIT: MARKER_WRITE_FAILED "
+                        "abi=V600 file=%s\n",
+                        mNPURuntime->mCachePath.c_str());
+                }
+                return NO_ERROR;
+            }
+        }
+
+        if (isExplicitHiAISession()) {
+            std::string loaderError;
+            const std::string runtimeLibraryDirectory =
+                mNPURuntime->mHiAIOptions != nullptr
+                    ? mNPURuntime->mHiAIOptions->runtimeLibraryDirectory
+                    : std::string();
+            if (!loadHiAIDynamicSymbols(HiAIDynamicLoadScope::Full,
+                                        true,
+                                        runtimeLibraryDirectory,
+                                        &loaderError)) {
+                MNN_ERROR("[NPU] HiAI V320 ABI unavailable: %s\n",
+                          loaderError.c_str());
+                if (mNativeIoContext != nullptr) {
+                    mNativeIoContext->reserved
+                        [MNN_HIAI_SESSION_STATUS_INDEX] =
+                            MNN_HIAI_SESSION_V320_FAILED;
+                }
+                return INVALID_VALUE;
+            }
+        }
+
+        domi::HiaiIrBuild ir_build;
+        domi::ModelBufferData om_model_buff;
+        const std::string v320CacheFile = HiaiCacheFile(mNPURuntime->mCachePath, modelIdentity, kHiaiV320CacheSuffix);
+        std::vector<std::uint8_t> cachedV320Model;
+        bool loadedFromV320Cache = false;
+        if (!v320CacheFile.empty() && ReadHiaiCacheFile(v320CacheFile, &cachedV320Model)) {
+            om_model_buff.data = cachedV320Model.data();
+            om_model_buff.length = static_cast<std::uint32_t>(cachedV320Model.size());
+            mMgrClient = LoadModelSync(om_model_buff, modelName);
+            if (mMgrClient != nullptr) {
+                loadedFromV320Cache = true;
+                MNN_PRINT(
+                    "MNN_HIAI_CACHE_AUDIT: HIT abi=V320 file=%s "
+                    "bytes=%u\n",
+                    v320CacheFile.c_str(), om_model_buff.length);
+            } else {
+                (void)std::remove(v320CacheFile.c_str());
+                cachedV320Model.clear();
+                om_model_buff = {};
+                MNN_ERROR(
+                    "MNN_HIAI_CACHE_AUDIT: INVALID abi=V320 "
+                    "file=%s detail=LoadModelSync failed\n",
+                    v320CacheFile.c_str());
+            }
+        } else if (!v320CacheFile.empty()) {
+            if (access(v320CacheFile.c_str(), F_OK) == 0) {
+                (void)std::remove(v320CacheFile.c_str());
+                MNN_ERROR(
+                    "MNN_HIAI_CACHE_AUDIT: INVALID abi=V320 "
+                    "file=%s detail=empty or oversized cache\n",
+                    v320CacheFile.c_str());
+            } else {
+                MNN_PRINT("MNN_HIAI_CACHE_AUDIT: MISS abi=V320 file=%s\n", v320CacheFile.c_str());
+            }
+        }
+#ifdef HIAI_DEBUG
+        WriteToBufferFile(buffer, "/data/local/tmp/test.irpb");
+#endif
+        bool createBufferSuc = loadedFromV320Cache || ir_build.CreateModelBuff(model, om_model_buff);
+
+        if (!createBufferSuc) {
+            MNN_ERROR("[NPU] Create Model Buff failed \n");
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] = MNN_HIAI_SESSION_V320_FAILED;
+            }
+            if (isExplicitHiAISession()) {
+                return INVALID_VALUE;
+            }
+        }
+        bool buildIRSuc = loadedFromV320Cache || ir_build.BuildIRModel(model, om_model_buff);
+        if (!buildIRSuc) {
+            MNN_ERROR("[NPU] IR model build failed  \n");
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] = MNN_HIAI_SESSION_V320_FAILED;
+            }
+            ir_build.ReleaseModelBuff(om_model_buff);
+            return INVALID_VALUE;
+        }
+#ifdef HIAI_DEBUG
+        WriteToOMFile(om_model_buff, "/data/local/tmp/test.om");
+#endif
+        if (!loadedFromV320Cache) {
+            mMgrClient = LoadModelSync(om_model_buff, modelName);
+        }
+
+        if (mMgrClient == nullptr) {
+            MNN_ERROR("[NPU] Model Manager Client is null \n");
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] = MNN_HIAI_SESSION_V320_FAILED;
+            }
+            if (!loadedFromV320Cache) {
+                ir_build.ReleaseModelBuff(om_model_buff);
+            }
+            return INVALID_VALUE;
+        }
+
+        if (!loadedFromV320Cache) {
+            if (!v320CacheFile.empty()) {
+                if (WriteHiaiCacheFileAtomic(v320CacheFile, om_model_buff.data, om_model_buff.length)) {
+                    MNN_PRINT(
+                        "MNN_HIAI_CACHE_AUDIT: WRITE abi=V320 "
+                        "file=%s bytes=%u\n",
+                        v320CacheFile.c_str(), om_model_buff.length);
+                } else {
+                    MNN_ERROR(
+                        "MNN_HIAI_CACHE_AUDIT: WRITE_FAILED abi=V320 "
+                        "file=%s bytes=%u\n",
+                        v320CacheFile.c_str(), om_model_buff.length);
+                }
+            }
+            ir_build.ReleaseModelBuff(om_model_buff);
+        }
+
+        int result = getInOutTensorInfo(modelName);
+        if (mNativeIoContext != nullptr) {
+            mNativeIoContext->reserved[MNN_HIAI_SESSION_STATUS_INDEX] =
+                result == 0 ? MNN_HIAI_SESSION_V320_READY : MNN_HIAI_SESSION_V320_FAILED;
+        }
+        if (result == 0) {
+            if (!EnsureHiaiCachePathMarker(mNPURuntime->mCachePath)) {
+                MNN_ERROR(
+                    "MNN_HIAI_CACHE_AUDIT: MARKER_WRITE_FAILED "
+                    "abi=V320 file=%s\n",
+                    mNPURuntime->mCachePath.c_str());
+            }
+            MNN_PRINT("MNN_HIAI_SESSION_REBUILD_AUDIT: V320 graph build/load PASS\n");
+        }
+        return (result == 0) ? NO_ERROR : INVALID_VALUE;
+    }
+
     int NPUBackend::process(int modelIndex) const {
         if (mMgrClient == nullptr) {
             MNN_ERROR("[NPU] Process skipped because model manager is null\n");
@@ -1252,6 +1903,27 @@ namespace MNN {
 #ifdef HIAI_DEBUG
         ATrace_beginSection("HIAI process");
 #endif
+        if (mHclV600Runtime != nullptr) {
+            const int ret = mHclV600Runtime->run();
+            if (mNativeIoContext != nullptr) {
+                mNativeIoContext->process_result = ret;
+            }
+            if (ret != 0) {
+                MNN_ERROR("MNN_HIAI_HCL_V600_AUDIT: RunV3 failed status=%d\n", ret);
+                mExecutionStatus = INVALID_VALUE;
+            }
+#ifdef HIAI_DEBUG
+            ATrace_endSection();
+#endif
+            return ret;
+        }
+
+        if (mMgrClient == nullptr) {
+            MNN_ERROR("MNN_HIAI: Process called without a loaded model\n");
+            mExecutionStatus = NO_EXECUTION;
+            return -1;
+        }
+
         hiai::AiContext context;
         string key = "model_name";
         context.AddPara(key, modelName);
@@ -1282,6 +1954,13 @@ namespace MNN {
             MNN_HIAI_LOG("process: OK istamp=%d", istamp);
         }
 #endif
+        if (mNativeIoContext != nullptr) {
+            mNativeIoContext->process_result = ret;
+        }
+        if (ret != hiai::AI_SUCCESS) {
+            MNN_ERROR("MNN_HIAI: Process failed status=%d\n", ret);
+            mExecutionStatus = INVALID_VALUE;
+        }
 #ifdef HIAI_DEBUG
         ATrace_endSection();
 #endif
@@ -1377,8 +2056,17 @@ namespace MNN {
         }
     }
 
-    NPURuntime::NPURuntime(const Backend::Info& info) {
-        mInfo = info;
+    NPURuntime::NPURuntime(const Backend::Info& info,
+                           const std::string& hiaiRuntimeVersion) {
+        mInfo.type = info.type;
+        mInfo.numThread = info.numThread;
+        mInfo.mode = info.mode;
+        mHiaiRuntimeVersion = hiaiRuntimeVersion;
+        mHiAIOptions = copyHiAIOptions(info);
+        mInfo.user = &mHiAIOptions->config;
+        mExplicitHiAI =
+            mHiAIOptions != nullptr &&
+            mHiAIOptions->explicitConfig;
 
         BackendConfig::PrecisionMode precision = BackendConfig::Precision_Normal;
         BackendConfig::PowerMode power         = BackendConfig::Power_Normal;
@@ -1407,43 +2095,112 @@ namespace MNN {
 
         virtual Runtime* onCreate(const Backend::Info& info) const override {
             AUTOTIME;
+            const auto options = copyHiAIOptions(info);
+            if (options == nullptr) {
+                MNN_ERROR("MNN_HIAI: invalid BackendConfig::sharedContext configuration.\n");
+                return nullptr;
+            }
+            options->report(MNN_HIAI_STAGE_RUNTIME, NO_EXECUTION, "HiAI Runtime initialization failed");
+            const auto* hiaiOptions = options.get();
+            const bool explicitlyRequestedHiAI =
+                hiaiOptions != nullptr &&
+                hiaiOptions->explicitConfig;
+            const bool forceV320 = HiaiForceV320(info,
+                                                 explicitlyRequestedHiAI);
+            std::string hclVersion;
+            bool useHclV600 = explicitlyRequestedHiAI &&
+                              !forceV320 &&
+                              HiaiHclV600Runtime::IsSupported(&hclVersion);
+            std::string loaderError;
+            const auto loaderScope = useHclV600
+                ? HiAIDynamicLoadScope::GraphOnly
+                : HiAIDynamicLoadScope::Full;
+            const std::string runtimeLibraryDirectory =
+                explicitlyRequestedHiAI
+                    ? hiaiOptions->runtimeLibraryDirectory
+                    : std::string();
+            if (!loadHiAIDynamicSymbols(loaderScope,
+                                        explicitlyRequestedHiAI &&
+                                            !useHclV600,
+                                        runtimeLibraryDirectory,
+                                        &loaderError)) {
+                options->report(MNN_HIAI_STAGE_RUNTIME, NO_EXECUTION, loaderError.c_str());
+                MNN_ERROR("[NPU] HiAI dynamic loader unavailable: %s\n",
+                          loaderError.c_str());
+                return nullptr;
+            }
+            // Some legacy clients publish the HCL plugin only after their
+            // complete runtime bootstrap. Preserve that ordering as a second
+            // chance without forcing the full client set on direct-HCL paths.
+            if (!useHclV600 && explicitlyRequestedHiAI && !forceV320) {
+                useHclV600 = HiaiHclV600Runtime::IsSupported(&hclVersion);
+            }
+            std::string runtimeVersion;
             {
+                if (useHclV600) {
+                    MNN_PRINT("MNN_HIAI_HCL_V600_AUDIT: capability PASS version=%s\n",
+                              hclVersion.c_str());
+                    options->report(MNN_HIAI_STAGE_RUNTIME, NO_ERROR, "HiAI HCL Runtime ready");
+                    return new NPURuntime(info, hclVersion);
+                }
                 shared_ptr<hiai::AiModelMngerClient> mgrClient = make_shared<hiai::AiModelMngerClient>();
                 if(mgrClient.get() == nullptr){
                     MNN_ERROR("mgrClient.get() == NULL");
                     return nullptr;
                 }
-                
+
 				auto ret = mgrClient->Init(nullptr);
                 if (ret != hiai::AI_SUCCESS) {
                     MNN_ERROR("[NPU] AiModelMngerClient Init Failed!\n");
                     return nullptr;
                 }
-				
+
                 const char* currentversion = mgrClient->GetVersion();
                 if(currentversion != nullptr){
                     MNN_PRINT("[NPU] ddk currentversion : %s \n", currentversion);
+                    runtimeVersion = currentversion;
                 }else{
                     MNN_ERROR("[NPU] current version don't support, return nullptr\n");
                     return nullptr;
                 }
 
-                if(string(currentversion).compare("100.330.000.000") <= 0){
-                    MNN_PRINT("[NPU] current version don't support,version=%s \n",currentversion);
+                const bool unsupportedVersion = explicitlyRequestedHiAI
+                                                    ? string(currentversion).compare("100.320.000.000") < 0
+                                                    : string(currentversion).compare("100.330.000.000") <= 0;
+                if (unsupportedVersion) {
+                    MNN_PRINT("[NPU] current version don't support,version=%s \n", currentversion);
                     return nullptr;
                 }
             }
 
-            return new NPURuntime(info);
+            options->report(MNN_HIAI_STAGE_RUNTIME, NO_ERROR, "HiAI Runtime ready");
+            return new NPURuntime(info, runtimeVersion);
         }
 
-        virtual bool onValid(Backend::Info& info) const {
+        bool onValid(Backend::Info& info) const override {
+            (void)info;
             return true;
         }
     };
 
+    bool registerHiAIRuntimeCreator() {
+        static std::mutex registrationMutex;
+        static bool registered = false;
+        std::lock_guard<std::mutex> lock(registrationMutex);
+        if (!registered) {
+            registered = MNNInsertExtraRuntimeCreator(
+                MNN_FORWARD_USER_0, new NPUBackendCreator, false);
+        }
+        return registered;
+    }
+
+#if !defined(MNN_NPU_INTEGRATED_REGISTRATION) && \
+    !defined(MNN_HIAI_EXPLICIT_PLUGIN)
+    // Preserve the original separate-backend behavior. In the single-library
+    // build MNNCore calls registerHiAIRuntimeCreator according to the selected
+    // automatic/manual mode instead.
     static const auto __npu_global_initializer = []() {
-        MNNInsertExtraRuntimeCreator(MNN_FORWARD_USER_0, new NPUBackendCreator, true);
-        return true;
+        return registerHiAIRuntimeCreator();
     }();
-}
+#endif
+    } // namespace MNN

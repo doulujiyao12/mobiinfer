@@ -106,7 +106,7 @@ options:
 [Compile from Source](../compile/other.html#id4)
 Add the required compilation macros during the standard compilation process:
 ```
--DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
+-DMNN_LOW_MEMORY=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
 ```
 
 - To enable visual features, add the following macros:
@@ -123,7 +123,7 @@ For macOS/Linux:
 ```
 mkdir build
 cd build
-cmake ../ -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
+cmake ../ -DMNN_LOW_MEMORY=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
 make -j16
 ```
 
@@ -131,7 +131,7 @@ For x86 architecture, additionally include the `MNN_AVX512` macro:
 ```
 mkdir build
 cd build
-cmake ../ -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_AVX512=true
+cmake ../ -DMNN_LOW_MEMORY=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_AVX512=true
 make -j16
 ```
 
@@ -140,12 +140,12 @@ Add the macros `MNN_ARM82` and `MNN_OPENCL`:
 ```
 cd project/android
 mkdir build_64
-../build_64.sh "-DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_ARM82=true -DMNN_OPENCL=true -DMNN_USE_LOGCAT=true"
+../build_64.sh "-DMNN_LOW_MEMORY=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_ARM82=true -DMNN_OPENCL=true -DMNN_USE_LOGCAT=true"
 ```
 
 #### iOS: Refer to transformers/llm/engine/ios/README.md:
 ```
-sh package_scripts/ios/buildiOS.sh "-DMNN_ARM82=true -DMNN_LOW_MEMORY=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_BUILD_LLM=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true"
+sh package_scripts/ios/buildiOS.sh "-DMNN_ARM82=true -DMNN_LOW_MEMORY=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DMNN_BUILD_LLM=true"
 ```
 
 #### Web
@@ -155,7 +155,7 @@ Refer to the environment setup at: https://mnn-docs.readthedocs.io/en/latest/com
 
 ```
 mkdir buildweb
-emcmake cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-msimd128 -msse4.1" -DMNN_FORBID_MULTI_THREAD=ON -DMNN_USE_THREAD_POOL=OFF -DMNN_USE_SSE=ON -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
+emcmake cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-msimd128 -msse4.1" -DMNN_FORBID_MULTI_THREAD=ON -DMNN_USE_THREAD_POOL=OFF -DMNN_USE_SSE=ON -DMNN_LOW_MEMORY=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true
 make -j16
 ```
 
@@ -163,7 +163,7 @@ make -j16
 To compile the demo:
 
 ```
-emcc ../transformers/llm/engine/llm_demo.cpp -DCMAKE_CXX_FLAGS="-msimd128 -msse4.1" -I ../include -I ../transformers/llm/engine/include libMNN.a libllm.a express/libMNN_Express.a -o llm_demo.js --preload-file ~/qwen2.0_1.5b/ -s ALLOW_MEMORY_GROWTH=1 -o llm_demo.js
+emcc ../transformers/llm/engine/demo/llm_demo.cpp -DCMAKE_CXX_FLAGS="-msimd128 -msse4.1" -I ../include -I ../transformers/llm/engine/include libMNN.a libllm.a express/libMNN_Express.a -o llm_demo.js --preload-file ~/qwen2.0_1.5b/ -s ALLOW_MEMORY_GROWTH=1 -o llm_demo.js
 ```
 
 To test the compiled demo, use the following command:
@@ -282,6 +282,11 @@ The usage of `llm_demo` is as follows:
 
 ```
 
+`qwen3_tts_demo` is the end-to-end text-to-speech demo for Qwen3-TTS; its arguments are:
+```
+./qwen3_tts_demo model_dir --text <text> [max_frames] [dump_dir] [language] --ref_audio <wav> [--normalize [target_peak]]
+```
+Here `model_dir` is the Qwen3-TTS MNN model directory, `text` is the input sentence, `max_frames` caps generated codec frames (default 128, about 80 ms per frame; raise it for longer text, EOS may stop earlier; too small a value truncates the utterance), `dump_dir` saves wav/bin debug outputs, `language` defaults to `auto` and supports `auto/chinese/english/german/italian/portuguese/spanish/japanese/korean/french/russian`, `--ref_audio <wav>` is required and supplies a reference voice wav for speaker-embedding-only voice cloning; Qwen3-TTS resamples it to 24 kHz with the soxr-like high-quality resampler on load, omitting `--ref_audio` is unsupported because the zero speaker embedding path does not produce reliable speech, download the evaluation reference audio from `https://modelscope.cn/datasets/huangzhengxiang/qwen3-tts-ref/resolve/master/qwen3_tts_ref.wav` to `transformers/llm/resource/audio/qwen3_tts_ref.wav`, and `--normalize [target_peak]` peak-normalizes only the saved wav with default target 1.
 
 - For Visual Models
 Embed image input in the prompt as follows:

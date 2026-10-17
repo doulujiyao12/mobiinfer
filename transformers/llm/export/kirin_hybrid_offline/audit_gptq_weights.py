@@ -67,7 +67,10 @@ def audit(source, exported, package):
                     report['weights_exact'] += 1
                     scales = sf.get_tensor(base + '.scales').astype(np.float32).T[section]
                     assert scales.shape[1] == codes.shape[1] // 128
-                    if scales.nbytes < external[2]:
+                    assert main['quanParameter'].get('scaleStorage', 'FP32') == 'FP32', (graph, name, 'scale dtype')
+                    # Layout is dictated by graph metadata, not merely by byte
+                    # count: FP16 (zero, scale) can equal FP32 scale-only size.
+                    if main['quanParameter'].get('readType', 0) > 0:
                         scales = np.stack([np.zeros_like(scales), scales], axis=-1)
                     assert scales.nbytes == external[2]
                     assert binary.read(external[2]) == scales.tobytes(), (graph, name, 'scales')

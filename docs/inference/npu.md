@@ -5,6 +5,19 @@
 - CoreML
 - NNAPI
 - HIAI
+- RKNN
+
+## 可选 NPU 插件接入
+
+QNN / NeuroPilot / HiAI 支持独立插件，各后端提供配置、诊断、动态加载和
+严格 Session API：
+
+- QNN：`MNNQnnBackend.h`、`MNNQnnPlugin.hpp`、`MNNQnnSession.hpp`；
+- NeuroPilot：`MNNNeuroPilotBackend.h`、`MNNNeuroPilotPlugin.hpp`、`MNNNeuroPilotSession.hpp`；
+- HiAI：`MNNHiAIBackend.h`、`MNNHiAIIO.h`、`MNNHiAIPlugin.hpp`、`MNNHiAISession.hpp`。
+
+配置通过 `BackendConfig::sharedContext` 传入。调用方加载目标芯片对应的插件，
+再调用该后端的 `create*Session`。NeuroPilot 在线模式与 NNAPI/CoreML 编译互斥。
 
 ## QNN
 
@@ -101,7 +114,7 @@ adb push model.mnn ${ANDROID_WORKING_DIR}
 adb shell "cd ${ANDROID_WORKING_DIR} && export LD_LIBRARY_PATH=.:${ANDROID_LD_LIBRARY_PATH} && export ADSP_LIBRARY_PATH=.:${ANDROID_ADSP_LIBRARY_PATH} && ./your/mnn/qnn/ai/exe"
 ```
 - 配置MNN
-  - Backend Type设置为`MNN_FORWARD_NN`，即5。
+  - Backend Type 显式设置为 `MNN_FORWARD_QNN`，即 16；不再占用 NNAPI/NeuroPilot 的 5。
   - 在使用Module API推理时，需要设定`Module::Config`中的`shapeMutable`字段为`false`。
 
 ### 离线构图模式，推理常规模型
@@ -150,17 +163,17 @@ cd ${MNN}
 cd project/android
 mkdir build && cd build
 ../build_64.sh -DMNN_USE_LOGCAT=ON -DMNN_NNAPI=ON
-``` 
+```
 
 ### NNAPI 后端使用
 backend type设置成：MNN_FORWARD_NN
 
 
-## 华为 HIAI 
+## 华为 HIAI
 适用于 Android 系统， Kirlin芯片
 
 ### HIAI 环境准备
-1. 从如下链接下载 DDK 
+1. 从如下链接下载 DDK
 https://developer.huawei.com/consumer/cn/doc/hiai-Library/ddk-download-0000001053590180
 
 
@@ -175,6 +188,122 @@ cp -r ${DDK}/include ${MNN}/source/backend/hiai/3rdParty/include
 ```
 
 ### HIAI 编译执行
-1. cmake 参数打开npu开关： -DMNN_NPU=true 
+1. cmake 参数打开npu开关： -DMNN_NPU=ON
 2. backend type设置成：MNN_FORWARD_USER_0
-3. 执行可执行程序（需动态加载：libMNN_NPU.so, libhiai_ir_build.so, libhiai_ir.so, libhiai.so）
+3. 根据构建参数选择产物：
+   - `MNN_NPU_BACKENDS_SHARED=ON`：生成 `libMNN_Backend_HiAI.so`，
+     通过 `MNN::loadHiAIBackendPlugin` 显式加载。
+   - `MNN_NPU_BACKENDS_SHARED=OFF`、`MNN_SEP_BUILD=ON`：生成 `libMNN_NPU.so`。
+   - 两者均为 `OFF`：HiAI 后端编入 `libMNN.so`。
+4. 创建 HiAI Runtime 时，通过 `dlopen()` 加载运行库并用 `dlsym()` 解析接口。
+   HCL V600 路径的 HiAI C++ 图接口从 `libhiai_ir.so` 解析；V320 完整路径还需
+   `libhiai.so` 和 `libhiai_ir_build.so`。这些库不是上述 MNN 产物的
+   `DT_NEEDED` 依赖。
+5. 将 HiAI 运行库放在动态链接器可搜索的路径中，或通过
+   `MNNHiAIBackendConfigV1::runtimeLibraryDirectory` 指定目录，再调用
+   `MNN::createHiAISession`。库加载失败会报告 Runtime 初始化错误。
+
+## RKNN
+适用于 Rockchip RKNPU 平台。当前接入方式不是在线逐算子构图，而是同一份 ONNX 在 Host 侧同时生成：
+- 包装后的 `.mnn`
+- sidecar `.rknn`
+
+其中 `.mnn` 内部保留 `Input + Plugin(type="RKNN")` 包装图，运行时由 MNN 的 CPU Plugin 框架调用 RKNN C API 执行 `.rknn`。
+
+### RKNN 后端整体介绍
+
+- Host 侧通过 `MNNConvert --rknn` 完成双产物生成，不走 `compilefornpu` 的 `MNN -> NPU` 逐算子编译链路。
+- Device 侧通过 MNN 的 CPU Plugin 框架调用 RKNN C API 加载 `.rknn` 并执行；应用侧 Session backend 仍使用 `MNN_FORWARD_CPU`。
+- RKNN backend 读取 runtime 库路径、转换脚本路径、目标平台等信息时，不做硬编码，全部从环境变量读取；缺失时直接报 `MNN_ERROR`。
+
+更完整的 RKNN 说明、包内容、示例代码与板端运行方式，请参考：
+- `source/backend/rknn/README.md`
+  - 包含 Host 转换、aarch64 交叉编译、Plugin 运行机制、独立示例代码、板端包内容与运行方式。
+
+### 编译
+
+#### Host，编译带 RKNN 转换能力的 MNNConvert
+
+需要开启：
+- `-DMNN_BUILD_CONVERTER=ON`
+- `-DMNN_RKNN_CONVERT_MODE=ON`
+
+示例：
+
+```bash
+cmake -S ${MNN_ROOT} -B ${BUILD_DIR} \
+  -DMNN_BUILD_CONVERTER=ON \
+  -DMNN_RKNN_CONVERT_MODE=ON
+
+cmake --build ${BUILD_DIR} --target MNNConvert -j8
+```
+
+#### Device/Runtime，编译带 RKNN backend 的 MNN
+
+需要开启：
+- `-DMNN_RKNN=ON`
+- `-DRKNN_API_INCLUDE_DIR=/path/to/rknn_api/include`
+
+示例：
+
+```bash
+cmake -S ${MNN_ROOT} -B ${BUILD_DIR} \
+  -DMNN_RKNN=ON \
+  -DRKNN_API_INCLUDE_DIR=/path/to/rknn_api/include
+
+cmake --build ${BUILD_DIR} --target MNN -j8
+```
+
+### Host，生成 RKNN 包装模型
+
+调用 `MNNConvert --rknn` 前，必须设置以下环境变量：
+
+- `MNN_RKNN_TARGET`
+  - 例如 `rv1126b`
+- `MNN_RKNN_PYTHON`
+  - RKNN Toolkit 所在 Python 解释器
+- `MNN_RKNN_SCRIPT`
+  - ONNX 转 `.rknn` 的脚本路径
+- `MNN_RKNN_OUTPUT_DIR`
+  - `.rknn` 和 manifest 的输出目录
+
+示例：
+
+```bash
+export MNN_RKNN_TARGET=rv1126b
+export MNN_RKNN_PYTHON=/path/to/python
+export MNN_RKNN_SCRIPT=/path/to/to_rknn.py
+export MNN_RKNN_OUTPUT_DIR=/path/to/output/sidecar
+
+${BUILD_DIR}/MNNConvert \
+  -f ONNX \
+  --modelFile model.onnx \
+  --MNNModel model.mnn \
+  --rknn
+```
+
+执行成功后会生成：
+- `model.mnn`
+  - RKNN wrapper 模型
+- `${MNN_RKNN_OUTPUT_DIR}/model_<target>.rknn`
+- `${MNN_RKNN_OUTPUT_DIR}/model.rknn.bundle.json`
+
+### Device，运行
+
+运行时必须设置：
+- `MNN_RKNN_RUNTIME_LIB`
+  - 指向目标板上的 `librknnrt.so`
+
+并在创建 Session 时选择：
+- backend type = `MNN_FORWARD_CPU`
+
+**注意：在 RK 板上执行任何真正调用 NPU 的命令时，必须使用 `sudo`。**
+
+如果 `.rknn` 路径在 wrapper `.mnn` 中是相对路径，则需要确保模型外部路径设置正确，使 MNN 能解析 sidecar 所在目录。
+
+### 当前限制
+
+- 当前 RKNN 路径执行 `Plugin(type="RKNN")` 节点，不支持逐算子 RKNN backend。
+- 当前实现走 host buffer copy 路径，尚未做 zero-copy。
+- 当前输出路径按 `float32` 处理。
+- 当前主目标是板端运行；PC 侧如果没有可用的 x86 `librknnrt.so`，则不能直接用 MNN runtime 在 Host 上模拟执行 RKNN backend。

@@ -5,6 +5,7 @@ MOBI_SOURCE_ROOT="${MOBI_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 cmake -S "$MOBI_SOURCE_ROOT" -B "$PWD" \
 -DCMAKE_TOOLCHAIN_FILE="$HARMONY_HOME/native/build/cmake/ohos.toolchain.cmake" \
 -DCMAKE_BUILD_TYPE=Release \
+-DCMAKE_SKIP_RPATH=ON \
 -DOHOS_ARCH="arm64-v8a" \
 -DOHOS_STL=c++_static \
 -DMNN_USE_LOGCAT=true \

@@ -95,6 +95,9 @@ ErrorCode ReductionExecution::onEncode(const std::vector<Tensor *> &inputs, cons
     int outputChannels = outputShape.at(3);
     int outputChannelBlocks = (outputChannels + 3) / 4;
 
+    auto inputType = input->getType();
+    bool isInt32 = (inputType.code == halide_type_int && inputType.bits == 32);
+
     std::set<std::string> buildOption;
     switch (mReductType) {
         case 0:
@@ -104,11 +107,11 @@ ErrorCode ReductionExecution::onEncode(const std::vector<Tensor *> &inputs, cons
             break;
         case 1:
             buildOption.emplace("-DOPERATE(a,b)=max(a,b)");
-            buildOption.emplace("-DVALUE=-FLT_MAX");
+            buildOption.emplace(isInt32 ? "-DVALUE=(-2147483647-1)" : "-DVALUE=-FLT_MAX");
             break;
         case 2:
             buildOption.emplace("-DOPERATE(a,b)=min(a,b)");
-            buildOption.emplace("-DVALUE=FLT_MAX");
+            buildOption.emplace(isInt32 ? "-DVALUE=2147483647" : "-DVALUE=FLT_MAX");
             break;
         case 3:
             buildOption.emplace("-DOPERATE(a,b)=(a*b)");
@@ -211,10 +214,40 @@ public:
         if(reduct->dim()->size() != 1) {
             return NULL;
         }
+        if (inputs[0]->getType().code != halide_type_float &&
+            !(inputs[0]->getType().code == halide_type_int && inputs[0]->getType().bits == 32)) {
+            return NULL;
+        }
         auto axis = reduct->dim()->data()[0];
+        if (axis < 0) {
+            axis += inputs[0]->buffer().dimensions;
+        }
         int dim = inputs[0]->length(axis);
         std::vector<int> inputShape = tensorShapeFormat(inputs[0]);
         if(dim == inputShape.at(3) && outputs[0]->buffer().dimensions == 1){
+            return NULL;
+        }
+        // Mirror the kernel-selection conditions in onEncode; if none matches,
+        // no kernel computes this shape correctly, so fall back (return NULL).
+        int inside = 1, outside = 1;
+        for (int i = 0; i < axis; ++i) {
+            outside *= inputs[0]->length(i);
+        }
+        for (int i = axis + 1; i < inputs[0]->dimensions(); ++i) {
+            inside *= inputs[0]->length(i);
+        }
+        int batch = inputShape.at(0);
+        int inputHeight = inputShape.at(1);
+        int inputWidth = inputShape.at(2);
+        int inputChannels = inputShape.at(3);
+        bool supported = (batch * inputHeight * inputChannels == outside && 1 == inside && dim == inputWidth) ||
+                         (batch * inputChannels == outside && inputWidth == inside && dim == inputHeight) ||
+                         (batch == outside && inputWidth * inputHeight == inside && dim == inputChannels);
+        // Batch reduce is only valid when the output keeps the input rank:
+        // dropping a dimension reinterprets the image layout and corrupts results.
+        bool batchSupported = (1 == outside && inputWidth * inputHeight * inputChannels == inside && dim == batch) &&
+                              outputs[0]->buffer().dimensions == inputs[0]->buffer().dimensions;
+        if (!supported && !batchSupported) {
             return NULL;
         }
         switch (op->main_as_ReductionParam()->operation()) {

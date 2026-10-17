@@ -6,6 +6,9 @@
 
 ## 双模式完整包
 
+MNN 主线合并后的导出兼容与验收方法见 [主线合并验证记录](../../../../docs/inference/mnn-upstream-integration.md)。
+新版导出器导入既有 GPTQ 时自动保留独立投影并使用 FP32 scale，权重仍为原 W8；使用连续 decoding 快照检查升级后的实际计算。下述 v2 发布记录属于合并前的历史包。
+
 已发布到 [ModelScope 双模式 v2](https://www.modelscope.cn/models/fengerhu1/mobi_2B_offline_npu2_kirin9030_online_v2)：37 个发布文件，共 3,536,832,614 bytes，已核验远端大小和 SHA256。发布记录见 `evidence_publication/modelscope_dual_publication.json`。
 
 `--with-mnn-vision` 额外保留完整的 MNN `visual_pre`、六个 blocks chunk、`visual_post` 及各自的 `.mnn.weight`，共 16 个视觉文件。它们来自用户提供的 AutoRound/GPTQ W8/group128 导出；pre/post、主 merger 和三个 DeepStack merger 保留原浮点权重。离线视觉仍是 Full NPU 冻结的 W4A16/group64 单图。两种视觉实现各自保留，不将厂商 LUT 文件当作 MNN 权重。

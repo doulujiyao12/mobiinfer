@@ -24,6 +24,7 @@ public:
 
         bool mHasGammaBeta = false;
         bool mRMSNorm = false;
+        int mGammaSize = 0;
         std::shared_ptr<Tensor> mGammaBuffer;
         std::shared_ptr<Tensor> mBetaBuffer;
     };
@@ -34,9 +35,32 @@ public:
     static std::shared_ptr<Resource> makeResource(Backend *backend, const LayerNorm *layernorm);
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 
+    // Used by an owning fused-projection op that folds this LayerNorm into its
+    // own GEMV dispatch: it needs gamma/eps to bind, and marks the LayerNorm
+    // fused so it skips dispatching.
+    std::shared_ptr<Tensor> getGamma() const { return mResource->mGammaBuffer; }
+    float getEps() const { return mResource->mEps; }
+    bool isRMSNormWithGammaBeta() const { return mResource->mRMSNorm && mResource->mHasGammaBeta; }
+    bool isNC4HW4() const { return mIsNC4HW4; }
+    void setFused() { mIsFused = true; }
+
 private:
+    // Simdgroups per threadgroup for the NC4HW4 RMS simdgroup-reduce kernels.
+    // `legacy` is the count the kernel used before it was parameterized (1 for
+    // single-input, 2 for binary) and stays the answer whenever the widened
+    // reduction cannot pay off, so those cases keep their exact old arithmetic.
+    int rmsSimdGroups(int legacy) const;
+
+    // How many tokens share one threadgroup in the C4 RMSNorm; 1 keeps the
+    // legacy one-threadgroup-per-token dispatch.
+    int rmsTokensPerGroup() const;
+
     int mOutside;
     int mInside;
+    bool mIsNC4HW4 = false;
+    bool mIsBinaryNCHW = false;
+    int mChannelUnit;
+    bool mIsFused = false;  // set by the owning fused-proj op or the gated-norm fold
     std::shared_ptr<Resource> mResource;
     id<MTLBuffer> mShapeBuffer;
     id<MTLComputePipelineState> mPipeline;

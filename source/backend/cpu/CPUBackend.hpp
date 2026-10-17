@@ -47,7 +47,9 @@ public:
     virtual void onConcurrencyEnd() const override;
     virtual bool onCheckInfo(Backend::Info& info) const override;
 
-    SingleBufferWithAllocator* buffer(int index) const;
+    SingleBufferWithAllocator* buffer(int index) const {
+        return (mDynamicMmap.empty() ? mDynamic.data() : mDynamicMmap.data()) + index;
+    }
     BufferAllocator* createDynamicBufferAlloctor(int index) const;
 
 private:
@@ -95,9 +97,8 @@ public:
     virtual MemChunk chunk() {
         return mChunk;
     }
-    inline int getSize() const {
-        return mSize;
-    }
+    inline int getSize() const { return mSize; }
+
 private:
     BufferAllocator* mAllocator;
     MemChunk mChunk;
@@ -112,7 +113,9 @@ public:
     std::pair<int, int> multiThreadDivide(int size) const;
     virtual bool onSelectDynamicAllocator(int index, int maxIndex) override;
     // dividedSize's length should be larger than threadNumber
-    void computeDivideSizes(int size, int* dst, float computeI = 0.f) const;
+    // threads > 0: divide for that many workers instead of mThreadNumber (for callers
+    // whose concurrency is capped by computeThreadNumber)
+    void computeDivideSizes(int size, int* dst, float computeI = 0.f, int threads = 0) const;
 
 public:
     virtual MemObj* onAcquire(const Tensor* nativeTensor, StorageType storageType) override;
@@ -143,7 +146,8 @@ public:
     const CoreInt8Functions* int8Functions() const {
         return mInt8CoreFunctions;
     }
-    void _resetDynamicMemory() const;
+    void _prepareTensorMemory(const Tensor* srcTensor, const Tensor* dstTensor) const;
+
 public:
     class Creator {
     public:
@@ -156,6 +160,13 @@ public:
     inline int threadNumber() const {
         return mThreadNumber;
     }
+
+    // Thread count for compute-bound work split statically across many
+    // independent items (prefill-shaped). Efficiency-core workers only
+    // straggle such splits at the barrier, so participation is capped at the
+    // performance-cluster size. Single/few-item work (decode) is
+    // bandwidth-bound and keeps every thread.
+    int computeThreadNumber(int workItems) const;
 
     BufferAllocator* getBufferAllocator(bool defer_allocator = true) const {
         return mDmaInfo->mCurrentDynamicAllocator;

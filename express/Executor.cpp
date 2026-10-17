@@ -51,6 +51,13 @@ void Executor::setGlobalExecutorConfig(MNNForwardType type, const BackendConfig&
 int Executor::getCurrentRuntimeStatus(RuntimeStatus statusEnum) {
     return mRuntimeInfo.first[mAttr->firstType]->onGetRuntimeStatus(statusEnum);
 }
+float Executor::getLastGpuTimeMs() const {
+    auto iter = mRuntimeInfo.first.find(mAttr->firstType);
+    if (iter == mRuntimeInfo.first.end()) {
+        return -1.0f;
+    }
+    return iter->second->onGetLastGpuTimeMs();
+}
 std::shared_ptr<Runtime> Executor::_getOrCreateRuntime(MNNForwardType type, const BackendConfig* config, int numberThread, bool reset) {
     auto iter = mRuntimeInfo.first.find(type);
     if (iter != mRuntimeInfo.first.end()) {
@@ -99,6 +106,16 @@ Executor::Executor(std::shared_ptr<Runtime> runtime, MNNForwardType type, int nu
 }
 Executor::~Executor(){
     // Do nothing
+}
+
+Executor::Activation::Activation(const RuntimeInfo& info) : mRuntimeInfo(info) {
+    mRuntimeWrap.reset(new RuntimeExecuteWrap(mRuntimeInfo));
+}
+
+Executor::Activation::~Activation() = default;
+
+std::shared_ptr<Executor::Activation> Executor::activte() const {
+    return std::shared_ptr<Activation>(new Activation(mRuntimeInfo));
 }
 
 void Executor::setCallBack(TensorCallBackWithInfo&& before, TensorCallBackWithInfo&& after) {
@@ -164,6 +181,10 @@ std::shared_ptr<Executor> Executor::newExecutor(MNNForwardType type,
     info.user = const_cast<BackendConfig*>(&config);
     std::shared_ptr<Runtime> runtime(creator->onCreate(info));
     auto executor = new Executor(runtime, type, numberThread);
+    // The runtime was created from `config`; the attr must agree, otherwise
+    // backends built later from this executor use the default precision.
+    executor->mAttr->config = config;
+    executor->mAttr->config.sharedContext = nullptr;
     return std::shared_ptr<Executor>(executor);
 }
 
@@ -248,13 +269,13 @@ void Executor::RuntimeManager::setExternalPath(std::string path, int type) {
 }
 void Executor::RuntimeManager::setHintPtr(Interpreter::HintMode mode, void* value) {
     if (mode == Interpreter::KVCACHE_INFO) {
-        mInside->mMeta = value;
+        mInside->mContent->pMeta = value;
     }
 }
 
 void Executor::RuntimeManager::applyMetaToRuntime() const {
     for (auto& iter : mInside->mRuntime.first) {
-        iter.second->pMeta = mInside->mMeta;
+        iter.second->pMeta = mInside->mContent->pMeta;
     }
 }
 
@@ -276,11 +297,13 @@ bool Executor::RuntimeManager::getInfo(Interpreter::SessionInfoCode code, void* 
             auto dst = (int*)ptr;
             if (!mInside->mRuntime.first.empty()) {
                 *dst = mInside->mRuntime.first.begin()->first;
+                return true;
             }
         } break;
         case Interpreter::RESIZE_STATUS: {
             auto dst = (int*)ptr;
             *dst = mInside->mResizeStatus;
+            return true;
         } break;
         default: {
             // Do nothing
@@ -353,6 +376,11 @@ BackendConfig* Executor::RuntimeManager::getBnConfig() {
 void Executor::RuntimeManager::setCache(std::string cacheName) {
     std::lock_guard<std::mutex> _l(mLock);
 
+    if (nullptr == mInside->mInfo) {
+        // Runtime not created (e.g. requested backend unavailable on this device), skip setCache
+        MNN_ERROR("Runtime not created, skip setCache\n");
+        return;
+    }
     mInside->mCache.reset(new Cache);
     mInside->mCache->cacheFile = cacheName;
     mInside->mInfo->onSetCachePath(cacheName.c_str(), 0);
@@ -599,6 +627,9 @@ void Executor::_makeCache(const std::vector<EXPRP>& expr, bool forceCPU) {
         scheduleInfo.pipelineInfo[0].first.info.type = MNN_FORWARD_CPU;
     } else {
         scheduleInfo.pipelineInfo[0].first.info.type = current->getAttr()->firstType;
+        // numThread aliases gpuMode for GPU backends; without it the geometry
+        // context sees the Backend::Info default instead of the executor's mode.
+        scheduleInfo.pipelineInfo[0].first.info.numThread = current->getAttr()->numThread;
     }
     scheduleInfo.pipelineInfo[0].first.needComputeShape = false;
     scheduleInfo.pipelineInfo[0].first.needComputeGeometry = mLazyMode != LAZY_CONTENT;

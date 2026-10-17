@@ -24,6 +24,7 @@ struct AttentionKernelParam {
     int batch;            // B (批次大小)
     int current_kv_seq_len_new; // 本步骤中新增的K/V的长度 (来自 AttentionExecution 类中的 mNewKvSeqLen)
     int past_kv_len;      // mCache->mPastLength (在此步骤之前KV Cache中已有的K/V长度)
+    int mask_kv_len;      // mask 列数: L_q 或 L_k_total
 };
 
 
@@ -36,7 +37,7 @@ public:
         int mMaxLength = 0;                 // Cache的已分配容量 (L_kv_max)
     };
 
-    AttentionExecution(Backend *backend, bool kv_cache_op_param); // kv_cache_op_param 来自 Op 定义
+    AttentionExecution(Backend* backend, bool kv_cache_op_param); // kv_cache_op_param 来自 Op 定义
     virtual ~AttentionExecution();
 
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
@@ -48,9 +49,11 @@ private:
     ErrorCode reallocKVCache_gpu(int required_total_kv_len, int batch_size, int kv_num_head, int head_dim, cudaStream_t stream);
     ErrorCode reallocKVCache_gpu(int required_total_kv_len, const KVMeta* meta, cudaStream_t stream);
     ErrorCode ensureTempBuffers_gpu(int batch, int num_head, int q_seq_piece_len_max, int current_max_total_kv_len, int head_dim);
+    ErrorCode ensureC4TailBuffers_gpu();
 
     CUDABackend* mCudaBackend;
     bool mIsKVCacheEnabled; // 基于 Op 参数
+    bool mIsKVShared = false;
     std::shared_ptr<SharedCache> mCache;
     float mScale;
 
@@ -61,6 +64,8 @@ private:
     int mHeadDim;           // 每个头的维度 (D)
     int mKvNumHead;         // KV头数量 (H_kv)
     int mNewKvSeqLen;       // 当前输入的K/V Tensor的序列长度 (L_k_new, 即将追加的长度)
+    bool mValueC4HasTail = false;
+    bool mOutputC4HasTail = false;
 
     int mQseqSplitNum;      // 查询序列分割数量
 
@@ -72,9 +77,15 @@ private:
     std::shared_ptr<Tensor> mTempK_current_step; // 布局: [Max_L_k_new_alloc, B, H_kv, D]
     std::shared_ptr<Tensor> mTempV_current_step; // 布局: [B, H_kv, D, Max_L_k_new_alloc]
 
+    // CUDA NC4HW4 is stored as NHWC8. Tail channels are unpacked only when C is not 8-aligned.
+    std::shared_ptr<Tensor> mC4ValueContiguous;
+    std::shared_ptr<Tensor> mC4OutputContiguous;
+
     // Mask 相关
     bool mHasMask;
+    bool mIsCausalMask;
     bool mIsAddMask; // 如果 mask 是 float 类型并相加则为 true, 如果是 int 类型并设为 -FLT_MAX 则为 false
+    int mMaskKvLen = 0;
 
     AttentionKernelParam* mParam_gpu = nullptr; // Kernel参数的设备指针
     KVMeta* mMeta = nullptr;

@@ -157,9 +157,12 @@ class Context:
 
 class Llm:
 
-    def __init__(self, c_obj):
+    def __init__(self, c_obj, base=None):
         self._c_obj = c_obj
         self._context = Context(self._c_obj)
+        # A split LoRA references its base module. Retain the base wrapper so
+        # Python cannot destroy it before this adapter.
+        self._base = base
 
     def load(self):
         '''
@@ -313,6 +316,31 @@ class Llm:
         '''
         return self._c_obj.apply_lora(lora_path)
 
+    def create_lora(self, lora_path):
+        '''
+        create a split LoRA instance sharing this model's base module
+
+        Parameters
+        ----------
+        lora_path : split LoRA model path
+
+        Returns
+        -------
+        llm : a new Llm instance
+
+        Notes
+        -----
+        Keep inference state on the returned instance. The base model is
+        retained automatically for the lifetime of the LoRA instance.
+
+        Example:
+        -------
+        >>> base = mllm.create('./qwen-int4/config.json')
+        >>> base.load()
+        >>> adapter = base.create_lora('lora.mnn')
+        '''
+        return Llm(self._c_obj.create_lora(lora_path), base=self)
+
     def select_module(self, module_index):
         '''
         select current module
@@ -371,6 +399,27 @@ class Llm:
 
     def reset(self):
         self._c_obj.reset()
+
+    def get_log(self):
+        '''
+        Get and clear the accumulated log buffer.
+        Requires LLM_LOG_TO_STRING to be enabled at compile time.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        log : str
+            The accumulated log string. Empty if LLM_LOG_TO_STRING is not enabled.
+
+        Example:
+        -------
+        >>> log = llm.get_log()
+        >>> print(log)
+        '''
+        return self._c_obj.get_log()
 
     def stoped(self):
         '''

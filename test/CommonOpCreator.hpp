@@ -41,7 +41,8 @@ static Express::VARP _HybridConv(const std::vector<float>& weight, const std::ve
     }
     int blocknum = alphasize / channel[1];
     int blocksize = kSize / blocknum;
-    conv2D->quanParameter = std::move(IDSTEncoder::encode(weight.data(), alpha, blocksize, kNum * blocknum, async, nullptr, clampMin, nbits, false));
+    conv2D->quanParameter = std::move(IDSTEncoder::encode(weight.data(), alpha, blocksize, kNum * blocknum, async,
+                                                          nullptr, clampMin, {nbits, false}));
     conv2D->common->padMode     = _convertPadMode(pad);
     if (pads.size() == 2) {
         conv2D->common->padX        = pads[0];
@@ -64,6 +65,44 @@ static Express::VARP _HybridConv(const std::vector<float>& weight, const std::ve
     MNN_ASSERT(bias.size() == channel[1]);
     conv2D->bias = bias;
     return (Express::Variable::create(Express::Expr::create(convOp.get(), {x})));
+}
+
+// Asymmetric block-quantized 1x1 conv member, for ops that take Convolution2D
+// tables directly (FusedLinear). Weight values span the whole code range so
+// IDSTEncoder keeps the full index width.
+static std::unique_ptr<Convolution2DT> _blockQuantConv1x1(int ic, int oc, int nbits, int blocksize, int seed) {
+    const float threshold = (float)(1 << (nbits - 1)) - 1.0f;
+    const float clampMin  = -threshold - 1.0f;
+    const int blocknum    = ic / blocksize;
+    std::vector<float> weight((size_t)oc * ic), alpha((size_t)2 * oc * blocknum), bias(oc);
+    for (int o = 0; o < oc; ++o) {
+        bias[o] = (float)(((o * 5 + seed * 3) % 11) - 5) * 0.013f;
+        for (int i = 0; i < ic; ++i) {
+            weight[(size_t)o * ic + i] = (float)(((o * ic + i) * 7 + seed * 13) % 17 - 8) * 0.021f;
+        }
+    }
+    for (int o = 0; o < oc; ++o) {
+        for (int b = 0; b < blocknum; ++b) {
+            const float* w = weight.data() + (size_t)o * ic + b * blocksize;
+            float mn = w[0], mx = w[0];
+            for (int u = 1; u < blocksize; ++u) {
+                mn = std::min(mn, w[u]);
+                mx = std::max(mx, w[u]);
+            }
+            alpha[2 * ((size_t)o * blocknum + b)]     = mn;
+            alpha[2 * ((size_t)o * blocknum + b) + 1] = (mx - mn) / (threshold - clampMin);
+        }
+    }
+    std::unique_ptr<Convolution2DT> conv(new Convolution2DT);
+    conv->common.reset(new Convolution2DCommonT);
+    conv->common->kernelX     = 1;
+    conv->common->kernelY     = 1;
+    conv->common->inputCount  = ic;
+    conv->common->outputCount = oc;
+    conv->quanParameter = IDSTEncoder::encode(weight.data(), alpha, blocksize, oc * blocknum,
+                                              /*async=*/true, nullptr, (int)clampMin, {nbits, false});
+    conv->bias = bias;
+    return conv;
 }
 
 static float findAbsMax(const float *weights, const int count) {

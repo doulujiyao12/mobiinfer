@@ -186,7 +186,8 @@ def check_app():
 def sync_app():
     check_app()
     root = config_path("MOBI_ROOT")
-    require_files(root, ["include/MNN/Interpreter.hpp", "transformers/llm/engine/include/llm/llm.hpp"])
+    require_files(root, ["include/MNN/Interpreter.hpp", "transformers/llm/engine/include/llm/llm.hpp",
+                         "transformers/llm/engine/src/llmconfig.hpp", "transformers/llm/engine/src/ujson.hpp"])
     library = config_path("MOBI_BUILD_DIR") / "libMNN.so"
     require_arm64(library)
     _, libraries = hiai_libraries()
@@ -195,6 +196,11 @@ def sync_app():
         copy_file(path, target / "libs/arm64-v8a" / path.name)
     copy_tree(root / "include/MNN", target / "src/main/cpp/include/MNN")
     copy_tree(root / "transformers/llm/engine/include/llm", target / "src/main/cpp/include/llm")
+    # The hybrid bridge constructs LlmConfig directly. Its definition and JSON
+    # implementation must match the library, in addition to the public API.
+    for name in ("llmconfig.hpp", "ujson.hpp"):
+        copy_file(root / "transformers/llm/engine/src" / name,
+                  target / "src/main/cpp/offline_npu2" / name)
     log("Synced libMNN.so, {} HiAI libraries and public headers: {}".format(len(libraries), target))
     log("Build the App in DevEco Studio to generate libentry.so and the HAP.")
 

@@ -7,6 +7,7 @@
 //
 
 #include "ConvolutionCommon.hpp"
+#include <limits.h>
 #include <math.h>
 #include "backend/cpu/compute/CommonOptFunction.h"
 #include "backend/cpu/CPUBackend.hpp"
@@ -354,7 +355,7 @@ static int8_t *ReadQuanData_c(BaseLoader* s, size_t* len, ConvolutionCommon::Int
             if (len) {
                 *len = blob ? dataCnt : 0;
             }
-            if (result->originBits <= 4 && forceQuant) {
+            if (result->originBits == 4 && forceQuant) {
                 // Reduce blob to 4 bit
                 result->canUseInt4 = true;
                 auto sizeDiv2 = UP_DIV(dataCnt, 2);
@@ -371,6 +372,13 @@ static int8_t *ReadQuanData_c(BaseLoader* s, size_t* len, ConvolutionCommon::Int
                 }
                 MNNMemoryFreeAlign(blob);
                 blob = newBlob;
+            } else if ((result->originBits == 2 || result->originBits == 3) && forceQuant) {
+                // Keep blob as one byte per weight; conv executor will pack to w2/w3 layout.
+                if (result->originBits == 2) {
+                    result->canUseInt2 = true;
+                } else {
+                    result->canUseInt3 = true;
+                }
             }
         }
     } while (0);
@@ -549,7 +557,20 @@ int ConvolutionCommon::getQuantBitFromExternalFile(const Op* op) {
     }
     return 0;
 }
-std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op* op, Backend* backend, bool forceFloat, bool forceInt8, void* weightPtr) {
+// Validate before narrowing to AutoStorage's int element count. Include the
+// alignment overhead added by MNNMemoryAllocAlign in the size_t limit.
+static bool externalElementCount(int64_t bytes, size_t elementBytes, int& count) {
+    if (bytes < 0 || bytes % elementBytes != 0 || bytes / elementBytes > INT_MAX ||
+        (uint64_t)bytes > SIZE_MAX - sizeof(void*) - MNN_MEMORY_ALIGN_DEFAULT) {
+        MNN_ERROR("Invalid external weight length: %lld\n", (long long)bytes);
+        return false;
+    }
+    count = (int)(bytes / elementBytes);
+    return true;
+}
+
+std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op* op, Backend* backend, bool forceFloat,
+                                                                    bool forceInt8, void* weightPtr, bool allowFp16Alpha) {
     auto conv = op->main_as_Convolution2D();
     auto quan = conv->quanParameter();
     std::shared_ptr<ConvolutionCommon::Int8Common> result(new Int8Common);
@@ -565,21 +586,44 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
         useCachedMmap = backend->getRuntime()->hint().useCachedMmap > 1;
     }
     if (USE_EXTERNAL_DATA(conv) && op->externalPath() && quan->type() == 8) {
+        auto externalInfo = conv->external()->data();
+        int weightCount = 0;
+        if (!externalElementCount(externalInfo[1], sizeof(float), weightCount) || weightCount == 0 ||
+            externalInfo[0] < 0 || externalInfo[0] > INT64_MAX - externalInfo[1]) {
+            return nullptr;
+        }
         std::unique_ptr<FileLoader> external(new FileLoader(op->externalPath()->c_str()));
-        auto param = op->main_as_Convolution2D();
-        external->offset(param->external()->data()[0]);
+        if (external->offset(externalInfo[0]) != 0 || !external->valid()) {
+            return nullptr;
+        }
         if(weightPtr != nullptr) {
             result->weightFloat.set((float *)weightPtr, false);
         } else {
-            result->weightFloat.reset((int)(param->external()->data()[1] / sizeof(float)));
+            result->weightFloat.reset(weightCount);
         }
-        external->read((char*)(result->weightFloat.get()), param->external()->data()[1]);
+        if (result->weightFloat.get() == nullptr ||
+            !external->read((char*)result->weightFloat.get(), externalInfo[1])) {
+            return nullptr;
+        }
         return result;
     }
+    // scaleStorage scalar survives weight externalization, unlike the alphaFp16 vector.
+    const bool alphaIsFp16 = (quan->scaleStorage() == ScaleStorageType_FP16);
     if (USE_EXTERNAL_DATA(conv) && (op->externalPath() || useCachedMmap) && quan->buffer() == nullptr) {
+        if (conv->external()->size() < 3) {
+            return nullptr;
+        }
         auto external_info = conv->external()->data();
-        buffer_size = external_info[1];
-        alpha_size = external_info[2] / sizeof(float);
+        const size_t alphaElemBytes = alphaIsFp16 ? sizeof(uint16_t) : sizeof(float);
+        int alphaCount = 0;
+        if (!externalElementCount(external_info[2], alphaElemBytes, alphaCount) || external_info[0] < 0 ||
+            external_info[1] < 0 || (uint64_t)external_info[1] > SIZE_MAX ||
+            external_info[0] > INT64_MAX - external_info[1] ||
+            external_info[0] + external_info[1] > INT64_MAX - external_info[2]) {
+            return nullptr;
+        }
+        buffer_size = (size_t)external_info[1];
+        alpha_size = alphaCount;
         result->alphaSize = alpha_size;
         if (useCachedMmap) {
             weightLength = conv->common()->inputCount() * conv->common()->outputCount() * conv->common()->kernelX() * conv->common()->kernelY();
@@ -588,7 +632,9 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
         } else {
             // external data
             std::unique_ptr<FileLoader> external_file(new FileLoader(op->externalPath()->c_str()));
-            external_file->offset(external_info[0]);
+            if (external_file->offset(external_info[0]) != 0 || !external_file->valid()) {
+                return nullptr;
+            }
             if (0 != buffer_size) {
                 if (1 == quan->type() && !forceFloat) {
                     buffer = IDSTDecoder::ReadQuanData_c(external_file.get(), &weightLength, result.get(), quan, forceInt8, forceFloat, weightPtr);
@@ -599,25 +645,55 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
                 } else {
                     external_buffer.reset(new int8_t[buffer_size]);
                     buffer_ptr = external_buffer.get();
-                    external_file->read((char*)buffer_ptr, buffer_size);
+                    if (!external_file->read((char*)buffer_ptr, buffer_size)) {
+                        return nullptr;
+                    }
                 }
             }
+            // The decoder's temporary buffer is not owned by result until below.
+            std::unique_ptr<void, decltype(&MNNMemoryFreeAlign)> decodedBuffer(
+                buffer == weightPtr ? nullptr : buffer, MNNMemoryFreeAlign);
             if (0 != alpha_size) {
-                result->alpha.reset((int)alpha_size);
-                if (nullptr == result->alpha.get()) {
-                    MNN_PRINT("Alloc memory error for extract idst int8\n");
-                    return nullptr;
+                if (alphaIsFp16) {
+                    result->alphaIsFp16 = true;
+                    result->alphaHalf.reset(alphaCount);
+                    if (nullptr == result->alphaHalf.get()) {
+                        MNN_PRINT("Alloc memory error for extract idst int8\n");
+                        return nullptr;
+                    }
+                    if (!external_file->read((char*)result->alphaHalf.get(), external_info[2])) {
+                        return nullptr;
+                    }
+                } else {
+                    result->alpha.reset(alphaCount);
+                    if (nullptr == result->alpha.get()) {
+                        MNN_PRINT("Alloc memory error for extract idst int8\n");
+                        return nullptr;
+                    }
+                    alpha_ptr = result->alpha.get();
+                    if (!external_file->read((char*)alpha_ptr, external_info[2])) {
+                        return nullptr;
+                    }
                 }
-                alpha_ptr = result->alpha.get();
-                external_file->read((char*)alpha_ptr, alpha_size * sizeof(float));
             }
+            decodedBuffer.release();
         }
     } else {
         if (quan->buffer()) {
             buffer_size = quan->buffer()->size();
             buffer_ptr = quan->buffer()->data();
         }
-        if (quan->alpha()) {
+        if (alphaIsFp16) {
+            alpha_size = quan->alphaFp16()->size();
+            result->alphaSize = alpha_size;
+            result->alphaIsFp16 = true;
+            result->alphaHalf.reset((int)alpha_size);
+            if (nullptr == result->alphaHalf.get()) {
+                MNN_PRINT("Alloc memory error for extract idst int8\n");
+                return nullptr;
+            }
+            ::memcpy(result->alphaHalf.get(), quan->alphaFp16()->data(), alpha_size * sizeof(int16_t));
+        } else if (quan->alpha()) {
             alpha_size = quan->alpha()->size();
             alpha_ptr = quan->alpha()->data();
             result->alphaSize = alpha_size;
@@ -628,6 +704,14 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
             }
             ::memcpy(result->alpha.get(), alpha_ptr, alpha_size * sizeof(float));
         }
+    }
+    const bool cpuFamily = backend && (backend->type() == MNN_FORWARD_CPU || backend->type() == MNN_FORWARD_CPU_EXTENSION);
+    if (nullptr == alpha_ptr && result->alphaHalf.get() != nullptr && !cpuFamily && !allowFp16Alpha) {
+        alpha_ptr = result->getAlphaFloat();
+    }
+    // Sparse paths below need fp32 alpha; lazy-fill from alphaHalf if disk was fp16.
+    if ((quan->index() != nullptr || 2 == quan->type()) && nullptr == alpha_ptr && result->alphaHalf.get() != nullptr) {
+        alpha_ptr = result->getAlphaFloat();
     }
     if (quan->index() != nullptr) {
         if (forceFloat) {
@@ -713,7 +797,9 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
                 MNN_PRINT("Alloc memory error for extract idst int8\n");
                 return nullptr;
             }
-            if(weightPtr != nullptr) {
+            // Low-bit decoding may return a temporary buffer even when the caller supplied
+            // weightPtr. Only the caller-owned buffer must be marked non-owning.
+            if (buffer == weightPtr) {
                 result->weight.set(buffer, false);
             } else {
                 result->weight.set(buffer, (int)weightLength);
@@ -721,17 +807,19 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
         }
         int outputCount = 0;
         if (result->asymmetric) {
-            outputCount   = result->alpha.size() / 2;
+            outputCount   = result->alphaSize / 2;
             // clampMin is minVal in asymmetric quant, clampMin = -(2^(bit))
             // and old version clampMin is -128
             float clampMin = quan->aMin() == 0 ? -128 : quan->aMin();
             if (clampMin < 0) {
+                // The fold runs in fp32; force the lazy fill when the disk form is fp16.
+                result->getAlphaFloat();
                 for (int o = 0; o < outputCount; ++o) {
                     result->alpha.get()[2 * o] = result->alpha.get()[2 * o] - clampMin * result->alpha.get()[2 * o + 1];
                 }
             }
         } else {
-            outputCount   = result->alpha.size(); // backward compability with previous symmetric quantization
+            outputCount   = result->alphaSize; // backward compability with previous symmetric quantization
         }
         if (!quan->has_scaleInt()) {
             float extraFactor = quan->quantScale();
@@ -739,6 +827,8 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
             if (oldType4) {
                 extraFactor = 1.0f;
             } else if (extraFactor != 1.0f) {
+                // Force the lazy fp32 fill when the disk form is fp16.
+                result->getAlphaFloat();
                 for (int o=0; o<result->alpha.size(); ++o) {
                     result->alpha.get()[o] *= extraFactor;
                 }
@@ -761,19 +851,21 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
         }
         int outputCount = 0;
         if (result->asymmetric) {
-            outputCount = result->alpha.size() / 2;
+            outputCount = result->alphaSize / 2;
         } else {
-            outputCount = result->alpha.size();
+            outputCount = result->alphaSize;
         }
+        // forceFloat needs fp32 alpha; lazy-fill from alphaHalf if disk was fp16.
+        auto alphaF = result->getAlphaFloat();
         int partWeightSize = (int)weightLength / outputCount;
         for (int o = 0; o < outputCount; ++o) {
             float min = 0.0f;
             float alpha = 0.0f;
             if (result->asymmetric) {
-                min = result->alpha.get()[2*o];
-                alpha = result->alpha.get()[2*o+1];
+                min = alphaF[2 * o];
+                alpha = alphaF[2 * o + 1];
             } else {
-                alpha = result->alpha.get()[o];
+                alpha = alphaF[o];
             }
             auto dstW   = result->weightFloat.get() + o * partWeightSize;
             auto srcW   = result->weight.get() + o * partWeightSize;
@@ -783,8 +875,42 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
         }
         result->weight.release();
         result->alpha.release();
+        result->alphaHalf.release();
     }
     return result;
+}
+
+const float* ConvolutionCommon::Int8Common::getAlphaFloat() {
+    if (alpha.get() != nullptr) {
+        return alpha.get();
+    }
+    if (alphaHalf.get() != nullptr) {
+        alpha.reset(alphaSize);
+        auto src = reinterpret_cast<const half_float::half*>(alphaHalf.get());
+        auto dst = alpha.get();
+        for (int i = 0; i < alphaSize; ++i) {
+            dst[i] = float(src[i]);
+        }
+        return alpha.get();
+    }
+    return nullptr;
+}
+
+const int16_t* ConvolutionCommon::Int8Common::getAlphaHalf() {
+    if (alphaHalf.get() != nullptr) {
+        return alphaHalf.get();
+    }
+    if (alpha.get() != nullptr) {
+        alphaHalf.reset(alphaSize);
+        auto src = alpha.get();
+        auto dst = alphaHalf.get();
+        for (int i = 0; i < alphaSize; ++i) {
+            half_float::half h(src[i]);
+            ::memcpy(&dst[i], &h, sizeof(int16_t));
+        }
+        return alphaHalf.get();
+    }
+    return nullptr;
 }
 
 void ConvolutionCommon::getConvParameters(std::shared_ptr<Int8Common> *quanCommon, Backend* backend, const MNN::Op *op, const float** originWeight, int* originWeightSize) {
@@ -797,7 +923,12 @@ void ConvolutionCommon::getConvParameters(std::shared_ptr<Int8Common> *quanCommo
         *originWeight     = (*quanCommon)->weightFloat.get();
         *originWeightSize = (*quanCommon)->weightFloat.size();
     }
-    if (*originWeight == nullptr) {
+    if (*originWeight == nullptr && nullptr != conv2d->weight()) {
+        // conv2d->weight() is null when the weight is supplied as a runtime
+        // input tensor (e.g. the backprop / weight-as-input deconvolution from
+        // _Deconv(weight, bias, input)). Leave originWeight null in that case
+        // so callers can detect "no embedded weight" instead of dereferencing
+        // a null flatbuffers vector.
         *originWeight = conv2d->weight()->data();
         *originWeightSize = conv2d->weight()->size();
     }
@@ -840,15 +971,17 @@ bool ConvolutionCommon::getConvInt8Parameters(const MNN::Op* op, std::shared_ptr
     if (conv2d->bias()) {
         ::memcpy(bias, conv2d->bias()->data(), outputCount * sizeof(float));
     }
-    if ((conv2d->quanParameter() && conv2d->quanParameter()->alpha()) || quanCommon->alpha.get()) {
+    if ((conv2d->quanParameter() && conv2d->quanParameter()->alpha()) || quanCommon->alpha.get() ||
+        quanCommon->alphaHalf.get()) {
         int quantCount;
         const float* alpha = nullptr;
         if (conv2d->quanParameter() && conv2d->quanParameter()->alpha()) {
             quantCount    = conv2d->quanParameter()->alpha()->size();
             alpha = conv2d->quanParameter()->alpha()->data();
         } else {
+            // Forces the lazy fp32 fill when the disk form is fp16.
+            alpha        = quanCommon->getAlphaFloat();
             quantCount   = quanCommon->alpha.size();
-            alpha = quanCommon->alpha.get();
         }
 
         if (false == weightAsy) { // symmetric quant

@@ -62,8 +62,8 @@ struct RuntimeHint {
     int mmapFileSize = 1024; // MB
     int useCachedMmap = 0;
 
-    // op encoder number for once commit
-    int encorderNumForCommit = 10;
+    // -1 selects the backend default for op encoders per commit.
+    int encorderNumForCommit = -1;
     int initThreadNumber = 0;
 
     // whether to use Arm sme2 cores when threads>1
@@ -82,8 +82,6 @@ struct RuntimeHint {
     // per single SME core is six times that of NEON,
     //while during the Decode stage it is the same (1×).
     int divisionRatio = 41;
-
-    int smeCores = 2; // Number of SME cores of the backend, default is 2, if supports sme
 };
 /** abstract backend */
 class Backend : public NonCopyable {
@@ -396,6 +394,10 @@ public:
 
     mutable int pCurrentStatus = 0; // NO_ERROR
     mutable int pExecutionStatus = 0; // NO_ERROR
+
+    // GPU profiling: last execution time in ms measured by GPU timestamps.
+    // Returns -1.0f if profiling is not supported or not enabled.
+    virtual float onGetLastGpuTimeMs() const { return -1.0f; }
 
     // TODO: Move to Backend
     void* pMeta = nullptr;

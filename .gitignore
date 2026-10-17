@@ -2,6 +2,9 @@
 # Created by https://www.gitignore.io/api/python,cmake,xcode,androidstudio
 # Edit at https://www.gitignore.io/?templates=python,cmake,xcode,androidstudio
 
+# Local build, export, and device-test artifacts.
+/.artifacts/
+
 ### AndroidStudio ###
 # Covers files to be ignored for android development using Android Studio.
 
@@ -242,6 +245,7 @@ celerybeat-schedule
 
 # Environments
 .env
+.copybara_sync.env
 .venv
 env/
 venv/
@@ -515,3 +519,12 @@ transformers/llm/export/plugin_quant_visual_matmul_route_v1/__pycache__
 transformers/llm/export/plugin_quant_visual_matmul_route_v1/.claude
 transformers/llm/export/plugin_quant_visual_matmul_route_v1/.empty
 transformers/llm/export/plugin_quant_visual_matmul_route_v1/model*
+# test.sh per-run artifacts
+/logs/
+/smoke_sources/
+/models/
+# smoke models converted on the host by ./test.sh local (sources are fetched
+# into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
+/resource/model/**/*.caffe.mnn
+
+model/

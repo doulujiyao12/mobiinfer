@@ -21,25 +21,40 @@ namespace MNN {
 
 class CPUAttention : public Execution {
 public:
-    CPUAttention(Backend* backend, bool kv_cache);
+    CPUAttention(Backend* backend, bool kvCache);
     virtual ~CPUAttention() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 
-private:
+protected:
+    virtual bool tryExecuteFastPath(const int8_t* query, int8_t* output, int seqLen, int kvSeqLen, int paddingLength,
+                                    float qScale, float attentionScale, bool lowerTriangular, bool hasSinks,
+                                    bool outputC4, bool directC4Output);
+    virtual CPUAttention* createClone(Backend* backend) const;
+
+#ifdef MNN_SME2
+    bool mUseMixedSmeNeonMatMul = false;
+    int mSmeThreadCount = 0;
+#endif
     bool mKVCache        = true;
     bool mIsKVShared = false;
+    bool mDecodeGqaBatch = false; // decode: batch query heads sharing one KV head into a single GEMM
     int mBytes = 4;
     int mThreadNum = 1;
-    int mBlockKV = 512;
+    int mKvBlockSize = 512;
     int eP, lP, hP, mPack; // float matmul packing
     int eP8, lP8, hP8;    // GemmInt8 packing
-    int mNumHead, mKvNumHead, mHeadDim;
+    int mQNumHead, mKvNumHead, mHeadDim;
     KVMeta* mMeta;
 
     // common
-    std::shared_ptr<Tensor> mPackQ, mPackQKV, mRunningMax, mRunningSum, mTempQKBlock, mTempOut, mExpfDiffMax;
+    std::shared_ptr<Tensor> mPackQ, mPackQKV, mRunningMax, mRunningSum, mTempOut, mExpfDiffMax;
+    // Decode scratch (flash path, seqLen==1) cached across onExecute calls; the
+    // flash block cap bounds every shape by a per-phase constant, so steady-state
+    // tokens reuse one allocation instead of five static-pool alloc/free cycles
+    // per layer per token.
+    std::shared_ptr<Tensor> mSoftmMaxQ, mNewPackQK, mQKBlockScratch, mKvSplitPartials, mPvSubBlockScratch;
     std::shared_ptr<CPUKVCacheManager> mKVCacheManager = nullptr;
     bool mUseFlashAttention = true;
 

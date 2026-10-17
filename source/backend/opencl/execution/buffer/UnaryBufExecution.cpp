@@ -13,8 +13,33 @@ namespace MNN {
 namespace OpenCL {
 
 UnaryBufExecution::UnaryBufExecution(const std::string& compute, const MNN::Op* op, Backend* backend) : CommonExecution(backend, op) {
-    mBuildOptions.emplace(" -DOPERATOR=" + compute);
+    mBuildOptions.emplace("-DOPERATOR=" + compute);
 }
+
+void UnaryBufExecution::prebuildOpenCLPrograms(const std::vector<Tensor*>& inputs,
+                                               const std::vector<Tensor*>& outputs) {
+    MNN_ASSERT(!inputs.empty() && !outputs.empty());
+    auto* openCLBackend = static_cast<OpenCLBackend*>(backend());
+    auto* runtime = openCLBackend->getOpenCLRuntime();
+    auto* output = outputs[0];
+#ifdef MNN_SUPPORT_INTEL_SUBGROUP
+    if (runtime->isSupportedIntelSubgroup() &&
+        MNN::MNN_DATA_FORMAT_NC4HW4 == TensorUtils::getDescribe(output)->dimensionFormat) {
+        return;
+    }
+#endif
+    auto outputShape = tensorShapeFormat(output);
+    int totalSize = outputShape[0] * outputShape[1] * outputShape[2] * outputShape[3];
+    if (MNN::MNN_DATA_FORMAT_NC4HW4 == TensorUtils::getDescribe(output)->dimensionFormat) {
+        totalSize = outputShape[0] * outputShape[1] * outputShape[2] * ROUND_UP(outputShape[3], 4);
+    }
+    auto buildOptions = mBuildOptions;
+    if (totalSize % 4 != 0) {
+        buildOptions.emplace("-DPACK_LEAVE");
+    }
+    runtime->submitPrebuild("unary_buf", buildOptions, openCLBackend->getPrecision(), inputs[0], output, true, true);
+}
+
 ErrorCode UnaryBufExecution::onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     mUnits.resize(1);
     auto &unit = mUnits[0];
@@ -215,6 +240,7 @@ public:
                 case UnaryOpOperation_COSH: OPENCL_CREATOR_CHECK(new UnaryBufExecution("cosh(convert_float4(in))", op, backend));
                case UnaryOpOperation_ERF: OPENCL_CREATOR_CHECK(new UnaryBufExecution("erf(convert_float4(in))", op, backend));
                 case UnaryOpOperation_ERFC: OPENCL_CREATOR_CHECK(new UnaryBufExecution("erfc(convert_float4(in))", op, backend));
+                case UnaryOpOperation_ERFINV: OPENCL_CREATOR_CHECK(new UnaryBufExecution("erfinv4(convert_float4(in))", op, backend));
                 case UnaryOpOperation_EXPM1: OPENCL_CREATOR_CHECK(new UnaryBufExecution("expm1(convert_float4(in))", op, backend));
                 case UnaryOpOperation_SIGMOID: OPENCL_CREATOR_CHECK(new UnaryBufExecution("native_recip((float4)1+native_exp(convert_float4(-in)))", op, backend));
                 case UnaryOpOperation_SILU: OPENCL_CREATOR_CHECK(new UnaryBufExecution("(convert_float4(in)*native_recip((float4)1+native_exp(convert_float4(-in))))", op, backend));

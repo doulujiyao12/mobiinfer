@@ -13,7 +13,17 @@
 #define INTERP 1
 namespace MNN {
 namespace OpenCL {
-bool ConvWinograd::valid(const Convolution2DCommon* common, const Tensor* input, const Tensor* output, int maxWidth, int maxHeight, int limit) {
+size_t ConvWinograd::transformImageBytes(int alpha, int wUnit, int hUnit, int inputChannel, int outputChannel,
+                                        int fpBytes) {
+    // Prices the pair onEncode allocates. MNN maps a CAFFE_C4 tensor to an image of
+    // width UP_DIV(C, 4) * W and height N * H, always CL_RGBA, so four channels per pixel.
+    // mSource is {alpha*alpha, ic, hUnit, wUnit}; mDest is {UP_DIV(oc, 4), wUnit*4, hUnit, alpha*alpha}.
+    size_t sourcePixels = (size_t)UP_DIV(inputChannel, 4) * wUnit * ((size_t)alpha * alpha * hUnit);
+    size_t destPixels   = (size_t)wUnit * alpha * alpha * ((size_t)UP_DIV(outputChannel, 4) * hUnit);
+    return (sourcePixels + destPixels) * 4 * (size_t)fpBytes;
+}
+
+bool ConvWinograd::valid(const Convolution2DCommon* common, const Tensor* input, const Tensor* output, int maxWidth, int maxHeight, int limit, int fpBytes, BackendConfig::MemoryMode memory) {
     if (common->strideX() != 1 || common->strideY() != 1) {
         return false;
     }
@@ -41,6 +51,13 @@ bool ConvWinograd::valid(const Convolution2DCommon* common, const Tensor* input,
     int destHeight = UP_DIV(ic, 4) * hUnit;
 
     if(sourceWidth > maxWidth || sourceHeight > maxHeight || destWidth > maxWidth || destHeight > maxHeight){
+        return false;
+    }
+    // The image-dimension bounds above are not a memory bound: they reject issue #4782's
+    // 640x640x256 conv, but a 512x512 ic64 -> oc512 conv passes them and still wants ~1.2GB for
+    // the transform pair. Gate on the same budget the buffer path uses, see ConvBufWinograd.
+    if (BackendConfig::Memory_Low == memory &&
+        transformImageBytes(alpha, wUnit, hUnit, ic, oc, fpBytes) > WINOGRAD_TRANSFORM_BUDGET) {
         return false;
     }
     if(ic >= 32 && oc >= 32){
@@ -201,13 +218,14 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
     mMaxWGS_D.resize(total_num);
     mUnits.resize(total_num * 3);
     
+    char format[20];
+    ::memset(format, 0, sizeof(format));
+    sprintf(format, "%d_%d_%d", UNIT, mKernelX, INTERP);
+    auto formatStr = std::string(format);
+
     std::set<std::string> basic;
     /*Create Kernel*/
     for(int i = 0; i < input->batch(); i++) {
-        char format[20];
-        ::memset(format, 0, sizeof(format));
-        sprintf(format, "%d_%d_%d", UNIT, mKernelX, INTERP);
-        auto formatStr = std::string(format);
         mUnits[i * 3].kernel =
             runTime->buildKernel("winogradTransformSource" + formatStr,
                                  "winogradTransformSource", basic, mOpenCLBackend->getPrecision());
@@ -264,7 +282,7 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
         {
             mGWS_S[b] = {static_cast<uint32_t>(wUnit * hUnit), static_cast<uint32_t>(icC4)};
             std::string kernelName = "winogradTransformSource";
-            mLWS_S[b] = localWS2DDefault(mGWS_S[b], mMaxWGS_S[b], mOpenCLBackend->getOpenCLRuntime(), kernelName + info, mUnits[b * 3].kernel, mOpenCLBackend->getCLTuneLevel(), "winogradTransformSource").first;
+            mLWS_S[b] = localWS2DDefault(mGWS_S[b], mMaxWGS_S[b], mOpenCLBackend->getOpenCLRuntime(), kernelName + info, mUnits[b * 3].kernel, mOpenCLBackend->getCLTuneLevel(), "winogradTransformSource" + formatStr).first;
             mOpenCLBackend->recordKernel2d(mUnits[b * 3].kernel, mGWS_S[b], mLWS_S[b]);
             mUnits[b * 3].globalWorkSize = {mGWS_S[b][0], mGWS_S[b][1]};
             mUnits[b * 3].localWorkSize = {mLWS_S[b][0], mLWS_S[b][1]};
@@ -331,7 +349,7 @@ ErrorCode ConvWinograd::onEncode(const std::vector<Tensor*>& inputs, const std::
         {
             mGWS_D[b] = {static_cast<uint32_t>(wUnit*hUnit), static_cast<uint32_t>(ocC4)};
             std::string kernelName = "winogradTransformDest";
-            mLWS_D[b] = localWS2DDefault(mGWS_D[b], mMaxWGS_D[b], mOpenCLBackend->getOpenCLRuntime(), kernelName + info, mUnits[b * 3 + 2].kernel, mOpenCLBackend->getCLTuneLevel(), "winogradTransformDest").first;
+            mLWS_D[b] = localWS2DDefault(mGWS_D[b], mMaxWGS_D[b], mOpenCLBackend->getOpenCLRuntime(), kernelName + info, mUnits[b * 3 + 2].kernel, mOpenCLBackend->getCLTuneLevel(), "winogradTransformDest" + formatStr).first;
             mOpenCLBackend->recordKernel2d(mUnits[b * 3 + 2].kernel, mGWS_D[b], mLWS_D[b]);
             mUnits[b * 3 + 2].globalWorkSize = {mGWS_D[b][0], mGWS_D[b][1]};
             mUnits[b * 3 + 2].localWorkSize = {mLWS_D[b][0], mLWS_D[b][1]};

@@ -1049,12 +1049,33 @@ std::vector<VARP> Variable::load(const uint8_t* buffer, size_t length) {
             // Set tensor shape from net
             expr->mCanDecompose = false;
         }
-        if (nullptr != expr->get() || expr->inputType() == VARP::INPUT) {
+        if (nullptr != expr->get()) {
+            // Non-INPUT node: keep the existing behavior (replace with cloned tensor from net metadata)
             for (int index = 0; index < op->outputIndexes.size(); ++index) {
                 auto outputIndex = op->outputIndexes[index];
                 delete expr->inside()->mOutputTensors[index];
                 expr->inside()->mOutputTensors[index] = Tensor::clone(allTensors[outputIndex].get());
+                // Restore the memoryType that Expr::create correctly set (MEMORY_HOST):
+                // Tensor::clone shares allTensors' describe (memoryType defaults to
+                // MEMORY_BACKEND), which would otherwise make mapOutput's copy branch
+                // fail to allocate a host buffer and return NULL on readMap (#4750).
+                // Safe: the cloned tensor's host is null for non-CONST nodes (allTensors
+                // are metadata-only for these; CONST/TRAIN nodes don't enter this branch,
+                // their weight-bearing host is preserved by Expr::create), so restoring
+                // MEMORY_HOST cannot cause a double-free on destruction.
+                TensorUtils::getDescribe(expr->inside()->mOutputTensors[index])->memoryType = Tensor::InsideDescribe::MEMORY_HOST;
                 Utils::copyTensorToInfo(expr->inside()->mOutputInfos.data() + index, expr->inside()->mOutputTensors[index]);
+            }
+        } else if (expr->inputType() == VARP::INPUT) {
+            // INPUT node: keep the tensor created by Expr::create (host already allocated,
+            // usage = INPUT, memoryType = MEMORY_HOST). Only migrate quantAttr if the model
+            // declares quantization info for this input.
+            for (int index = 0; index < op->outputIndexes.size(); ++index) {
+                auto outputIndex = op->outputIndexes[index];
+                auto srcTensor = allTensors[outputIndex].get();
+                if (nullptr != srcTensor && TensorUtils::getDescribe(srcTensor)->quantAttr) {
+                    TensorUtils::getDescribe(expr->inside()->mOutputTensors[index])->quantAttr = TensorUtils::getDescribe(srcTensor)->quantAttr;
+                }
             }
         }
 

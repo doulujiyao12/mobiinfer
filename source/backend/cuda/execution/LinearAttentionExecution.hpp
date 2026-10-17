@@ -3,6 +3,7 @@
 
 #include "core/Execution.hpp"
 #include "backend/cuda/core/CUDABackend.hpp"
+#include "core/KVMeta.hpp"
 
 namespace MNN {
 namespace CUDA {
@@ -30,10 +31,16 @@ private:
     int mHeadKDim;
     int mHeadVDim;
     bool mUseQKL2Norm;
+    bool mGateFold = false;
     int mPrecision;
+
+    // gate/beta chain fold (gate_fold): per-head -exp(A_log) at [0..63] and
+    // dt_bias at [64..127] on device, uploaded once at construction.
+    std::shared_ptr<Tensor> mGateFoldConst;
 
     // Persistent state shared between prefill/decode via onClone
     std::shared_ptr<CUDAStateCache> mStateCache;
+    KVMeta* mMeta = nullptr;
 
     // Temporary GPU buffers (DYNAMIC)
     std::shared_ptr<Tensor> mConvOut;           // [B, D, L] conv output after SiLU

@@ -56,6 +56,8 @@ class SetupTests(unittest.TestCase):
                 (self.repo, "CMakeLists.txt", "project(fixture)\n"),
                 (self.repo, "include/MNN/Interpreter.hpp", "fixture MNN header\n"),
                 (self.repo, "transformers/llm/engine/include/llm/llm.hpp", "fixture LLM header\n"),
+                (self.repo, "transformers/llm/engine/src/llmconfig.hpp", "fixture LLM config\n"),
+                (self.repo, "transformers/llm/engine/src/ujson.hpp", "fixture JSON implementation\n"),
                 (self.app, "entry/src/main/cpp/CMakeLists.txt", "project(fixture)\n"),
                 (self.app, "entry/src/main/cpp/offline_npu2/OfflineNpu2.cpp", "// fixture bridge\n"),
                 (self.app, "entry/keep.txt", "keep unrelated files\n")]:
@@ -112,6 +114,10 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(list(target.glob("*.so"))), 5)
         self.assertEqual((self.app / "entry/src/main/cpp/include/MNN/Interpreter.hpp").read_text(),
                          "fixture MNN header\n")
+        self.assertEqual((self.app / "entry/src/main/cpp/offline_npu2/llmconfig.hpp").read_text(),
+                         "fixture LLM config\n")
+        self.assertEqual((self.app / "entry/src/main/cpp/offline_npu2/ujson.hpp").read_text(),
+                         "fixture JSON implementation\n")
         before = (target / "libMNN.so").stat().st_mtime_ns
         Path(self.env["CANN_KIT_ZIP"]).unlink()  # Reuse an already installed SDK without the ZIP.
         self.run_script("01_prepare_hiai.sh")

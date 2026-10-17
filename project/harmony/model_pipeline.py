@@ -187,7 +187,9 @@ class Pipeline:
         paths += [Path(__file__).resolve(), Path(__file__).with_name("model_sources.py"),
                   self.offline / "w4a16.py", self.offline / "external_weights.py",
                   self.offline / "package_runtime.py", self.offline / "verify_hybrid_vision.py",
-                  self.export / "llmexport.py", self.export / "utils/mnn_converter.py"]
+                  self.export / "llmexport.py", self.export / "utils/mnn_converter.py",
+                  self.export / "utils/gptq.py", self.export / "utils/model.py",
+                  self.export / "utils/transformers.py", self.export / "utils/vision.py"]
         if self.reuse_frozen:
             paths += [self.frozen / "manifest.json"]
         record = {"inputs": {str(p): sha(p) for p in sorted(set(paths))},

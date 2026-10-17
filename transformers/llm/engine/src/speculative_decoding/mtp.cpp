@@ -15,7 +15,7 @@ MtpGeneration::MtpGeneration(Llm* llm, std::shared_ptr<LlmContext> context, std:
     // do nothing
 }
     
-void MtpGeneration::load(Module::Config module_config) {
+bool MtpGeneration::load(Module::Config module_config) {
     mMtpMeta.reset(new KVMeta);
     mLlm->mRuntimeManager->setHintPtr(Interpreter::KVCACHE_INFO, mMtpMeta.get());
     
@@ -26,7 +26,10 @@ void MtpGeneration::load(Module::Config module_config) {
         "position_ids", "logits_index"};
     std::vector<std::string> outputNames {"logits"};
     mMtpModules[0].reset(Module::load(inputNames, outputNames, mtp_path.c_str(), mLlm->mRuntimeManager, &module_config));
-    
+    if (mMtpModules[0] == nullptr) {
+        MNN_ERROR("MTP: failed to load mtp model %s\n", mtp_path.c_str());
+        return false;
+    }
     int verify_length = mLlm->mDraftLength + 1;
     // speculative decode module
     for(int i = 1; i <= verify_length; i++) {
@@ -35,6 +38,7 @@ void MtpGeneration::load(Module::Config module_config) {
     // prefill module
     mMtpModulePool[std::make_pair(mLlm->mPrefillKey, false)] = mMtpModules[0];
     mHiddenStateIndex = mLlm->getOutputIndex("hidden_states");
+    return true;
 }
 
 std::vector<VARP> MtpGeneration::mtpForward(const std::vector<int>& input_ids, VARP hidden_states) {
@@ -168,7 +172,10 @@ void MtpGeneration::generate(GenerationParams& param) {
         drafts.push_back(mContext->current_token);
         
         auto decodeStr = mLlm->tokenizer_decode(mContext->current_token);
-        mContext->generate_str += decodeStr;
+        {
+            std::lock_guard<std::mutex> _l(mContext->mutex);
+            mContext->generate_str += decodeStr;
+        }
         if (nullptr != mContext->os) {
             *mContext->os << decodeStr;
             *mContext->os << std::flush;
@@ -225,8 +232,11 @@ void MtpGeneration::generate(GenerationParams& param) {
             mContext->decode_us += _t.durationInUs();
 
             // add all accept tokens to string
-            mContext->history_tokens.insert(mContext->history_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
-            mContext->output_tokens.insert(mContext->output_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
+            {
+                std::lock_guard<std::mutex> _l(mContext->mutex);
+                mContext->history_tokens.insert(mContext->history_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
+                mContext->output_tokens.insert(mContext->output_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
+            }
             
         #ifdef DUMP_PROFILE_INFO
             spl_decode += drafts.size();
@@ -234,14 +244,20 @@ void MtpGeneration::generate(GenerationParams& param) {
             spl_count++;
         #endif
             if(stop) {
-                mContext->history_tokens.push_back(mContext->current_token);
-                mContext->output_tokens.push_back(mContext->current_token);
+                {
+                    std::lock_guard<std::mutex> _l(mContext->mutex);
+                    mContext->history_tokens.push_back(mContext->current_token);
+                    mContext->output_tokens.push_back(mContext->current_token);
+                }
                 mLlm->updateContext(0, 1);
                 break;
             }
             if (mLlm->is_stop(mContext->current_token)) {
-                mContext->history_tokens.push_back(mContext->current_token);
-                mContext->output_tokens.push_back(mContext->current_token);
+                {
+                    std::lock_guard<std::mutex> _l(mContext->mutex);
+                    mContext->history_tokens.push_back(mContext->current_token);
+                    mContext->output_tokens.push_back(mContext->current_token);
+                }
                 mLlm->updateContext(0, 1);
                 if (nullptr != mContext->os) {
                     *mContext->os << mContext->end_with << std::flush;

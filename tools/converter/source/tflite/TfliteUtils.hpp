@@ -13,6 +13,7 @@
 
 #include "MNN_generated.h"
 #include "schema_generated.h"
+#include "MNN/MNNDefine.h"
 #include "logkit.h"
 
 typedef std::unique_ptr<tflite::QuantizationParametersT> tfliteQuanParam;
@@ -55,8 +56,23 @@ bool convertDataFormatTfliteDequant(const T* src, float* dst, int KH, int KW, in
     return true;
 }
 
+// Overflow-safe product of weight dimensions (e.g. CO/KH/KW/CI). Rejects a non-positive dimension,
+// and any product that would not fit in int. The running product is compared against INT_MAX / dim
+// before each multiplication, so the multiplication itself can never overflow: four dimensions near
+// 2^31 would overflow int64, which would make a check performed afterwards meaningless.
+bool computeTfliteWeightSize(const int32_t* dims, int dimCount, int* weightSize);
+
 MNN::DataType TfliteDataTypeToMNN(tflite::TensorType type);
 
 MNN::DataType TfliteDequantDataTypeToMNN(tflite::TensorType type);
+
+template <typename T>
+inline const T* tfliteAt(const std::vector<std::unique_ptr<T>>& v, int i, const char* what) {
+    if (i < 0 || i >= static_cast<int>(v.size()) || v[i] == nullptr) {
+        MNN_ERROR("[ERROR] Invalid TFLite Model: %s index %d out of range (size %zu)\n", what, i, v.size());
+        return nullptr;
+    }
+    return v[i].get();
+}
 
 #endif /* TfliteUtils_hpp */

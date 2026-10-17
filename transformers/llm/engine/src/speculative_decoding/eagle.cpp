@@ -25,7 +25,7 @@ EagleGeneration::EagleGeneration(Llm* llm, std::shared_ptr<LlmContext> context, 
     // do nothing
 }
 
-void EagleGeneration::load(Module::Config module_config) {
+bool EagleGeneration::load(Module::Config module_config) {
     mEagleMeta.reset(new KVMeta);
     mLlm->mRuntimeManager->setHintPtr(Interpreter::KVCACHE_INFO, mEagleMeta.get());
 
@@ -33,8 +33,15 @@ void EagleGeneration::load(Module::Config module_config) {
     std::vector<std::string> outputNames {"logits", "out_hidden_states"};
     mEagleModules.resize(2);
     mEagleModules[0].reset(Module::load(inputNames, outputNames, mLlm->mConfig->eagle_model().c_str(), mLlm->mRuntimeManager, &module_config));
-
+    if (mEagleModules[0] == nullptr) {
+        MNN_ERROR("Eagle: failed to load eagle model %s\n", mLlm->mConfig->eagle_model().c_str());
+        return false;
+    }
     mEagleModules[1].reset(Module::load({"fc_hidden"}, {"hidden_states"}, mLlm->mConfig->eagle_fc().c_str(), mLlm->mRuntimeManager, &module_config));
+    if (mEagleModules[1] == nullptr) {
+        MNN_ERROR("Eagle: failed to load eagle fc model %s\n", mLlm->mConfig->eagle_fc().c_str());
+        return false;
+    }
 
     mD2t = Express::Variable::load(mLlm->mConfig->eagle_d2t().c_str())[0];
 
@@ -42,6 +49,7 @@ void EagleGeneration::load(Module::Config module_config) {
     mTopK = mLlm->mConfig->eagle_topk();
     mDepth = mLlm->mConfig->eagle_depth();
     mTreePosition = _Input({1, mTopK}, NCHW, halide_type_of<int>());
+    return true;
 }
 
 MNN::Express::VARP EagleGeneration::getMask(std::vector<std::vector<bool>> mask, int seqLen) {
@@ -330,8 +338,11 @@ void EagleGeneration::generate(GenerationParams& param) {
     auto inputIds     = param.input_ids;
     auto sampleToken  = mLlm->sample(param.outputs[0]);
     mContext->current_token = sampleToken;
-    mContext->history_tokens.push_back(mContext->current_token);
-    mContext->output_tokens.push_back(mContext->current_token);
+    {
+        std::lock_guard<std::mutex> _l(mContext->mutex);
+        mContext->history_tokens.push_back(mContext->current_token);
+        mContext->output_tokens.push_back(mContext->current_token);
+    }
     mLlm->updateContext(0, 1);
     if (nullptr != mContext->os) {
         *mContext->os << mLlm->tokenizer_decode(sampleToken) << std::flush;
@@ -376,6 +387,7 @@ void EagleGeneration::generate(GenerationParams& param) {
         accpetLens.push_back(acceptInfo.acceptTokens.size());
         {
             mContext->current_token = acceptInfo.acceptTokens.back();
+            std::lock_guard<std::mutex> _l(mContext->mutex);
             for (auto token : acceptInfo.acceptTokens) {
                 mContext->history_tokens.push_back(token);
                 mContext->output_tokens.push_back(token);
@@ -383,6 +395,7 @@ void EagleGeneration::generate(GenerationParams& param) {
         }
         bool stop = processTokens(acceptInfo.acceptTokens);
         if (stop || newTokens >= param.max_new_tokens) {
+            std::lock_guard<std::mutex> _l(mContext->mutex);
             mContext->output_tokens.push_back(steps);
             break;
         }

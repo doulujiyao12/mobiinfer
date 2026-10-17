@@ -514,6 +514,8 @@ bool OpCommonUtils::opCompabilityForLowp(const Op* op, int bytes) {
         case OpType_DynamicQuant:
         case OpType_Attention:
         case OpType_LinearAttention:
+        case OpType_FusedLinear:
+        case OpType_RoPE:
         case OpType_LayerNorm:
         case OpType_Softmax:
         case OpType_Plugin:
@@ -647,6 +649,66 @@ static bool _RebuildExternalOp(FileLoader* external, const MNN::Op* origin, flat
             parameterMain = Convolution2D::Pack(builder, param.get()).Union();
             break;
         }
+        case OpParameter_FusedLinearParam:
+        {
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+            std::unique_ptr<FusedLinearParamT> param(origin->main_as_FusedLinearParam()->UnPack());
+            for (auto& conv : param->convs) {
+                if (conv->external.size() < 3) {
+                    continue;
+                }
+                if (conv->quanParameter) {
+                    bool isSparse = conv->sparseParameter.get() != nullptr;
+                    bool isPTQ = conv->quanParameter->scaleIn != 0;
+                    if (isSparse || isPTQ) {
+                        external->offset(conv->external[0]);
+                        if (0 != conv->external[1]) {
+                            conv->quanParameter->buffer.resize(conv->external[1]);
+                            external->read((char*)conv->quanParameter->buffer.data(), conv->external[1]);
+                        }
+                        conv->quanParameter->alpha.resize(conv->external[2] / sizeof(float));
+                        external->read((char*)conv->quanParameter->alpha.data(), conv->external[2]);
+                    } else {
+                        // skip weight and dequant alpha for load speed; member convs read
+                        // them through the externalPath stamped on the rebuilt op
+                        externalPathFbb = builder.CreateString(external->path());
+                        external->offset(conv->external[0] + conv->external[1] + conv->external[2]);
+                    }
+                    if (conv->bias.empty() && conv->external.size() > 3) {
+                        if (conv->external[3] > 0) {
+                            conv->bias.resize(conv->external[3] / sizeof(float));
+                            external->read((char*)conv->bias.data(), conv->external[3]);
+                        } else {
+                            conv->bias.resize(conv->common->outputCount);
+                        }
+                    }
+                    if (conv->quanParameter->index.empty() && conv->external.size() > 4) {
+                        if (conv->external[4] > 0) {
+                            conv->quanParameter->index.resize(conv->external[4] / sizeof(uint32_t));
+                            external->read((char*)conv->quanParameter->index.data(), conv->external[4]);
+                        }
+                    }
+                } else {
+                    conv->quanParameter.reset(new IDSTQuanT);
+                    conv->quanParameter->type = 8;
+                    externalPathFbb = builder.CreateString(external->path());
+                    conv->bias.resize(conv->external[2] / sizeof(float));
+                    external->offset(conv->external[0] + conv->external[1]);
+                    external->read((char*)conv->bias.data(), conv->external[2]);
+                }
+            }
+            if (param->ln && param->ln->external.size() >= 3) {
+                external->offset(param->ln->external[0]);
+                param->ln->gamma.resize(param->ln->external[1] / sizeof(float));
+                external->read((char*)param->ln->gamma.data(), param->ln->external[1]);
+                param->ln->beta.resize(param->ln->external[2] / sizeof(float));
+                external->read((char*)param->ln->beta.data(), param->ln->external[2]);
+                param->ln->external.clear();
+            }
+            parameterMain = FusedLinearParam::Pack(builder, param.get()).Union();
+#endif
+            break;
+        }
         default:
             break;
     }
@@ -695,6 +757,25 @@ Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const st
         case OpParameter_LayerNorm:
             hasExternal = USE_EXTERNAL_DATA(op->main_as_LayerNorm());
             break;
+        case OpParameter_FusedLinearParam:
+        {
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+            auto param = op->main_as_FusedLinearParam();
+            if (nullptr != param->ln() && USE_EXTERNAL_DATA(param->ln())) {
+                hasExternal = true;
+                break;
+            }
+            if (nullptr != param->convs()) {
+                for (auto conv : *param->convs()) {
+                    if (USE_EXTERNAL_DATA(conv)) {
+                        hasExternal = true;
+                        break;
+                    }
+                }
+            }
+#endif
+            break;
+        }
         default:
             break;
     }
@@ -735,7 +816,7 @@ Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const st
             tmpstore.reset(new BufferStorage);
             tmpstore->storage = builder.ReleaseRaw(tmpstore->allocated_size, tmpstore->offset);
         }
-    } else {
+    } else if (!usemmap) {
         // For Scale / LayerNorm (and any other op_type going through _RebuildExternalOp):
         // newOp points into `builder`, a stack-local FlatBufferBuilder. When this function
         // returns, `builder` is destroyed and newOp becomes a dangling pointer.
@@ -922,4 +1003,138 @@ DataType OpCommonUtils::convertDataType(halide_type_t type) {
     }
     return DataType_DT_INVALID;
 }
+
+#if defined(MNN_SUPPORT_TRANSFORMER_FUSE) && defined(MNN_GATED_RMS_NORM)
+bool OpCommonUtils::gatedRMSNormFusable(const Op* op, const std::vector<Tensor*>& inputs,
+                                        const std::vector<Tensor*>& outputs, bool supportSimdGroupReduce) {
+    if (!supportSimdGroupReduce) {
+        return false;
+    }
+    if (nullptr == op || inputs.size() != 2 || outputs.size() != 1) {
+        return false;
+    }
+    auto param = op->main_as_LayerNorm();
+    if (nullptr == param || !param->useRMSNorm()) {
+        return false;
+    }
+    // The kernel binds gamma and beta unconditionally: it has no no-gamma branch.
+    // Converter-folded ops keep them in the external weight file; the loader
+    // inlines them before the Metal creator runs, so sizes are all we need here.
+    int gammaSize = 0;
+    int betaSize  = 0;
+    if (nullptr != param->gamma() && nullptr != param->beta()) {
+        gammaSize = (int)param->gamma()->size();
+        betaSize  = (int)param->beta()->size();
+    } else if (nullptr != param->external() && param->external()->size() >= 3) {
+        gammaSize = (int)(param->external()->data()[1] / sizeof(float));
+        betaSize  = (int)(param->external()->data()[2] / sizeof(float));
+    } else {
+        return false;
+    }
+    auto x = inputs[0];
+    auto z = inputs[1];
+    if (x->dimensions() < 2 || z->dimensions() < 2) {
+        return false;
+    }
+    const int inside = x->length(1);
+    const int zBatch = z->length(0);
+    if (x->length(0) <= 0 || inside <= 0 || (inside % 4) != 0) {
+        return false;
+    }
+    // The kernel folds the head into x's batch axis (outside = zBatch * heads)
+    // and reads z / out at (head * inside/4 + c) * zBatch + b, so it needs
+    // exactly the shape contract the size computer enforces. Prefill carries
+    // zBatch == seq_len, decode zBatch == 1.
+    if (zBatch <= 0 || (x->length(0) % zBatch) != 0) {
+        return false;
+    }
+    if (z->length(1) != (x->length(0) / zBatch) * inside) {
+        return false;
+    }
+    // Both copies in the creator are sized by inside.
+    if (gammaSize != inside || betaSize != inside) {
+        return false;
+    }
+    // The absorbed C4 repacks only make sense in NC4HW4.
+    for (auto t : {x, z, outputs[0]}) {
+        if (TensorUtils::getDescribe(t)->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool OpCommonUtils::gatedRMSNormOpenCLOk(const Op* op, const std::vector<Tensor*>& inputs,
+                                         const std::vector<Tensor*>& outputs, int* outside, int* inside, int* heads) {
+    if (nullptr == op || inputs.size() != 2 || outputs.size() != 1) {
+        return false;
+    }
+    auto param = op->main_as_LayerNorm();
+    if (nullptr == param || !param->useRMSNorm() || param->group() > 1) {
+        return false;
+    }
+    if (nullptr != param->axis() && param->axis()->size() != 1) {
+        return false;
+    }
+    // The loader inlines converter-folded gamma / beta before the creator runs;
+    // the kernels bind the pair or neither, so anything left external is out.
+    const bool hasGamma = (nullptr != param->gamma() && nullptr != param->beta());
+    if (!hasGamma) {
+        if ((nullptr != param->gamma()) != (nullptr != param->beta())) {
+            return false;
+        }
+        if (nullptr != param->external() && param->external()->size() > 1 && param->external()->data()[1] > 0) {
+            return false;
+        }
+    }
+    auto x = inputs[0];
+    auto z = inputs[1];
+    auto out = outputs[0];
+    if (x->dimensions() < 2 || z->dimensions() < 2 || out->dimensions() < 2) {
+        return false;
+    }
+    // The absorbed C4 repacks only make sense in NC4HW4, and the kernels' index
+    // arithmetic treats both sides as channel-only (no spatial extent).
+    for (auto t : {x, z, out}) {
+        if (TensorUtils::getDescribe(t)->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
+            return false;
+        }
+        for (int i = 2; i < t->dimensions(); ++i) {
+            if (t->length(i) != 1) {
+                return false;
+            }
+        }
+    }
+    const int insideSize = x->length(1);
+    if (insideSize <= 0 || x->length(0) <= 0) {
+        return false;
+    }
+    if (hasGamma && ((int)param->gamma()->size() != insideSize || (int)param->beta()->size() != insideSize)) {
+        return false;
+    }
+    // x is [outside, inside] with the head as batch axis; z / out are
+    // [batch, heads * inside] with outside == batch * heads.
+    const int batch = z->length(0);
+    if (batch <= 0 || (z->length(1) % insideSize) != 0) {
+        return false;
+    }
+    const int headNum = z->length(1) / insideSize;
+    if (headNum <= 0 || batch * headNum != x->length(0)) {
+        return false;
+    }
+    if (out->length(0) != batch || out->length(1) != z->length(1)) {
+        return false;
+    }
+    if (nullptr != outside) {
+        *outside = x->length(0);
+    }
+    if (nullptr != inside) {
+        *inside = insideSize;
+    }
+    if (nullptr != heads) {
+        *heads = headNum;
+    }
+    return true;
+}
+#endif
 } // namespace MNN

@@ -1,0 +1,253 @@
+# MNN Regression / CI Suite (host + Android)
+
+> **Trigger**: when the user wants to run the test suite or CI ("run the tests",
+> "run CI", "smoke test", "does this still pass", "verify on the phone/device",
+> "benchmark on device"), or to add / select / retune a test stage.
+
+The operational scripts live at the **repository root** and are invoked from
+there — this skill is the discovery + usage entry point for AI agents and
+humans:
+
+| File | Role |
+|------|------|
+| [`test.sh`](../../test.sh) | Bash driver. `static`, `local` (host CPU), and `android <serial>` modes. |
+| [`test_stages.json`](../../test_stages.json) | Declarative stage matrix. **Edit this** to add / drop / retune stages — no shell edits needed for the common cases. It is self-documenting via its `_documentation` block. |
+| [`docs/testing.md`](../../docs/testing.md) | 中文测试文档：阶段说明、字段表、新增算子测试流程。 |
+
+## Quick start
+
+```bash
+# Static checks only:
+./test.sh static
+
+# Host regression (CPU only): build + unit suite + smoke + LLM smoke.
+./test.sh local
+
+# Full on-device matrix on the attached arm64 device:
+./test.sh android <serial>          # e.g. ./test.sh android R5CY71BJJ9D
+```
+
+`<serial>` comes from `adb devices` (the script prefers `adbk` and falls back
+to `adb`). If the device shows as `unauthorized`, the user must tap **Allow USB
+debugging** on the phone first.
+
+## Running a subset (filters)
+
+Android mode takes an optional filter as the third argument:
+
+```bash
+./test.sh android <serial> cpu        # CPU unit + lowmem + llm
+./test.sh android <serial> opencl     # OpenCL unit (image+buffer) + opencl smoke
+./test.sh android <serial> vulkan     # Vulkan unit + vulkan smoke
+./test.sh android <serial> gpu        # opencl + vulkan
+./test.sh android <serial> unit       # all unit/op stages only
+./test.sh android <serial> lowmem     # only the low-memory matrix
+./test.sh android <serial> android-ci # bench + smoke + llm only (no unit/lowmem)
+```
+
+Valid filters: `all` (default) · `cpu` · `opencl` · `opencl-image` ·
+`opencl-buffer` · `vulkan` · `gpu` · `unit` · `lowmem` · `android-ci`.
+
+## Reading the result (agent-friendly)
+
+* Each stage prints a delimited `═══ stage: <name> ═══` block, then a
+  `PASS` / `FAIL` / `SKIP` line.
+* A final **summary** prints `total / passed / failed / skipped` and one line
+  per stage. `SKIP` is not a failure — it means the prerequisite was absent
+  (e.g. a GPU library, a model, or a missing build artefact).
+* **Exit code is non-zero iff any stage failed.** Gate automation on the exit
+  code, not on log scraping.
+* Combined stdout/stderr for every stage is saved under
+  `logs/test-<UTC-timestamp>/<stage>.log` — read the named log of a failing
+  stage for the trailing output. `rc=137` ≈ OOM-kill, `rc=139` ≈ SIGSEGV.
+* **`run_test.out` prints `√√√ all <filter> tests passed` even when the filter
+  matched nothing.** Judge by the `passed:N` count in
+  `TEST_CASE_AMOUNT_UNIT` / `TEST_CASE` — `passed:0` means the case never ran
+  (wrong filter name, or the file was never compiled in; see § Adding a new
+  test). Never read the all-passed line as proof that a specific test ran.
+* `skipped:N` in the same line counts cases that gated themselves off the
+  running backend through `MNNTEST_CPU_ONLY()` (`test/MNNTestSuite.h`); they are
+  excluded from `passed`. A green Metal run reporting `skipped:6` means
+  `op/AvePool3d`, `op/Interp`, `op/InterpInt8` and
+  `op/unary/{erf,erfc,erfinv}Int8` never executed — not that they passed. Each
+  gate site records the backend gap it stands in for.
+* When a remote transport has a shorter timeout than the device workload, a
+  blank or truncated client response does not prove that the process exited.
+  Write results on the device, then poll the process and result-file size
+  before deciding whether the test completed.
+
+## Environment variables
+
+| Var | Mode | Meaning |
+|-----|------|---------|
+| `ANDROID_NDK` | android | NDK root. Falls back to `$HOME/android-ndk-r21`. |
+| `ANDROID_EXTRA_CMAKE` | android | Extra cmake flags appended to the build (e.g. `-DMNN_SME2=OFF`) — handy for bisecting a backend regression. |
+| `LLM_MODEL_DIR` | both | Path to an existing on-disk MNN-format LLM model. When set, that directory is used **as-is and nothing is downloaded**. Defaults to `models/<repo-basename>/`. |
+| `LLM_MODEL_REPO` | both | Model repo id for the LLM smoke test. Default `taobao-mnn/Qwen2.5-0.5B-Instruct-MNN`. |
+| `LLM_MODEL_SOURCE` | both | Download source when `LLM_MODEL_DIR` is unset: `huggingface` (default) or `modelscope`. |
+| `LLM_MODEL_URL_BASE` | both | Override the resolve URL prefix outright (wins over `LLM_MODEL_SOURCE`). |
+| `MNN_TEST_SKIP` | both | Comma list of exact test names to skip (also set per-stage via the JSON `skip` field). |
+
+### Offline / no-network and mainland-China notes
+
+LLM model provisioning is **lazy**: the download (or `LLM_MODEL_DIR` check) is
+deferred until the `llm` stage actually runs, and a provisioning failure skips
+**only** that stage. So the unit / smoke / bench stages run fine with no
+network.
+
+```bash
+# Already have the model on disk → no download attempt at all:
+LLM_MODEL_DIR=/path/to/Qwen2.5-0.5B-Instruct-MNN ./test.sh local
+
+# huggingface.co unreachable (e.g. mainland China) → fetch from ModelScope:
+LLM_MODEL_SOURCE=modelscope ./test.sh android <serial>
+```
+
+For the built-in default model the ModelScope org is remapped automatically
+(`taobao-mnn/*` → `MNN/*`); an explicitly-set `LLM_MODEL_REPO` is used verbatim.
+
+### LLM backend/layout smoke
+
+For backend or tensor-layout optimizations, do not stop at operator tests. Run
+an end-to-end `llm_demo` correctness smoke with a short prompt and another
+prompt long enough to cross backend prefill branch thresholds. This catches
+real exported-graph layout bugs where an op test covers only the output format,
+but the graph also changes an input tensor format.
+
+### Split LoRA multi-instance smoke
+
+When testing multiple split LoRA models against one quantized base, use
+adapter-specific exact markers and verify both concurrency and switching:
+
+1. Keep the base `Llm` alive until every object returned by `create_lora()` is
+   destroyed; adapter modules reference the base module.
+2. Load all adapters before inference. Run one request per adapter concurrently,
+   then alternate adapters for multiple rounds with `reset()` before each
+   independent request.
+3. Require each output to contain its own marker and not another adapter's
+   marker. Loading without errors is not a sufficient pass condition.
+4. Match LoRA-training fake-quant settings to export settings and prefer LoRA
+   filenames relative to the base `config.json`.
+5. A Python thread-pool test is concurrent only if the native inference binding
+   releases the GIL. Align worker entry with a barrier so serialized scheduling
+   cannot accidentally satisfy the test.
+The runnable reference is
+`transformers/llm/finetune/examples/multi_lora/README.md`.
+
+## Configuring stages
+
+Editing [`test_stages.json`](../../test_stages.json) is the supported way to
+add, drop, or retune unit / lowmem / smoke / bench stages. Every parameter
+(forward type, precision, gpuMode, thread count, tag, memory mode,
+dynamic-quant option, KleidiAI flag, per-stage skip list, smoke model list,
+benchmark args) lives there, and the `_documentation` block at the top of the
+file explains every field and every `skip` entry's rationale.
+
+* **Add a stage that runs an existing test in a new config** → add an object to
+  `android.stages` (or `local.stages`). See `docs/testing.md` § "增加专门阶段".
+* **Skip a known-broken test on one stage** → add its exact name to that
+  stage's `skip` array **and** document why under `_documentation.skip_rationale`.
+* **Add a smoke model / bench entry** → see `docs/testing.md` § "新增 smoke 模型或 bench 阶段".
+
+## Auditing stale CI/test scripts
+
+When asked to clean up old CI or test scripts, build a usage map before
+recommending deletion:
+
+* Prefer `git ls-files` plus targeted `rg`/`git grep` over broad filesystem
+  scans, so generated build directories and local experiments do not look like
+  maintained CI surface.
+* Classify scripts by role: active CI entrypoints, declarative test driver,
+  release/package scripts, manual benchmark helpers, third-party vendored
+  tests, and local device/debug helpers.
+* Treat lack of in-repo references as a "review/deprecate" signal, not proof
+  of dead code; internal CI systems can invoke tracked files by convention.
+  Prefer a staged deprecation plan unless a script is both unreferenced and
+  clearly superseded by `test.sh` / `test_stages.json`.
+* When renaming or consolidating test entrypoints, grep for both executable
+  names and generated-artifact prefixes. Update CI config, `.gitignore`,
+  `test_stages.json` self-documentation, developer docs, skill docs, and code
+  comments in the same change so the old entrypoint disappears completely.
+
+## Bugfix 单测提交原则
+
+- **不默认给每个 bugfix 新增仓库单测**。优先复用已有测试、模型 smoke 或最小复现验证，避免重复用例和
+  一次性复现代码持续膨胀。
+- **开发时可以写临时单测，但不要随修复提交**。临时用例或脚本留在本地或临时目录，提交前从 diff 中
+  排除；它们用于定位和验证，不自动成为仓库的长期维护内容。
+- **提交到仓库的单测必须审查必要性，理由充分才添加**。评估现有覆盖的缺口、问题再次发生的风险与影响、
+  用例能否稳定捕获回归，以及代码量、构建/运行和维护成本；在 CR/PR 中说明为什么已有验证不足、
+  该用例有什么长期价值。仅为证明本次修复有效、重复已有覆盖或照抄实现逻辑，不足以支持新增单测。
+- **确需长期覆盖时，优先小幅扩展已有用例**，再考虑新增独立单测；保持用例最小，并确认修复前失败、
+  修复后通过。不提交新增单测也必须完成修复验证，在 CR/PR 中记录复现方式、修复前后结果和已执行的验证。
+
+## Adding a new test
+
+For bugfixes, first apply the [unit-test submission policy](#bugfix-单测提交原则).
+Use the steps below when a committed test is warranted; a bugfix alone does not require adding one.
+
+1. Write the C++ test under `test/<area>/` (one file, registered with
+   `MNNTestSuiteRegister`). For operators the full template + conventions are in
+   [`docs/testing.md`](../../docs/testing.md) § "新增算子测试".
+2. **Re-run `cmake` before building.** `test/CMakeLists.txt` collects sources
+   with `GLOB_RECURSE`, which CMake expands at **configure** time — a new file
+   is *not* picked up by an incremental `cmake --build`, and the test is simply
+   absent from `run_test.out` with no error. Run `cmake .` in the build dir (or
+   delete it) first, then confirm the case actually ran via `passed:N`
+   (see § Reading the result) — not via the all-passed line.
+3. If its name prefix matches an existing stage (e.g. `op/*`, `core/*`), it is
+   picked up automatically — no JSON change needed. Otherwise add a dedicated
+   stage.
+4. **Check that the test can actually fail.** Reintroduce the bug (or revert the
+   fix) and confirm the test goes red; a test that passes on the broken code is
+   worse than no test, because it manufactures confidence. See
+   [general-debug §3](../general-debug/concurrency.md) for the case where a runtime
+   test *cannot* work and the invariant must be asserted at compile time.
+
+### Attention causal-mask assumption (⚠️ non-causal models on Metal)
+
+Since 2026-07-31 the causal assumption on Metal is **data-driven** — the old
+`MNN_METAL_QK_CAUSAL_TRI` env is deleted: `MetalAttention.mm`
+`_computePathFlags` derives `mCausalLayout` from the mask input. A scalar
+sentinel mask (or no mask + KV cache) routes to the causal-optimized kernels
+(CAUSAL_TRI / CAUSAL_BOUND / FA); a real mask tensor disables all causal
+optimizations (including FA / faTc) and honors the mask element-wise.
+
+The remaining silent-error mode is therefore on the **export / mask-generation
+side**: if `gen_attention_mask` emits a scalar sentinel for a model that is
+actually non-causal (Sliding Window Attention: Mistral 7B v0.1 / Gemma-2 /
+Ministral; Prefix LM: Baichuan-Base; encoder / bidirectional: BERT-family,
+T5, UL2), Metal still applies causal optimizations and **produces garbled
+tokens with no crash and no warning**.
+
+The default LLM smoke stage uses Qwen2.5-0.5B (causal), so it will not catch
+this regression. When adding a **non-causal model** to `test_stages.json`
+smoke list, or when introducing a new Attention / softmax / prefill_qk /
+prefill_qkv shader change, you must:
+
+1. Verify the non-causal model actually emits a **real mask tensor** (not the
+   scalar sentinel), so `mCausalLayout == false`; then greedy-diff the first
+   20 tokens against the CPU backend (recipe in
+   [`build-and-test.md`](../metal-optimize/build-and-test.md) § "Attention
+   causal 假设"). If it garbles, the root cause is almost always the
+   export / `gen_attention_mask` side, not the kernel.
+2. For shader changes, cover **both** mask routes — one scalar-sentinel
+   (causal) model and one real-mask-tensor (non-causal) model — since the two
+   compile and dispatch different kernel variants.
+
+No env pin in stage entries is needed anymore. `MNN_ENABLE_FLASH_ATTN_PREFILL=0`
+remains only as a developer A/B override, not a correctness workaround
+(real-mask models never route to FA).
+
+Full risk breakdown, gate conditions, and remediation options: see
+[`skills/general-debug/kernel-assumptions.md`](../general-debug/kernel-assumptions.md) (§7 后端 kernel 隐式假设违反)
+and [`skills/metal-optimize/build-and-test.md`](../metal-optimize/build-and-test.md)
+§ "Attention causal 假设".
+
+For deeper work on operators themselves, see the
+[`add-new-op`](../add-new-op/SKILL.md) skill.
+
+## Read next
+
+`docs/testing.md` is the authoritative deep reference — read it for the per-stage
+breakdown, the stage-object field table, and worked examples.

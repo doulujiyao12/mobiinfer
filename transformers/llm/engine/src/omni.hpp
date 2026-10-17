@@ -11,6 +11,8 @@
 #include "llm/llm.hpp"
 #include "llm/npu_chunk_executor.hpp"
 #include <set>
+#include <algorithm>
+#include <utility>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -22,6 +24,15 @@ namespace MNN {
 using namespace Express;
 namespace Transformer {
 
+static const char* const kOmniMultimodalRegex = "<(img|audio|video)>(.*?)</\\1>";
+
+std::vector<int> qwenVideoSampleIndices(int totalFrames, double nativeFps, float targetFps, int minFrames,
+                                        int maxFrames);
+int qwenVideoAlignedFrameCount(int frameCount, int maxFrames, int factor);
+int qwenVideoEffectiveMaxPixels(int maxPixels, int maxVisionTokens, int frameCount, int factor, int patchSize);
+std::pair<int, int> qwenVideoResizeSize(int width, int height, int alignSize, int maxPixels);
+void fillQwenVisionAttentionMask(float* mask, int gridT, int tokensPerTemporal);
+
 class MropeInfo {
 public:
     MropeInfo() {}
@@ -29,6 +40,7 @@ public:
         mT = info.mT;
         mH = info.mH;
         mW = info.mW;
+        mX = info.mX;
     }
     int back() {
         if (mW.empty()) {
@@ -40,12 +52,14 @@ public:
         if (mW.empty()) {
             return 0;
         }
-        return back() + 1;
+        return std::max(std::max(mT.back(), mH.back()), std::max(mW.back(), mX.back())) + 1;
     }
-    void push_back(int t, int h, int w) {
+    void push_back(int t, int h, int w) { push_back(t, h, w, w); }
+    void push_back(int t, int h, int w, int x) {
         mT.push_back(t);
         mH.push_back(h);
         mW.push_back(w);
+        mX.push_back(x);
     }
     void push_back(int t) {
         push_back(t, t, t);
@@ -54,12 +68,29 @@ public:
         int cur_idx = currentIdx();
         push_back(cur_idx, cur_idx, cur_idx);
     }
+    void prependTextPositions(size_t count) {
+        if (count == 0) {
+            return;
+        }
+        const int offset = static_cast<int>(count);
+        std::vector<int> prefix(count);
+        for (size_t i = 0; i < count; ++i) {
+            prefix[i] = i;
+        }
+        for (auto* positions : {&mT, &mH, &mW, &mX}) {
+            for (auto& position : *positions) {
+                position += offset;
+            }
+            positions->insert(positions->begin(), prefix.begin(), prefix.end());
+        }
+    }
     void clear() {
         mT.clear();
         mH.clear();
         mW.clear();
+        mX.clear();
     }
-    std::vector<int> mT, mH, mW;
+    std::vector<int> mT, mH, mW, mX;
 };
 
 struct WavChunk {
@@ -89,6 +120,7 @@ public:
     VARP token2wav(const std::vector<int>& codec_tokens);
     void token2wav(bool talker_done = false);
     void generate();
+    bool generateQwen3TTS(const std::string& prompt, int maxFrames, const std::string& refAudio);
     void stepPrefill();
     void stepForward(int stepIdx);
     void finalize();
@@ -109,8 +141,13 @@ private:
     MropeInfo mPositionIds;
     std::vector<VARP> mTalkerEmbeds;
     std::shared_ptr<Module> mPreDit, mDit, mBigvgan;
+    std::shared_ptr<Module> mQwen3PromptEmbedder, mQwen3AudioCodePredictor, mQwen3CodecEmbedder, mQwen3SpeechDecoder;
+    std::shared_ptr<Module> mQwen3SpeakerEncoder;
+    std::shared_ptr<DiskEmbedding> mQwen3TextEmbedding, mQwen3AudioCodePredictorEmbedding;
     Llm* mThinker;
-    std::shared_ptr<Executor::RuntimeManager> mProcessorRuntimeManager;
+    std::shared_ptr<Executor::RuntimeManager> mProcessorRuntimeManager, mQwen3RuntimeManager;
+    std::shared_ptr<Executor::RuntimeManager> mQwen3CpRuntimeManager;
+    std::shared_ptr<KVMeta> mQwen3CpMeta;
     // stream generate
     std::vector<float> mInitialNoise, mWaveformBuffer;
     VARP mMelBuffer = nullptr;
@@ -145,7 +182,7 @@ private:
     VARP mSpk_async, mCond_async;
 };
 
-class Omni : public Llm {
+class Omni : public Embedding {
 public:
     Omni(std::shared_ptr<LlmConfig> config);
     ~Omni() {
@@ -160,20 +197,28 @@ public:
         mAudioModule.reset();
     }
     virtual bool load() override;
-    virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) override;
+    virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos,
+                                                  Express::VARPS extraArgs = {}) override;
     virtual std::vector<int> tokenizer_encode(const std::string& query) override;
     virtual std::vector<int> tokenizer_encode(const MultimodalPrompt& multimodal_input) override;
     virtual Express::VARP embedding(const std::vector<int>& input_ids) override;
+    virtual Express::VARP gen_attention_mask(int seq_len) override;
     virtual Express::VARP gen_position_ids(int seq_len) override;
+    virtual bool prepareHistoryReplay(const std::vector<int>& input_ids) override;
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1) override;
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) override;
     virtual void generateWavform() override;
+    virtual bool generateTTS(const std::string& text, const std::string& language = "english", int max_new_tokens = -1,
+                             const std::string& ref_audio = "") override;
+    // Embedding API — single ExecutorScope wrapping the forward pass (same pattern as forwardVec)
+    virtual Express::VARP ids_embedding(const std::vector<int>& ids) override;
     // some models preprocess function
     std::vector<int> visionProcess(VARP image);
     std::vector<int> defaultVisionProcess(VARP image);
     std::vector<int> qwen2VisionProcess(VARP image);
     std::vector<int> smolvlmVisionProcess(VARP image);
     std::vector<int> minicpmVisionProcess(VARP image);
+    std::vector<int> hunyuanVisionProcess(VARP image);
     std::vector<int> gemma4VisionProcess(VARP image);
     // Inject an external NPU chunk executor (HarmonyOS OM path).
     // omPaths: per-chunk .om file paths, aligned with visual_blocks_chunks.
@@ -183,21 +228,33 @@ public:
         mNpuChunkOmPaths = omPaths;
         return mNpuChunkExecutor != nullptr;
     }
+    std::vector<int> qwenVideoProcess(const std::vector<VARP>& frames, const std::vector<float>& timestamps);
+
 private:
-    int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
-        mVisionEnd = 151858, mVisionPad = 151859, mAudioPad = 151646,
-        mAudioStart = -1, mAudioEnd = -1;
+    bool initProcessorRuntime();
+    int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857, mVisionEnd = 151858, mVisionPad = 151859,
+        mAudioPad = 151646, mAudioStart = -1, mAudioEnd = -1, mVideoPad = -1;
     int mVisionGlobal = 49152;
     int mVisionSizeUnit = 1, mVisionMaxSize = 2048;
+    float mVideoFps = 2.0f;
+    int mVideoMaxFrames = 768;
+    int mVideoMaxPixels = 768 * 28 * 28;
+    int mVideoMaxVisionTokens = 4096;
     int mVisionNum = 0;
+    int mNumGridPerSide = 1;
+    bool mVisionSizeOverridden = false;
     std::vector<float> mVisionMean{122.7709383, 116.7460125, 104.09373615};
     std::vector<float> mVisionNorm{0.01459843, 0.01500777, 0.01422007};
     std::vector<int> multimodeProcess(const std::string& mode, std::string info);
     std::vector<int> visionProcess(const std::string& file);
+    std::vector<int> videoProcess(const std::string& file);
+    std::vector<int> videoProcess(const PromptVideoPart& video);
     std::vector<int> audioProcess(const std::string& file);
     std::vector<int> audioProcess(MNN::Express::VARP waveform);
     std::vector<int> processImageContent(const std::string& content, const std::map<std::string, PromptImagePart>& images);
     std::vector<int> processAudioContent(const std::string& content, const std::map<std::string, PromptAudioPart>& audios);
+    std::vector<int> processVideoContent(const std::string& content,
+                                         const std::map<std::string, PromptVideoPart>& videos);
     void responseInterleaved(const std::vector<int>& input_ids, std::ostream* os, const char* end_with,
                              int max_new_tokens);
     std::shared_ptr<Module> mVisionModule, mAudioModule;
@@ -232,6 +289,8 @@ private:
     int mVisualChunkDumpedSamples = 0;
 #endif
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
+    VARP mVisionPositionIdsCache, mVisionAttentionMaskCache, mVisionWindowAttentionMaskCache;
+    VARP mVisionIdxTensorCache, mVisionWeightTensorCache, mVisionWindowIndexCache;
     std::shared_ptr<Talker> mTalker;
     int64_t mThinkerElapsedUs = 0;
     // m_rope position ids
@@ -240,8 +299,8 @@ private:
     // Absolute MRoPE position at the end of the current prefill. Unlike
     // all_seq_len this follows the compressed multimodal position timeline.
     int mDecodePositionBase = 0;
+    bool mIsEmbedding = false;
 };
-
 }
 }
 #endif // OMNI_hpp

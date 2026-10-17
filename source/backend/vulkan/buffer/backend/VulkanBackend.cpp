@@ -223,6 +223,10 @@ Backend::MemObj* VulkanBackend::onAcquire(const Tensor* tensor, StorageType stor
     auto des = TensorUtils::getDescribeOrigin(tensor);
     if (Backend::STATIC == storageType) {
         auto newBuffer = mRuntime->mBufferPool->alloc(alignSize);
+        if (nullptr == newBuffer.first) {
+            MNN_ERROR("Vulkan alloc static buffer failed, size=%zu\n", alignSize);
+            return nullptr;
+        }
         auto mem = new VulkanMemRelease(mRuntime->mBufferPool.get(), newBuffer, alignSize);
         MTensor->buffer().device = (uint64_t)(newBuffer.first);
         des->offset = newBuffer.second;
@@ -230,6 +234,10 @@ Backend::MemObj* VulkanBackend::onAcquire(const Tensor* tensor, StorageType stor
     }
     bool seperate  = storageType == Backend::DYNAMIC_SEPERATE;
     auto newBuffer = mCurrentDynamicBufferPool->alloc(alignSize, seperate);
+    if (nullptr == newBuffer.first) {
+        MNN_ERROR("Vulkan alloc dynamic buffer failed, size=%zu\n", alignSize);
+        return nullptr;
+    }
     auto mem = new VulkanMemRelease(mCurrentDynamicBufferPool, newBuffer, alignSize);
     MTensor->buffer().device = (uint64_t)(newBuffer.first);
     des->offset = newBuffer.second;
@@ -310,10 +318,16 @@ void VulkanBackend::onExecuteEnd() const {
     auto endTime = std::chrono::high_resolution_clock::now();
     float totalTime = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime).count() / (1e6f);
     if (mTimeProfiler) {
+        // Store Execution-level GPU time so callers can query it via
+        // Runtime::onGetLastGpuTimeMs() without parsing printed output.
+        mRuntime->mLastGpuTimeMs = mTimeProfiler->getTotalTime(VulkanTimeProfiler::Kind::Execution);
+
+#ifndef MNN_GPU_PROFILE_SILENT
         MNN_PRINT("\n=============== Vulkan Time Profiling (Begin) ===============\n");
         mTimeProfiler->printTimeProfile();
         MNN_PRINT("Total time calculated by CPU is %6.2f ms.\n", totalTime);
         MNN_PRINT("\n================ Vulkan Time Profiling (End) ================\n");
+#endif
     }
 #else
     _finish();
@@ -535,6 +549,15 @@ bool VulkanBackend::addCreator(OpType t, Creator* c) {
     auto allKind = getCreatorMap();
     allKind->insert(std::make_pair(t, c));
     return true;
+}
+
+VulkanBackend::Creator* VulkanBackend::getCreator(OpType t) {
+    auto allKind = getCreatorMap();
+    auto iter = allKind->find(t);
+    if (iter == allKind->end()) {
+        return nullptr;
+    }
+    return iter->second;
 }
 
 bool VulkanBackend::onGetTensorInfo(const Tensor* tensor, void* dstInfo) {

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from .model_mapper import ModelMapper
-from .custom_op import FusedAttention, MoE, FusedLinearAttention
+from .custom_op import FusedAttention, FusedRoPE, MoE, FusedLinearAttention
 
 class Embedding(torch.nn.Module):
     def __init__(self, embed, config):
@@ -12,7 +12,10 @@ class Embedding(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.embed = embed
         self.embed_scale = 1.0
-        if config.model_type == 'gemma' or config.model_type == 'gemma2':
+        config_embed_scale = getattr(config, 'scale_emb', None)
+        if config_embed_scale is not None:
+            self.embed_scale = config_embed_scale
+        elif config.model_type == 'gemma' or config.model_type == 'gemma2':
             self.embed_scale = self.hidden_size**0.5
         if hasattr(embed, 'embed_scale'):
             self.embed_scale = embed.embed_scale
@@ -47,6 +50,18 @@ class RMSNorm(torch.nn.Module):
             hidden_states = hidden_states * F.silu(gate.to(torch.float32))
         return hidden_states.to(input_dtype)
 
+def canonical_rms_norm(norm, weight_offset=0.0):
+    """Convert model-specific RMSNorm weight semantics to an explicit gamma."""
+    if norm is None or not hasattr(norm, 'weight') or norm.weight is None:
+        return norm
+    eps = getattr(norm, 'variance_epsilon', getattr(norm, 'eps', 1e-6))
+    canonical = RMSNorm(norm.weight.numel(), eps=float(eps))
+    gamma = norm.weight.detach().float().clone()
+    if weight_offset != 0.0:
+        gamma = gamma + weight_offset
+    canonical.weight = torch.nn.Parameter(gamma, requires_grad=norm.weight.requires_grad)
+    return canonical
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -54,15 +69,49 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+def layer_layout_config(config):
+    # The flattened export config does not forward the layer layout; the original HF (text)
+    # config carries it.
+    for cfg in (config, getattr(config, 'origin_config', None)):
+        if cfg is None:
+            continue
+        for candidate in (cfg, getattr(cfg, 'text_config', None)):
+            if candidate is not None and getattr(candidate, 'num_kv_shared_layers', 0):
+                return candidate
+    return None
+
+def kv_shared_owner(config, layer_id):
+    # Index of the layer whose kvcache a sharing layer reads. HF dropped the per-module
+    # kv_shared_layer_index attribute (gemma4, transformers >= 5.5.4) but the layer layout
+    # still determines it: the owner is the last layer of the same attention type among those
+    # that keep a cache of their own. Returns None when the layout does not say.
+    cfg = layer_layout_config(config)
+    if cfg is None:
+        return None
+    first_shared = getattr(cfg, 'num_hidden_layers', 0) - cfg.num_kv_shared_layers
+    if first_shared <= 0 or layer_id < first_shared:
+        return None
+    layer_types = getattr(cfg, 'layer_types', None)
+    if not layer_types:
+        return first_shared - 1
+    want = layer_types[layer_id]
+    for index in range(first_shared - 1, -1, -1):
+        if layer_types[index] == want:
+            return index
+    return None
+
 class Attention(torch.nn.Module):
     def __init__(self, attn, layer_id, config, rotary, mapper):
         super().__init__()
         self.export_fused_attn = False
+        self.export_fused_rope = False
         if config is None: return
         self.config = config
         self.kv_cache = True
         self.layer_id = layer_id
         self.rotary = rotary
+        export_args = getattr(config, 'export_args', None)
+        self.export_fused_rope = getattr(export_args, 'transformer_c4', True)
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
         if isinstance(config.num_attention_heads, list):
@@ -74,6 +123,21 @@ class Attention(torch.nn.Module):
             self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         ModelMapper.do_map(self, attn, mapper['attention'])
+        if config.model_type == 'mobilemoe' and not attn.use_rope:
+            self.rotary = None
+        if config.model_type == 'mobilemoe' and attn.attn_temperature_tuning and not attn.use_rope:
+            raise ValueError('MobileMoE attention temperature tuning is not supported')
+        if config.model_type in ['qwen3_5', 'qwen3_5_moe', 'qwen3_5_text']:
+            # Qwen3.5 attention norms use gamma=(1+weight). FusedRoPE stores
+            # norm.weight as gamma, so canonicalize the offset semantics first.
+            self.q_norm = canonical_rms_norm(getattr(self, 'q_norm', None), 1.0)
+            self.k_norm = canonical_rms_norm(getattr(self, 'k_norm', None), 1.0)
+        self.q_gate_proj = None
+        self.qk_norm_after_rope = getattr(config, 'qk_norm_after_rope', False)
+        if not self.qk_norm_after_rope:
+            self.qk_norm_after_rope = (
+                hasattr(attn, 'query_layernorm') and hasattr(attn, 'key_layernorm')
+            )
 
         # Read attention scaling from the original HF attention module
         if hasattr(attn, 'scaling'):
@@ -104,11 +168,30 @@ class Attention(torch.nn.Module):
         # KV sharing (gemma4): track which layers share KV
         self.is_kv_shared_layer = getattr(attn, 'is_kv_shared_layer', False)
         self.kv_shared_layer_index = getattr(attn, 'kv_shared_layer_index', None)
+        if self.is_kv_shared_layer and self.kv_shared_layer_index is None:
+            self.kv_shared_layer_index = kv_shared_owner(config, layer_id)
+            if self.kv_shared_layer_index is None:
+                raise RuntimeError(f'layer {layer_id} shares its kvcache but the owning layer '
+                                   'cannot be determined, so the export would drop the sharing '
+                                   'and the layer has no key / value of its own')
         self.store_full_length_kv = getattr(attn, 'store_full_length_kv', False)
 
         # Create FusedAttention with KV sharing info
-        kv_shared_idx = self.kv_shared_layer_index if self.is_kv_shared_layer else -1
-        self.fused_attn = FusedAttention(self.num_heads * self.head_dim, self.kv_cache, f'/layers.{layer_id}/self_attn/FusedAttention', layer_id, kv_shared_idx)
+        kv_shared_idx = -1
+        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None:
+            kv_shared_idx = self.kv_shared_layer_index
+        self.fused_attn = FusedAttention(
+            self.num_heads * self.head_dim, self.kv_cache,
+            f'/layers.{layer_id}/self_attn/FusedAttention', layer_id, kv_shared_idx,
+            self.head_dim)
+        self.rope_cut_head_dim = min(int(getattr(self.rotary, 'rotary_dim', self.head_dim)), self.head_dim)
+        self.fused_rope = FusedRoPE(
+            self.rope_cut_head_dim,
+            self.num_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            f'/layers.{layer_id}/self_attn/FusedRoPE',
+        )
 
         if hasattr(self, 'qkv_proj') and self.qkv_proj is not None:
             # split qkv linear to q, k, v
@@ -157,6 +240,33 @@ class Attention(torch.nn.Module):
             self.k_proj.bias.requires_grad = False
             self.v_proj.bias.requires_grad = False
 
+        # Some gated attention variants concatenate query and output-gate channels in q_proj.
+        # Split the projection while exporting C4 so query and gate can remain independent C4 tensors.
+        query_size = self.num_heads * self.head_dim
+        if (self.export_fused_rope
+                and not getattr(export_args, 'lora_split', False)
+                and isinstance(self.q_proj, torch.nn.Linear)
+                and self.q_proj.out_features == 2 * query_size):
+            combined_q_proj = self.q_proj
+            has_bias = combined_q_proj.bias is not None
+            self.q_proj = torch.nn.Linear(combined_q_proj.in_features, query_size, bias=has_bias)
+            self.q_gate_proj = torch.nn.Linear(combined_q_proj.in_features, query_size, bias=has_bias)
+            q_gate_weight = combined_q_proj.weight.data.view(
+                self.num_heads, 2, self.head_dim, combined_q_proj.in_features)
+            self.q_proj.weight.data = q_gate_weight[:, 0].reshape(query_size, combined_q_proj.in_features).clone()
+            self.q_gate_proj.weight.data = q_gate_weight[:, 1].reshape(query_size, combined_q_proj.in_features).clone()
+            if has_bias:
+                q_gate_bias = combined_q_proj.bias.data.view(self.num_heads, 2, self.head_dim)
+                self.q_proj.bias.data = q_gate_bias[:, 0].reshape(query_size).clone()
+                self.q_gate_proj.bias.data = q_gate_bias[:, 1].reshape(query_size).clone()
+            for projection in (self.q_proj, self.q_gate_proj):
+                projection.weight.requires_grad = False
+                if projection.bias is not None:
+                    projection.bias.requires_grad = False
+
+        # Shared-input q/k/v(/q_gate) projections stay separate Linears in the
+        # exported graph; MNNConvert's FuseTransformerC4 groups them into one
+        # FusedLinear at convert time (--transformerFuseQkvProj).
         self.past_key_value = None
 
     def forward(
@@ -167,23 +277,27 @@ class Attention(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
-        if self.q_proj.out_features == 2 * self.num_heads * self.head_dim:
+        key_states = None
+        value_states = None
+        if self.q_gate_proj is not None:
+            gate = self.q_gate_proj(hidden_states)
+        elif self.q_proj.out_features == 2 * self.num_heads * self.head_dim:
             reshaped = query_states.view(bsz, q_len, self.num_heads, self.head_dim * 2)
             query_states, gate = torch.split(reshaped, self.head_dim, dim=-1)
             gate = gate.reshape(bsz, q_len, -1)
         else:
             gate = None
 
+        qk_norm_after_rope = getattr(self, 'qk_norm_after_rope', getattr(self.config, 'qk_norm_after_rope', False))
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        # q_norm (openelm, gemma3/4, qwen3, etc.)
-        if hasattr(self, 'q_norm') and self.q_norm is not None:
-            query_states = self.q_norm(query_states)
+        q_norm_before_rope = not qk_norm_after_rope and hasattr(self, 'q_norm') and self.q_norm is not None
 
         # KV sharing: for shared layers, reuse KV from source layer (test mode only)
         shared_kv_cache = getattr(self, '_shared_kv_cache', None)
         use_shared_kv = (self.is_kv_shared_layer and shared_kv_cache is not None
                          and self.kv_shared_layer_index in shared_kv_cache
                          and not torch.onnx.is_in_onnx_export())
+        k_norm_before_rope = False
 
         if use_shared_kv:
             key_states, value_states = shared_kv_cache[self.kv_shared_layer_index]
@@ -195,26 +309,80 @@ class Attention(torch.nn.Module):
                 value_states = self.v_proj(hidden_states)
             key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
             value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-            if hasattr(self, 'k_norm') and self.k_norm is not None:
-                key_states = self.k_norm(key_states)
+            k_norm_before_rope = not qk_norm_after_rope and hasattr(self, 'k_norm') and self.k_norm is not None
             # gemma4 has v_norm (RMSNorm without scale)
             if hasattr(self, 'v_norm') and self.v_norm is not None:
                 value_states = self.v_norm(value_states)
+            # Publish for the layers that read this one's cache. Pre-RoPE, because they apply
+            # RoPE themselves at the same positions; without this the dict stays empty and a
+            # sharing layer falls through to the zero placeholders below.
+            if shared_kv_cache is not None and self.store_full_length_kv:
+                shared_kv_cache[self.layer_id] = (key_states, value_states)
         else:
             # Pure KV sharing layer: no local K/V projections (e.g. gemma4 in HF>=5.5.4)
             # Dummy K/V for ONNX tracing; FusedAttention handles sharing via kv_shared_layer_index
             key_states = query_states.new_zeros(bsz, q_len, self.num_key_value_heads, self.head_dim)
             value_states = key_states
+            k_norm_before_rope = False
 
         kv_seq_len = key_states.shape[1]
         if self.past_key_value is not None:
             kv_seq_len += self.past_key_value[0].shape[1]
         # rope
         if self.rotary is not None:
+            q_norm_fusable = (
+                not q_norm_before_rope
+                or (hasattr(self.q_norm, 'weight') and self.q_norm.weight is not None)
+            )
+            k_norm_fusable = (
+                not k_norm_before_rope
+                or (hasattr(self.k_norm, 'weight') and self.k_norm.weight is not None)
+            )
             cos, sin = rotary_pos_emb[0], rotary_pos_emb[1]
-            query_states = self.rotary.apply_rotary_pos(query_states, cos, sin)
-            if not use_shared_kv and self.k_proj is not None:
-                key_states = self.rotary.apply_rotary_pos(key_states, cos, sin)
+            use_fused_rope = (
+                self.export_fused_attn and torch.onnx.is_in_onnx_export()
+                and self.export_fused_rope
+                and not qk_norm_after_rope
+                and not use_shared_kv
+                and not self.k_eq_v
+                and self.k_proj is not None
+                and q_norm_fusable
+                and k_norm_fusable
+                and self.rotary.model_type not in ['chatglm', 'chatglm2', 'ernie4_5', 'glm_ocr', 'mobilemoe']
+                and cos.shape[-1] == self.rope_cut_head_dim
+                and sin.shape[-1] == self.rope_cut_head_dim
+            )
+            fuse_q_norm = use_fused_rope and q_norm_before_rope
+            fuse_k_norm = use_fused_rope and k_norm_before_rope
+            if use_fused_rope:
+                query_states, key_states = self.fused_rope(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.q_norm if fuse_q_norm else None,
+                    self.k_norm if fuse_k_norm else None,
+                )
+            else:
+                # Most models apply q/k norm before rotary, but Hunyuan applies it after rotary.
+                if q_norm_before_rope:
+                    query_states = self.q_norm(query_states)
+                if k_norm_before_rope:
+                    key_states = self.k_norm(key_states)
+                query_states = self.rotary.apply_rotary_pos(query_states, cos, sin)
+                if not use_shared_kv and self.k_proj is not None:
+                    key_states = self.rotary.apply_rotary_pos(key_states, cos, sin)
+        elif q_norm_before_rope or k_norm_before_rope:
+            if q_norm_before_rope:
+                query_states = self.q_norm(query_states)
+            if k_norm_before_rope:
+                key_states = self.k_norm(key_states)
+
+        if qk_norm_after_rope:
+            if hasattr(self, 'q_norm') and self.q_norm is not None:
+                query_states = self.q_norm(query_states)
+            if not use_shared_kv and self.k_proj is not None and hasattr(self, 'k_norm') and self.k_norm is not None:
+                key_states = self.k_norm(key_states)
 
         # MobileLLM model llama4_text has qk_norm after rotary
         if hasattr(self, 'qk_norm') and self.qk_norm is not None :
@@ -539,6 +707,9 @@ class ShortConvAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Note: ShortConvAttention is mask-free; `attention_mask` is accepted
+        # only to keep the call signature uniform with `Attention.forward` and
+        # is intentionally unused.
         batch_size, seq_len, _ = hidden_states.shape
 
         # in_proj: [B, L, H] -> [B, L, 3H]
@@ -608,6 +779,19 @@ class LinearAttention(torch.nn.Module):
         self.norm = RMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
         self.norm.weight.data = original_norm.weight.data
 
+        export_args = getattr(config, 'export_args', None)
+        # Defaults off rather than following llmexport's --fuse_linear_attn_gate
+        # default: export_args is None for callers outside llmexport, which have
+        # no flag to turn the fold back off again.
+        self.gate_fold = getattr(export_args, 'fuse_linear_attn_gate', False)
+        gate_coef = None
+        gate_bias = None
+        if self.gate_fold:
+            assert self.num_v_heads <= 64, \
+                f"gate_fold requires num_v_heads <= 64, got {self.num_v_heads}"
+            gate_coef = (-self.A_log.float().exp()).tolist()
+            gate_bias = self.dt_bias.float().tolist()
+
         self.fused_attn = FusedLinearAttention(
             name=f'/layers.{layer_id}/self_attn/FusedLinearAttention',
             attn_type="gated_delta_rule",
@@ -615,8 +799,16 @@ class LinearAttention(torch.nn.Module):
             num_v_heads=self.num_v_heads,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            use_qk_l2norm=True
+            use_qk_l2norm=True,
+            gate_fold=self.gate_fold,
+            gate_coef=gate_coef,
+            gate_bias=gate_bias,
         )
+        # The four in_proj_* stay separate Linears in the exported graph;
+        # MNNConvert's FuseTransformerC4 groups them into one FusedLinear at
+        # convert time. This fusion is unconditional (not gated by
+        # --transformerFuseQkvProj) because the LinearAttention runtime op only
+        # runs correctly on C4-fused projections, unlike regular Attention.
         self.conv_state = None
         self.rnn_state = None
 
@@ -625,26 +817,34 @@ class LinearAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Note: LinearAttention is mask-free; `attention_mask` is accepted
+        # only to keep the call signature uniform with `Attention.forward` and
+        # is intentionally unused.
         batch_size, seq_len, _ = hidden_states.shape
 
         # 1. Linear Projections
         # mixed_qkv: [B, L, 2*key_dim + value_dim]
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        # Transpose for Conv1d: [B, Dim, L]
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
         # Gate, Beta, Z projections
         z = self.in_proj_z(hidden_states) # [B, L, value_dim]
         b = self.in_proj_b(hidden_states) # [B, L, num_v_heads]
         a = self.in_proj_a(hidden_states) # [B, L, num_v_heads]
+        # Transpose for Conv1d: [B, Dim, L]
+        mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # 2. Pre-compute gates
         beta = torch.sigmoid(b)
         gate = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if torch.onnx.is_in_onnx_export():
-            attn_out = self.fused_attn(mixed_qkv, gate, beta, self.conv1d.weight.data.detach())
+            if self.gate_fold:
+                attn_out = self.fused_attn(mixed_qkv, a, b, self.conv1d.weight.data.detach())
+            else:
+                attn_out = self.fused_attn(mixed_qkv, gate, beta, self.conv1d.weight.data.detach())
             attn_out = attn_out.reshape(-1, self.head_v_dim)
+            # The RMSNorm(x)*silu(z) segment stays spelled out here
+            # (Reshape/RMSNorm/SILU/MUL); MNNConvert's FuseTransformerC4 folds it
+            # into one GatedRMSNorm op when --transformerFuseC4 is on.
             z = z.reshape(-1, self.head_v_dim)
             attn_out = self.norm(attn_out, z)
             attn_out = attn_out.view(batch_size, seq_len, -1)
@@ -801,6 +1001,8 @@ class Rotary(torch.nn.Module):
             self.rope_theta *= self.rope_ratio
         self.rotary_dim = config.head_dim
         self.model_type = config.model_type
+        self.preserve_cpu_mrope = (self.model_type == 'qwen3_vl' and
+                                   bool(getattr(getattr(config, 'export_args', None), 'gptq_path', None)))
         if hasattr(config, 'rotary_dim'):
             self.rotary_dim = config.rotary_dim
         if self.model_type == 'chatglm':
@@ -824,6 +1026,7 @@ class Rotary(torch.nn.Module):
         self.attention_scaling = 1.0
         self.is_scaled = False
         self.mrope_interleaved = False
+        self.mrope_axes = 3
 
         def get_theta():
             return 1.0 / (self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
@@ -831,17 +1034,21 @@ class Rotary(torch.nn.Module):
         self.theta = get_theta()
         # other type
         if hasattr(config, 'rope_scaling') and config.rope_scaling is not None:
-            scaling_config = config.rope_scaling
+            scaling_config = dict(config.rope_scaling)
+            if 'xdrope_section' in scaling_config and 'mrope_section' not in scaling_config:
+                scaling_config['mrope_section'] = scaling_config['xdrope_section']
             # get rope_type
             rope_type = 'default'
-            if 'type' in config.rope_scaling:
-                rope_type = config.rope_scaling['type']
-            elif 'rope_type' in config.rope_scaling:
-                rope_type = config.rope_scaling['rope_type']
+            if 'type' in scaling_config:
+                rope_type = scaling_config['type']
+            elif 'rope_type' in scaling_config:
+                rope_type = scaling_config['rope_type']
+            if rope_type == 'xdrope':
+                rope_type = 'dynamic'
             # gen theta for rope_type
             if rope_type == 'dynamic': # NTK
-                if 'alpha' in config.rope_scaling: # NTKAlpha in Hunyuan
-                    self.rope_theta *= (config.rope_scaling['alpha'] ** (self.rotary_dim / (self.rotary_dim - 2)))
+                if 'alpha' in scaling_config: # NTKAlpha in Hunyuan
+                    self.rope_theta *= (scaling_config['alpha'] ** (self.rotary_dim / (self.rotary_dim - 2)))
                 else: # NTKScaling
                     pass
                 self.theta = get_theta()
@@ -853,6 +1060,20 @@ class Rotary(torch.nn.Module):
                     scaling_config=scaling_config,
                     max_position_embeddings=config.max_position_embeddings
                 )
+            elif rope_type == 'llama3' and self.model_type == 'mobilemoe':
+                factor = scaling_config['factor']
+                low = scaling_config['low_freq_factor']
+                high = scaling_config['high_freq_factor']
+                original_length = scaling_config['original_max_position_embeddings']
+                wavelength = 2 * math.pi / self.theta
+                scaled = self.theta / factor
+                if high != low:
+                    smooth = (original_length / wavelength - low) / (high - low)
+                    scaled = torch.where(wavelength >= original_length / high,
+                                         (1 - smooth) * scaled + smooth * self.theta, self.theta)
+                else:
+                    scaled = self.theta
+                self.theta = torch.where(wavelength > original_length / low, self.theta / factor, scaled)
             elif rope_type == 'longrope': # longrope in MiniCPM
                 self.is_scaled = True
                 original_max_position_embeddings = config.rope_scaling['original_max_position_embeddings']
@@ -864,8 +1085,10 @@ class Rotary(torch.nn.Module):
 
             # mrope for multimode
             if 'mrope_section' in scaling_config:
-                self.mrope_interleaved = scaling_config.get('mrope_interleaved', False)
+                self.mrope_interleaved = scaling_config.get('mrope_interleaved',
+                                                             scaling_config.get('interleaved', False))
                 self.mrope_section = scaling_config['mrope_section']
+                self.mrope_axes = len(self.mrope_section)
                 self.theta = get_theta().unsqueeze(0)
                 self.theta_sections = self.theta.split(self.mrope_section, dim=-1)
                 def apply_interleaved_mrope(freqs, mrope_section):
@@ -882,14 +1105,71 @@ class Rotary(torch.nn.Module):
                     self.mrope_reindex = apply_interleaved_mrope(freq_idx, self.mrope_section).flatten()
 
         self.is_mrope = self.theta_sections is not None or self.mrope_interleaved
+        self.preserve_cpu_mrope = self.preserve_cpu_mrope and self.is_mrope
+        self.rope_table_split = 2048
+        self.rope_max_pos = getattr(config, 'max_position_embeddings', None) or 131072
+        if not self.preserve_cpu_mrope:
+            self.build_rope_tables()
+
+    def build_rope_tables(self):
+        # fp16-safe rope tables (shared by forward and mrope_forward).
+        # Backends running the graph in fp16 cannot represent integer positions
+        # >= 2048 exactly (spacing 2 at 2048, 4 at 4096), so baking
+        # position.float() * theta into the graph makes adjacent positions
+        # collide into bit-identical cos/sin and garbles attention past 4096.
+        # Instead keep the position integer, split it as p = 2048 * q + r (exact
+        # int ops), and gather cos/sin from two tables whose angles were folded
+        # into [0, 2pi) in float64:
+        #   angle(p) = q * (2048 * theta) + r * theta  (mod 2pi)
+        #   cos(p)   = cosH[q] * cosL[r] - sinH[q] * sinL[r]
+        #   sin(p)   = sinH[q] * cosL[r] + cosH[q] * sinL[r]
+        # Every tensor the backend touches then stays in [-1, 1], which fp16
+        # represents to ~6e-4 - a harmless phase jitter instead of total loss.
+        # Must be re-called by anyone mutating self.theta after __init__.
+        # reserve 4x max_pos so dynamic extrapolation (NTK, user-extended
+        # context) still gets exact angles; the clamp in _rope_cos_sin() is only
+        # a last-resort guard against out-of-bounds gathers.
+        self.rope_high_entries = (4 * self.rope_max_pos) // self.rope_table_split + 2
+        theta64 = self.theta.reshape(-1).to(torch.float64)
+        two_pi = 2.0 * math.pi
+        low_angle = (torch.arange(self.rope_table_split, dtype=torch.float64).reshape(-1, 1) * theta64) % two_pi
+        high_angle = (torch.arange(self.rope_high_entries, dtype=torch.float64).reshape(-1, 1)
+                      * ((self.rope_table_split * theta64) % two_pi)) % two_pi
+        self.rope_cos_low = torch.cos(low_angle).float()
+        self.rope_sin_low = torch.sin(low_angle).float()
+        self.rope_cos_high = torch.cos(high_angle).float()
+        self.rope_sin_high = torch.sin(high_angle).float()
+
+    def _rope_cos_sin(self, position_ids):
+        # fp16-safe gather of cos/sin for integer positions; see build_rope_tables.
+        # Returns cos, sin of shape [*position_ids.shape, rotary_dim // 2].
+        device = position_ids.device
+        shape = position_ids.shape
+        # clamp the position itself: positions outside the reserved table range
+        # are outside the model's usable window anyway, and an out-of-range
+        # gather in the exported graph reads garbage memory instead of failing.
+        # Bounding pos first keeps q and r consistent by construction (q in
+        # [0, high_entries), r in [0, split)) with only Div/Mul/Sub. pos is
+        # non-negative here so trunc == floor, but trunc avoids the Mod/Xor
+        # sign handling that floor's ONNX lowering emits and Metal cannot run.
+        pos_max = self.rope_high_entries * self.rope_table_split - 1
+        pos = position_ids.reshape(-1).long().clamp(0, pos_max)
+        q = torch.div(pos, self.rope_table_split, rounding_mode='trunc')
+        r = pos - q * self.rope_table_split
+        cos_h = torch.nn.functional.embedding(q, self.rope_cos_high.to(device))
+        sin_h = torch.nn.functional.embedding(q, self.rope_sin_high.to(device))
+        cos_l = torch.nn.functional.embedding(r, self.rope_cos_low.to(device))
+        sin_l = torch.nn.functional.embedding(r, self.rope_sin_low.to(device))
+        cos_pos = cos_h * cos_l - sin_h * sin_l
+        sin_pos = sin_h * cos_l + cos_h * sin_l
+        return cos_pos.reshape(*shape, -1), sin_pos.reshape(*shape, -1)
 
     def forward(self, position_ids):
         if self.is_mrope:
             return self.mrope_forward(position_ids)
-        position_ids = position_ids.float().reshape(-1, 1)
-        idx_theta = position_ids * self.theta.to(position_ids.device)
-        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)])
-        if self.model_type == 'ernie4_5':
+        cos_pos, sin_pos = self._rope_cos_sin(position_ids.reshape(-1))
+        rotary_pos_emb = torch.stack([cos_pos, sin_pos])
+        if self.model_type in ['ernie4_5', 'mobilemoe']:
             rotary_pos_emb = torch.stack((rotary_pos_emb, rotary_pos_emb), dim=-1)
             rotary_pos_emb = rotary_pos_emb.reshape(*rotary_pos_emb.shape[:-2], -1)
         elif self.model_type != 'chatglm2':
@@ -900,22 +1180,58 @@ class Rotary(torch.nn.Module):
         return rotary_pos_emb
 
     def mrope_forward(self, position_ids):
-        position_ids = position_ids.float().unsqueeze(-1)
+        if self.preserve_cpu_mrope:
+            # The frozen CPU GPTQ model uses direct FP32 angles. The FP16-safe
+            # split-angle tables change rounding even below position 2048;
+            # dynamic activation quantization can amplify that into new logits.
+            positions = position_ids.float().unsqueeze(-1)
+            if self.mrope_interleaved:
+                angles = positions * self.theta.to(position_ids.device)
+                angles = angles.transpose(1, 0).reshape(-1, self.mrope_axes * self.rotary_dim // 2)
+                angles = angles[:, self.mrope_reindex]
+            else:
+                angles = torch.cat([positions[axis] * self.theta_sections[axis]
+                                    for axis in range(self.mrope_axes)], dim=-1)
+            values = torch.stack([torch.cos(angles), torch.sin(angles)])
+            return torch.cat((values, values), dim=-1).unsqueeze(2).unsqueeze(1)
+        # position_ids: [axes, seq]. Gather fp16-safe cos/sin per axis first
+        # ([axes, seq, half]); the branch-specific reorderings below are pure
+        # index selections, which commute with the elementwise cos/sin, so the
+        # result is identical to rotating position.float() * theta directly -
+        # without ever materializing a large float position in the graph.
+        cos_all, sin_all = self._rope_cos_sin(position_ids)
         if self.mrope_interleaved:
-            idx_theta = position_ids * self.theta.to(position_ids.device)
-            idx_theta = idx_theta.transpose(1, 0).reshape(-1, 3 * self.rotary_dim // 2)
-            idx_theta = idx_theta[:, self.mrope_reindex]
-        else:
-            idx_theta = torch.concat([
-                position_ids[0] * self.theta_sections[0],
-                position_ids[1] * self.theta_sections[1],
-                position_ids[2] * self.theta_sections[2]
+            half3 = 3 * self.rotary_dim // 2
+            cos_pos = cos_all.transpose(1, 0).reshape(-1, half3)[:, self.mrope_reindex]
+            sin_pos = sin_all.transpose(1, 0).reshape(-1, half3)[:, self.mrope_reindex]
+        elif self.model_type == 'hunyuan_vl':
+            cos_all = torch.cat((cos_all, cos_all), dim=-1)
+            sin_all = torch.cat((sin_all, sin_all), dim=-1)
+            full_sections = [section * 2 for axis, section in enumerate(self.mrope_section)]
+            cos_chunks = [cos_all[axis].split(full_sections, dim=-1) for axis in range(self.mrope_axes)]
+            sin_chunks = [sin_all[axis].split(full_sections, dim=-1) for axis in range(self.mrope_axes)]
+            cos_pos = torch.cat([
+                cos_chunks[axis % self.mrope_axes][axis] for axis, section in enumerate(full_sections)
             ], dim=-1)
-        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)])
+            sin_pos = torch.cat([
+                sin_chunks[axis % self.mrope_axes][axis] for axis, section in enumerate(full_sections)
+            ], dim=-1)
+        else:
+            cos_pos = torch.cat([
+                cos_all[axis].split(self.mrope_section, dim=-1)[axis]
+                for axis, section in enumerate(self.mrope_section)
+            ], dim=-1)
+            sin_pos = torch.cat([
+                sin_all[axis].split(self.mrope_section, dim=-1)[axis]
+                for axis, section in enumerate(self.mrope_section)
+            ], dim=-1)
+        rotary_pos_emb = torch.stack([cos_pos, sin_pos])
         if self.model_type in ['glm_ocr']:
             # interleaved doubling: [c0,c0,c1,c1,...,cn,cn]
             rotary_pos_emb = torch.stack((rotary_pos_emb, rotary_pos_emb), dim=-1)
             rotary_pos_emb = rotary_pos_emb.reshape(*rotary_pos_emb.shape[:-2], -1)
+        elif self.model_type == 'hunyuan_vl':
+            pass
         else:
             rotary_pos_emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         rotary_pos_emb = rotary_pos_emb.unsqueeze(2).unsqueeze(1)
@@ -926,9 +1242,9 @@ class Rotary(torch.nn.Module):
             return self.chatglm_rotary_pos(x, cos, sin)
         if self.model_type == 'chatglm2':
             return self.chatglm2_rotary_pos(x, cos, sin)
-        if self.model_type in ['phi-msft', 'qwen3_5', 'qwen3_5_moe']:
+        if self.model_type in ['phi-msft', 'qwen3_5', 'qwen3_5_moe', 'qwen3_5_text']:
             return self.phi_rotary_pos(x, cos, sin)
-        if self.model_type in ['ernie4_5', 'glm_ocr']:
+        if self.model_type in ['ernie4_5', 'glm_ocr', 'mobilemoe']:
             return self.ernie_rotary_pos(x, cos, sin)
         # Auto-detect partial rotary: cos/sin dim < x dim
         if cos.shape[-1] < x.shape[-1]:
@@ -1032,7 +1348,7 @@ class Qwen3Expert(torch.nn.Module):
         return out
 
 class Mlp(torch.nn.Module):
-    def __init__(self, mlp, mapper, layer_id):
+    def __init__(self, mlp, mapper, layer_id, model_type=None):
         super().__init__()
         self.layer_id = layer_id
         ModelMapper.do_map(self, mlp, mapper['mlp'])
@@ -1047,13 +1363,17 @@ class Mlp(torch.nn.Module):
             # refacte experts to qwen3_experts
             original_experts = self.experts
             hidden_size = getattr(original_experts, 'hidden_dim', None) or getattr(original_experts, 'hidden_size')
-            expert_dim = getattr(original_experts, 'intermediate_dim', None) or getattr(original_experts, 'intermediate_size')
+            expert_dim = (original_experts.expert_dim if model_type == 'mobilemoe' else
+                          getattr(original_experts, 'intermediate_dim', None) or original_experts.intermediate_size)
             act_fn = original_experts.act_fn
             new_experts_list = torch.nn.ModuleList()
             for i in range(self.num_experts):
                 expert_mlp = Qwen3Expert(hidden_size, expert_dim, act_fn)
                 expert_mlp.gate_up_proj_linear.weight.data = original_experts.gate_up_proj.data[i]
                 expert_mlp.down_proj_linear.weight.data = original_experts.down_proj.data[i]
+                if model_type == 'mobilemoe':
+                    expert_mlp.gate_up_proj_linear.weight.data = original_experts.gate_up_proj.data[i].T.contiguous()
+                    expert_mlp.down_proj_linear.weight.data = original_experts.down_proj.data[i].T.contiguous()
                 new_experts_list.append(expert_mlp)
             self.experts = new_experts_list
 
@@ -1064,6 +1384,10 @@ class Mlp(torch.nn.Module):
 
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             self.moe_type = 'lfm2_moe'
+        if model_type == 'mobilemoe':
+            self.moe_type = 'mobilemoe'
+            self.norm_topk_prob = mlp.norm_topk_prob
+            self.gate.float()
 
         if hasattr(self, 'router'):
             self.moe_type = 'gpt_oss'
@@ -1094,19 +1418,23 @@ class Mlp(torch.nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if hasattr(self, 'shared_expert'):
-            shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(hidden_states)
+            shared_expert_output = self.shared_expert(hidden_states)
+            if getattr(self, 'shared_expert_gate', None) is not None:
+                shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
             shared_expert_output = shared_expert_output.reshape(batch_size, sequence_length, hidden_dim)
         else:
             shared_expert_output = None
 
-        if self.moe_type == 'lfm2_moe':
-            router_logits = self.gate(hidden_states)
+        if self.moe_type in ['lfm2_moe', 'mobilemoe']:
+            router_input = hidden_states.float() if self.moe_type == 'mobilemoe' else hidden_states
+            router_logits = self.gate(router_input)
             routing_weights = router_logits.sigmoid()
             scores_for_routing = routing_weights + self.expert_bias
             _, selected_experts = torch.topk(scores_for_routing, self.top_k, dim=-1)
             routing_weights = torch.gather(routing_weights, dim=-1, index=selected_experts)
             if self.norm_topk_prob:
-                routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-6)
+                eps = 1e-20 if self.moe_type == 'mobilemoe' else 1e-6
+                routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + eps)
             routing_weights = (routing_weights * self.routed_scaling_factor).to(hidden_states.dtype)
         elif self.moe_type == 'gpt_oss':
             router_logits = self.gate(hidden_states)
@@ -1200,7 +1528,11 @@ class Decoder(torch.nn.Module):
             mapper = config.model_map
         ModelMapper.do_map(self, decoder, mapper['decoder'])
         if 'mlp' in mapper and hasattr(self.mlp, 'experts'):
-            self.mlp = Mlp(self.mlp, mapper, layer_id)
+            self.mlp = Mlp(self.mlp, mapper, layer_id, config.model_type)
+
+        # Dense SwiGLU gate/up stays spelled out (gate/up Linears + SILU + MUL);
+        # MNNConvert's FuseTransformerC4 folds the pair into one act_silu_mul
+        # FusedLinear at convert time (--transformerFuseGateUpProj).
 
         # gemma4 MoE: router and experts are at decoder layer level (parallel to dense MLP)
         self.has_gemma4_moe = hasattr(self, 'experts') and self.experts is not None

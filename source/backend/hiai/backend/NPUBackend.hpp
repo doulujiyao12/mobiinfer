@@ -15,7 +15,7 @@
 
 // Enable chunk-aware OM cache:
 //   - Save/read OM as
-//     "<npu_model_dir>/chunk_i/om_cache_v2/<shape-key>/vision.om" when runtime
+//     "<npu_model_dir>/chunk_i/om_cache_v3/<shape-key>/vision.om" when runtime
 //     passes per-chunk EXTERNAL_NPU_FILE_DIR.
 //   - Set to 0 to keep legacy behavior.
 #ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
@@ -30,7 +30,9 @@
 //
 // Comment out (or pass -DMNN_HIAI_FREE_CONST_HOST=0) to keep the legacy behaviour
 // of retaining host weights across the lifetime of the session.
+#ifndef MNN_HIAI_FREE_CONST_HOST
 #define MNN_HIAI_FREE_CONST_HOST 1
+#endif
 
 #include <graph/attr_value.h>
 #include <graph/operator_hiai_reg.h>
@@ -41,10 +43,15 @@
 #include <graph/compatible/all_ops.h>
 #include <hiai_ir_build.h>
 #include <graph/buffer.h>
+#if defined(__ANDROID__)
+#include <native_handle.h>
+#endif
 #include <MNN/ErrorCode.hpp>
+#include "../include/MNNHiAIIO.h"
 #include <core/Backend.hpp>
 #include <core/Execution.hpp>
 #include "HiAiModelManagerService.h"
+#include "HiaiHclV600Runtime.hpp"
 #include "MNN_generated.h"
 
 #include <stdio.h>
@@ -88,12 +95,13 @@
 
 #ifdef HIAI_DEBUG
 #include <android/trace.h>
-#include <dlfcn.h>
 #endif
+#include <dlfcn.h>
 
 using namespace std;
 
 namespace MNN {
+    struct HiAIBackendOptions;
     typedef std::vector<Tensor *> MNNTensorList;
 #ifdef HIAI_DEBUG
     typedef void *(*fp_ATrace_beginSection) (const char* sectionName);
@@ -305,7 +313,7 @@ namespace MNN {
 
     class NPURuntime : public Runtime {
     public:
-        NPURuntime(const Backend::Info& info);
+        NPURuntime(const Backend::Info& info, const std::string& hiaiRuntimeVersion);
         virtual ~NPURuntime();
         virtual CompilerType onGetCompilerType() const override;
         virtual Backend* onCreate(const BackendConfig* conf, Backend* origin) const override;
@@ -334,12 +342,25 @@ namespace MNN {
             return std::make_pair(mCacheBuffer, mCacheSize);
         }
 
+        virtual bool onSetCachePath(const char* path, int mode) override {
+            (void)mode;
+            if (!mExplicitHiAI) {
+                return false;
+            }
+            mCachePath = path == nullptr ? std::string() : std::string(path);
+            return true;
+        }
+
     private:
         Backend::Info mInfo;
         BackendConfig::PrecisionMode mPrecision;
+        std::string mHiaiRuntimeVersion;
         // mutable IHostMemory* mModel = nullptr;
         const void* mCacheBuffer = nullptr;
         size_t mCacheSize = 0;
+        std::string mCachePath;
+        std::shared_ptr<HiAIBackendOptions> mHiAIOptions;
+        bool mExplicitHiAI = false;
 
         friend class NPUBackend;
     };
@@ -352,6 +373,7 @@ namespace MNN {
 
         virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op) override;
 
+        ErrorCode runGraphOnce() const;
         virtual void onExecuteBegin() const override;
         virtual void onExecuteEnd() const override;
 
@@ -363,15 +385,23 @@ namespace MNN {
         virtual ErrorCode onResizeEnd() override;
 
     public:
+        ErrorCode buildIRModelAndLoad();
+        ErrorCode buildLegacyIRModelAndLoad();
+        int process(int modelIndex) const;
 
-        ErrorCode bulidIRModelAndLoad();
-        int process(int modelIndex) const ;
+        shared_ptr<ge::Operator> getInputOps(const Op* op, int index = 0);
 
-        shared_ptr<ge::Operator> getInputOps(const Op *op, int index = 0);
-
-        void setOutputOps(const Op *op, vector<shared_ptr<ge::Operator>>&& HIAI_op,
-                          const std::vector<Tensor *> &outputs);
-        void setNetworkInput(const std::vector<Tensor *> &inputs, const Op* op);
+        void setOutputOps(const Op* op, vector<shared_ptr<ge::Operator>>&& HIAI_op,
+                          const std::vector<Tensor*>& outputs);
+        void setNetworkInput(const std::vector<Tensor*>& inputs, const Op* op);
+        bool usesHclV600Runtime() const { return mHclV600Runtime != nullptr; }
+        bool isExplicitHiAISession() const {
+            return mNPURuntime != nullptr && mNPURuntime->mExplicitHiAI;
+        }
+        bool supportsRom600NativeResize() const {
+            return isExplicitHiAISession() && !mForceV320 &&
+                   mNPURuntime->mHiaiRuntimeVersion >= "100.600.000.000";
+        }
 
     private:
         int getInOutTensorInfo(string modelName);
@@ -379,6 +409,8 @@ namespace MNN {
 #if MNN_HIAI_CACHE_OM_BY_CHUNK
         std::string buildOmCacheShapeKey() const;
 #endif
+        bool bindNativeHandleIo();
+        bool releaseModelResources(bool finalRelease);
 
     public:
 
@@ -436,6 +468,24 @@ namespace MNN {
 
         vector<shared_ptr<hiai::AiTensor>> mInputTensors;
         vector<shared_ptr<hiai::AiTensor>> mOutputTensors;
+        vector<shared_ptr<hiai::AiTensor>> mHostInputTensors;
+        vector<shared_ptr<hiai::AiTensor>> mHostOutputTensors;
+        std::unique_ptr<HiaiHclV600Runtime> mHclV600Runtime;
+
+        MNNHiAINativeHandleIoContext* mNativeIoContext = nullptr;
+        bool mForceV320 = false;
+        bool mRequiresV320SessionRebuild = false;
+        int mImageInputIndex = -1;
+        int mImageOutputIndex = -1;
+        void* mBoundInputAhb = nullptr;
+        void* mBoundOutputAhb = nullptr;
+        void* mLibAndroid = nullptr;
+#if defined(__ANDROID__)
+        const native_handle_t* (*mGetAhbNativeHandle)(const void*) = nullptr;
+#endif
+        mutable bool mResetStatusOnNextExecute = true;
+        mutable bool mGraphExecuted = false;
+        mutable ErrorCode mExecutionStatus = NO_ERROR;
 
         MNNTensorList mMNNOutTensors;
         // Map from tensor's Backend::MemObj (shared between original and clone) to

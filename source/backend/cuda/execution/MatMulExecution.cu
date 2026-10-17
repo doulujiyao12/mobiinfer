@@ -586,7 +586,7 @@ void MatMulExecution::setArguments(const std::vector<Tensor *> &inputs, const st
             }
             mInfo.epilogueVectorize = true;
             mInfo.epilogueType = 0;// Linear
-            mInfo.precisionType = 2;// FP16_FP16
+            mInfo.precisionType = (mFp16Fp32MixInfer || mFp32Infer) ? 0 : 2;// FP16_FP32 or FP16_FP16
             mInfo.backend = mBackend;
 
             if(mUseRRLayout) {
@@ -1105,6 +1105,7 @@ ErrorCode MatMulExecution::onResize(const std::vector<Tensor *> &inputs, const s
     }
     if((mNeedConvertMatAB && mFp16Fp32MixInfer) || mNeedATempBuffer) {
         bufferAData = pool->alloc(convertBytes * mBatch * mAs * mGemmInfo.elh[0] * mGemmInfo.elhPad[1]);
+        if (nullptr == bufferAData.first) { MNN_ERROR("CUDA alloc failed\n"); return OUT_OF_MEMORY; }
         mTempMatA = (void*)bufferAData.ptr();
     } else {
         mTempMatA = (void *)A->deviceId();
@@ -1112,6 +1113,7 @@ ErrorCode MatMulExecution::onResize(const std::vector<Tensor *> &inputs, const s
 
     if((mNeedConvertMatAB && mFp16Fp32MixInfer) || mNeedBTempBuffer) {
         bufferBData = pool->alloc(convertBytes * mBatch * mBs * mGemmInfo.elh[2] * mGemmInfo.elhPad[1]);
+        if (nullptr == bufferBData.first) { MNN_ERROR("CUDA alloc failed\n"); return OUT_OF_MEMORY; }
         mTempMatB = (void*)bufferBData.ptr();
     } else {
         mTempMatB = (void *)B->deviceId();

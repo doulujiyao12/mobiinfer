@@ -7,6 +7,7 @@
 //
 
 #include <stdio.h>
+#include <limits>
 
 #include "TfliteUtils.hpp"
 #include "liteOpConverter.hpp"
@@ -33,14 +34,32 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, int quantizedModel) {
     // 3|2 inputs: input tensor, weight, (bias)
     const int inputSize = tfliteOp->inputs.size();
-    DCHECK(inputSize == 2 || inputSize == 3) << "tflite Conv2D input ERROR! ";
+    if (inputSize < 2 || tfliteOp->outputs.empty()) {
+        MNN_ERROR("[ERROR] Invalid TFLite Model: Conv2D has invalid inputs or outputs\n");
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     const auto& tfliteConvOption = tfliteOp->builtin_options.AsConv2DOptions();
+    if (nullptr == tfliteConvOption) {
+        DLOG(ERROR) << "CONV_2D operator carries no Conv2DOptions";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     const int inputIndex     = tfliteOp->inputs[0];
     const int weightIndex    = tfliteOp->inputs[1];
     const int outputIndex    = tfliteOp->outputs[0];
-    const auto& inputTensor  = tfliteTensors[inputIndex];
-    const auto& weightTensor = tfliteTensors[weightIndex];
-    const auto& outputTensor = tfliteTensors[outputIndex];
+    const auto* inputTensor  = tfliteAt(tfliteTensors, inputIndex, "tensor");
+    const auto* weightTensor = tfliteAt(tfliteTensors, weightIndex, "tensor");
+    const auto* outputTensor = tfliteAt(tfliteTensors, outputIndex, "tensor");
+    if (nullptr == inputTensor || nullptr == weightTensor || nullptr == outputTensor) {
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
+    const auto* weightBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(weightTensor->buffer), "buffer");
+    if (nullptr == weightBuffer) {
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     if (weightTensor->type == tflite::TensorType_INT8 || weightTensor->type == tflite::TensorType_INT4) {
         quantizedModel = 2;
         dstOp->type = MNN::OpType_Convolution;
@@ -60,17 +79,32 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
     int group = 1;
     // co kh kw ci
     const auto& weightShape = weightTensor->shape;
-    DCHECK(weightShape.size() == 4) << "Conv2D weight ERROR!";
+    if (4 != weightShape.size()) {
+        DLOG(ERROR) << "CONV_2D weight shape is not 4-D";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     const int co         = weightShape[0];
     const int kh         = weightShape[1];
     const int kw         = weightShape[2];
     const int ci         = weightShape[3];
-    const int weightSize = co * kh * kw * ci;
+    if (co <= 0 || kh <= 0 || kw <= 0 || ci <= 0) {
+        DLOG(ERROR) << "CONV_2D weight shape contains non-positive dimension";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
+    const int32_t weightDims[4] = {co, kh, kw, ci};
+    int weightSize = 0;
+    if (!computeTfliteWeightSize(weightDims, 4, &weightSize)) {
+        DLOG(ERROR) << "CONV_2D weight size overflow: " << co << "x" << kh << "x" << kw << "x" << ci;
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     if (inputShape.size() == 4 && inputShape[3] > ci) {
         group = inputShape[3] / ci;
     }
     if (quantizedModel == 1) { // UINT8_QUANT
-        auto conv2dParamQuan         = new MNN::TfQuantizedConv2DT;
+        std::unique_ptr<MNN::TfQuantizedConv2DT> conv2dParamQuan(new MNN::TfQuantizedConv2DT);
         conv2dParamQuan->modelFormat = MNN::ModeFormat_TFLITE;
         conv2dParamQuan->common      = std::unique_ptr<MNN::Convolution2DCommonT>(new MNN::Convolution2DCommonT);
         // filterOffset
@@ -146,29 +180,55 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         filter_hwcn.resize(weightSize);
         for (int i = 0; i < out_size; i++) {
             for (int j = 0; j < in_size; j++) {
-                filter_hwcn[i * in_size + j] = tfliteModelBuffer[weightTensor->buffer]->data[i + j * out_size];
+                filter_hwcn[i * in_size + j] = weightBuffer->data[i + j * out_size];
             }
         }
         conv2dParamQuan->weight = filter_hwcn;
 
+        // 3 operands means the bias operand is present; 2 operands is valid TFLite and is accepted
+        // by the input count check above, so the bias lookup must stay inside this guard.
         conv2dParamQuan->biasflag = (inputSize == 3);
-        DCHECK(conv2dParamQuan->biasflag == true);
-        const auto& biasTensor = tfliteTensors[tfliteOp->inputs[2]];
         if (inputSize == 3) {
-            DCHECK(biasTensor->type == tflite::TensorType_INT32) << "Bias Type ERROR";
-            const auto& biasData                = tfliteModelBuffer[biasTensor->buffer]->data;
+            const auto* biasTensor = tfliteAt(tfliteTensors, tfliteOp->inputs[2], "tensor");
+            if (nullptr == biasTensor) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            if (biasTensor->type != tflite::TensorType_INT32) {
+                DLOG(ERROR) << "CONV_2D bias type is not INT32";
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto* biasBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(biasTensor->buffer), "buffer");
+            if (nullptr == biasBuffer) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto* biasQuant = biasTensor->quantization.get();
+            if (nullptr == biasQuant || biasQuant->zero_point.empty() || biasQuant->scale.empty()) {
+                DLOG(ERROR) << "CONV_2D bias tensor carries no quantization scale/zero point";
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto& biasData = biasBuffer->data;
             conv2dParamQuan->biasQuantizedParam = std::unique_ptr<MNN::QuantizedParamT>(new MNN::QuantizedParamT);
             conv2dParamQuan->biasQuantizedParam->zeroPoint = biasTensor->quantization->zero_point[0];
             conv2dParamQuan->biasQuantizedParam->scale     = biasTensor->quantization->scale[0];
-            DCHECK(biasData.size() / 4 == co) << "Bias Data ERROR";
-            auto biasDataPtr               = biasData.data();
-            const int32_t* realBiasDataPtr = (int32_t*)biasDataPtr;
-            std::vector<int32_t> biasInt32Vec(realBiasDataPtr, realBiasDataPtr + co);
-            conv2dParamQuan->bias = biasInt32Vec;
+            if (biasData.size() >= sizeof(int32_t) * co) {
+                auto biasDataPtr = biasData.data();
+                const int32_t* realBiasDataPtr = (int32_t*)biasDataPtr;
+                std::vector<int32_t> biasInt32Vec(realBiasDataPtr, realBiasDataPtr + co);
+                conv2dParamQuan->bias = biasInt32Vec;
+            } else {
+                DLOG(ERROR) << "CONV_2D bias buffer needs " << (sizeof(int32_t) * co) << " bytes, got "
+                            << biasData.size();
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
         }
 
         conv2dParamQuan->activationType = (MNN::FusedActivation)tfliteConvOption->fused_activation_function;
-        dstOp->main.value               = conv2dParamQuan;
+        dstOp->main.value = conv2dParamQuan.release();
     } else if (quantizedModel == 2) { // INT8_QUANT
         std::unique_ptr<MNN::Convolution2DT> convolution2DQuant(new MNN::Convolution2DT);
         convolution2DQuant->common = std::unique_ptr<MNN::Convolution2DCommonT>(new MNN::Convolution2DCommonT);
@@ -202,20 +262,20 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         }
 
         // weight
-        if (tfliteModelBuffer[weightTensor->buffer]->data.data() == nullptr) {
+        if (weightBuffer->data.data() == nullptr) {
             //MNN_ERROR("Has not const weight data for tflite convolution\n");
             dstOp->main.value = convolution2DQuant.release();
             return;
         }
         std::vector<int8_t> weightTmp;
-        auto weight = reinterpret_cast<const int8_t*>(tfliteModelBuffer[weightTensor->buffer]->data.data());
+        auto weight = reinterpret_cast<const int8_t*>(weightBuffer->data.data());
         if (weightTensor->type == tflite::TensorType_INT4) {
             // Add one to assume has enough memory
             weightTmp.resize(weightSize + 1);
-            auto originSize = tfliteModelBuffer[weightTensor->buffer]->data.size();
+            auto originSize = weightBuffer->data.size();
             // Int4 -> Int8
             int halfSize = (weightSize + 1) / 2;
-            auto srcInt4 = reinterpret_cast<const uint8_t*>(tfliteModelBuffer[weightTensor->buffer]->data.data());
+            auto srcInt4 = reinterpret_cast<const uint8_t*>(weightBuffer->data.data());
             for (int v=0; v<halfSize; ++v) {
                 int srcValue = srcInt4[v];
                 weightTmp[2 * v] = srcValue & 0x0F;
@@ -230,7 +290,7 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
             weight = weightTmp.data();
         } else {
             MNN_ASSERT(weightTensor->type == tflite::TensorType_INT8);
-            MNN_ASSERT(tfliteModelBuffer[weightTensor->buffer]->data.size() == weightSize);
+            MNN_ASSERT(weightBuffer->data.size() == weightSize);
         }
 
         MNN_ASSERT(weightTensor->quantization->scale.size() == co);
@@ -254,11 +314,27 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         // bias
         convolution2DQuant->bias.resize(co);
         if (inputSize == 3) {
-            const auto& biasTensor = tfliteTensors[tfliteOp->inputs[2]];
-            auto bias = reinterpret_cast<const int*>(tfliteModelBuffer[biasTensor->buffer]->data.data());
-            // int to float
-            for (int i = 0; i < co; i++) {
-                convolution2DQuant->bias[i] = bias[i] * (scaleIn * alpha[i]);
+            const auto* biasTensor = tfliteAt(tfliteTensors, tfliteOp->inputs[2], "tensor");
+            if (nullptr == biasTensor) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto* biasBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(biasTensor->buffer), "buffer");
+            if (nullptr == biasBuffer) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto& biasRaw = biasBuffer->data;
+            auto bias = reinterpret_cast<const int*>(biasRaw.data());
+            if (biasRaw.size() >= sizeof(int) * co) {
+                // int to float
+                for (int i = 0; i < co; i++) {
+                    convolution2DQuant->bias[i] = bias[i] * (scaleIn * alpha[i]);
+                }
+            } else {
+                DLOG(ERROR) << "CONV_2D bias buffer needs " << (sizeof(int) * co) << " bytes, got " << biasRaw.size();
+                dstOp->type = MNN::OpType_MAX;
+                return;
             }
         }
         dstOp->main.value = convolution2DQuant.release();
@@ -295,7 +371,7 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         }
 
         // weight
-        if (tfliteModelBuffer[weightTensor->buffer]->data.data() == nullptr) {
+        if (weightBuffer->data.data() == nullptr) {
             //MNN_ERROR("Has not const weight data for tflite convolution\n");
             dstOp->main.value = convolution2DFloat.release();
             return;
@@ -305,13 +381,13 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         switch (weightTensor->type) {
             case tflite::TensorType_FLOAT32:
             {
-                auto originalWeightPtr = reinterpret_cast<const float*>(tfliteModelBuffer[weightTensor->buffer]->data.data());
+                auto originalWeightPtr = reinterpret_cast<const float*>(weightBuffer->data.data());
                 convertDataFormatTflite(originalWeightPtr, weightData.data(), kh, kw, ci, co);
                 break;
             }
             case tflite::TensorType_UINT8:
             {
-                auto originalWeightPtr = reinterpret_cast<const int8_t*>(tfliteModelBuffer[weightTensor->buffer]->data.data());
+                auto originalWeightPtr = reinterpret_cast<const int8_t*>(weightBuffer->data.data());
                 convertDataFormatTfliteDequant<int8_t>(originalWeightPtr, weightData.data(), kh, kw, ci, co, weightTensor->quantization.get());
                 break;
             }
@@ -322,9 +398,24 @@ void Conv2DTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>
         // bias
         std::vector<float> biasData(co, 0.0f);
         if (inputSize == 3) {
-            const auto& biasTensor = tfliteTensors[tfliteOp->inputs[2]];
-            auto biasDataPtr       = reinterpret_cast<const float*>(tfliteModelBuffer[biasTensor->buffer]->data.data());
-            ::memcpy(biasData.data(), biasDataPtr, sizeof(float) * co);
+            const auto* biasTensor = tfliteAt(tfliteTensors, tfliteOp->inputs[2], "tensor");
+            if (nullptr == biasTensor) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto* biasBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(biasTensor->buffer), "buffer");
+            if (nullptr == biasBuffer) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto& biasRaw = biasBuffer->data;
+            if (biasRaw.data() != nullptr && biasRaw.size() >= sizeof(float) * co) {
+                ::memcpy(biasData.data(), biasRaw.data(), sizeof(float) * co);
+            } else {
+                DLOG(ERROR) << "CONV_2D bias buffer needs " << (sizeof(float) * co) << " bytes, got " << biasRaw.size();
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
         }
         convolution2DFloat->bias = biasData;
         dstOp->main.value = convolution2DFloat.release();
@@ -353,9 +444,13 @@ void TransposeConvTflite::run(MNN::OpT *dstOp, const std::unique_ptr<tflite::Ope
 
     DCHECK(!quantizedModel) << "TransposeConv not support quantized model";
 
-    // 3|4 inputs: output shape, weight, input tensor, (bias)
+    // TFLite TRANSPOSE_CONV operands: 0=output_shape, 1=weights, 2=input tensor, 3=bias (optional).
     const int inputSize = tfliteOp->inputs.size();
-    DCHECK(inputSize == 3 || inputSize == 4) << "tflite Conv2D input ERROR! ";
+    if (inputSize != 3 && inputSize != 4) {
+        DLOG(ERROR) << "TRANSPOSE_CONV expects 3 or 4 inputs, got " << inputSize;
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     /*
      enum Padding : byte { SAME, VALID }
      table TransposeConvOptions {
@@ -365,32 +460,81 @@ void TransposeConvTflite::run(MNN::OpT *dstOp, const std::unique_ptr<tflite::Ope
      }
      */
     const auto& tfliteConvOption = tfliteOp->builtin_options.AsTransposeConvOptions();
+    if (nullptr == tfliteConvOption) {
+        DLOG(ERROR) << "TRANSPOSE_CONV operator carries no TransposeConvOptions";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     // weight index
     const int weightIndex    = tfliteOp->inputs[1];
-    const auto& weightTensor = tfliteTensors[weightIndex];
+    const auto* weightTensor = tfliteAt(tfliteTensors, weightIndex, "tensor");
+    if (nullptr == weightTensor) {
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     // co kh kw ci
     const auto& weightShape = weightTensor->shape;
-    DCHECK(weightShape.size() == 4) << "Conv2D weight ERROR!";
+    if (4 != weightShape.size()) {
+        DLOG(ERROR) << "TRANSPOSE_CONV weight shape is not 4-D";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     const int co         = weightShape[0];
     const int kh         = weightShape[1];
     const int kw         = weightShape[2];
     const int ci         = weightShape[3];
-    const int weightSize = co * kh * kw * ci;
+    if (co <= 0 || kh <= 0 || kw <= 0 || ci <= 0) {
+        DLOG(ERROR) << "TRANSPOSE_CONV weight shape contains non-positive dimension";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
+    const int32_t weightDims[4] = {co, kh, kw, ci};
+    int weightSize = 0;
+    if (!computeTfliteWeightSize(weightDims, 4, &weightSize)) {
+        DLOG(ERROR) << "TRANSPOSE_CONV weight size overflow: " << co << "x" << kh << "x" << kw << "x" << ci;
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     {
-        auto convolution2DFloat = new MNN::Convolution2DT;
+        std::unique_ptr<MNN::Convolution2DT> convolution2DFloat(new MNN::Convolution2DT);
         // weight
         std::vector<float> weightData;
         weightData.resize(weightSize);
-        auto originalWeightPtr = reinterpret_cast<const float*>(tfliteModelBuffer[weightTensor->buffer]->data.data());
-        convertDataFormatTflite(originalWeightPtr, weightData.data(), kh, kw, ci, co, true);
+        const auto* weightBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(weightTensor->buffer), "buffer");
+        if (nullptr == weightBuffer) {
+            dstOp->type = MNN::OpType_MAX;
+            return;
+        }
+        auto originalWeightPtr = reinterpret_cast<const float*>(weightBuffer->data.data());
+        if (!convertDataFormatTflite(originalWeightPtr, weightData.data(), kh, kw, ci, co, true)) {
+            DLOG(ERROR) << "TRANSPOSE_CONV weight data is invalid";
+            dstOp->type = MNN::OpType_MAX;
+            return;
+        }
         convolution2DFloat->weight = weightData;
         // bias
         std::vector<float> biasData(co, 0.0f);
         if (inputSize == 4) {
-            const auto& biasTensor = tfliteTensors[tfliteOp->inputs[2]];
-            auto biasDataPtr       = reinterpret_cast<const float*>(tfliteModelBuffer[biasTensor->buffer]->data.data());
-            if(biasDataPtr){
-                ::memcpy(biasData.data(), biasDataPtr, sizeof(float) * co);
+            // Bias is operand 3, not operand 2: operand 2 is the activation tensor, which is
+            // usually a graph input and therefore has no constant buffer at all.
+            const auto* biasTensor = tfliteAt(tfliteTensors, tfliteOp->inputs[3], "tensor");
+            if (nullptr == biasTensor) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto* biasBuffer = tfliteAt(tfliteModelBuffer, static_cast<int>(biasTensor->buffer), "buffer");
+            if (nullptr == biasBuffer) {
+                dstOp->type = MNN::OpType_MAX;
+                return;
+            }
+            const auto& biasRaw = biasBuffer->data;
+            if (biasRaw.data() != nullptr && biasRaw.size() >= sizeof(float) * co) {
+                ::memcpy(biasData.data(), biasRaw.data(), sizeof(float) * co);
+            } else {
+                DLOG(ERROR) << "TRANSPOSE_CONV bias buffer needs " << (sizeof(float) * co) << " bytes, got "
+                            << biasRaw.size();
+                dstOp->type = MNN::OpType_MAX;
+                return;
             }
         }
         convolution2DFloat->bias = biasData;
@@ -413,7 +557,7 @@ void TransposeConvTflite::run(MNN::OpT *dstOp, const std::unique_ptr<tflite::Ope
         common->padMode     = MNN::PadMode_SAME;
         common->hasOutputShape = true;
 
-        dstOp->main.value = convolution2DFloat;
+        dstOp->main.value = convolution2DFloat.release();
     }
 
     // set input output index
@@ -440,11 +584,16 @@ void FullConnectedTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::Ope
                        const std::vector<std::unique_ptr<tflite::TensorT>>& tfliteTensors,
                        const std::vector<std::unique_ptr<tflite::BufferT>>& tfliteModelBuffer,
                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, int quantizedModel) {
+    const auto& option = tfliteOp->builtin_options.AsFullyConnectedOptions();
+    if (nullptr == option) {
+        DLOG(ERROR) << "FULLY_CONNECTED operator carries no FullyConnectedOptions";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
     dstOp->main.value = new MNN::ExtraT;
     auto dstP = dstOp->main.AsExtra();
     dstP->engine = "Tflite";
     dstP->type = "FULL_CONNECT";
-    const auto& option = tfliteOp->builtin_options.AsFullyConnectedOptions();
     dstP->attr.resize(3);
     dstP->attr[0].reset(new MNN::AttributeT);
     dstP->attr[0]->key = "keep_num_dims";

@@ -1,0 +1,306 @@
+{
+  "branch": "integrate/mnn-master-20261018",
+  "baseline_commit": "1fb0b954b87f4fa153d0a0d36ec4f5ff63dd096d",
+  "mnn_upstream_commit": "dbf9ba61b08106a3b43426e295d1a29cb41cc8fe",
+  "host_validation_passed": true,
+  "device_executed": false,
+  "complete_hap_built": false,
+  "native": {
+    "platform": "OpenHarmony API20 AArch64",
+    "hiai_enabled": true,
+    "llm_omni_enabled": true,
+    "no_host_runpath": true,
+    "libMNN_sha256": "82b781fb1b70e84e297e3b73987bc4784dfee1b82f1e2933489b55053d3dce86"
+  },
+  "tests": {
+    "cpu_ops_passed": 304,
+    "cpu_attention_subset_passed": 13,
+    "setup_pipeline_passed": 32,
+    "gptq_export_compatibility_passed": 5,
+    "nnrt_call_substitute_tests_passed": 9,
+    "hybrid_protocol_passed": 1
+  },
+  "app_compile": {
+    "arm64_objects_checked": 9,
+    "required_mnn_symbols": 70,
+    "missing": [],
+    "complete_app_linked": false
+  },
+  "quantization": {
+    "cpu_language": "original W8/group128 GPTQ",
+    "online_vision": "original W8/group128 GPTQ",
+    "offline_vision": "frozen W4A16/group64 checkpoint",
+    "language_matrices": 196,
+    "online_visual_matrices": 144,
+    "weight_codes_exact": 340,
+    "scale_arrays_exact": 340,
+    "language_scale_storage": "FP32",
+    "scale_layout_checked": true,
+    "llm_weight_file_unchanged_sha256": "23c072fb9a870812cdf4c859bf2fe57b3b9594852fb8794dc34dbf62c0c29095",
+    "offline_vision_weight_file_unchanged_sha256": "7699638e2bbbe7e45aba1b6defe7e92f520d77af208bccf8d4d20b3e067f0cd4"
+  },
+  "offline_decode_steps_per_case": 16,
+  "online_reference_scope": "Both old and newly exported MNN models run on merged CPU runtime with corrected visual attention metadata; HiAI is not executed.",
+  "checks": {
+    "offline_1_image": {
+      "baseline": "/tmp/mobi-mnn-validation/baseline-offline-decode-1",
+      "candidate": "/tmp/mobi-mnn-validation/final-offline-1",
+      "device_executed": false,
+      "files": {
+        "tokens.bin": {
+          "elements": 167,
+          "baseline_sha256": "98c4b8b02cea43f5648b6806cb2a835c0e5abd3fa9a0489db4f59c200695d9f9",
+          "candidate_sha256": "98c4b8b02cea43f5648b6806cb2a835c0e5abd3fa9a0489db4f59c200695d9f9",
+          "exact": true
+        },
+        "logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "10457f0c729d04c544db5c3d58ed097af70bb043d73ff47e9684aa5f39640e74",
+          "candidate_sha256": "10457f0c729d04c544db5c3d58ed097af70bb043d73ff47e9684aa5f39640e74",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "generated.bin": {
+          "elements": 16,
+          "baseline_sha256": "9d7495ace0196f388043458f93b21da6db3f32e1704612a34e0ecfcbfaea2db5",
+          "candidate_sha256": "9d7495ace0196f388043458f93b21da6db3f32e1704612a34e0ecfcbfaea2db5",
+          "exact": true
+        },
+        "positions.bin": {
+          "elements": 501,
+          "baseline_sha256": "dbd31baba83fa3123b352509b3f9845bce6bc1ddf5c7d3bb156c6c912bc31059",
+          "candidate_sha256": "dbd31baba83fa3123b352509b3f9845bce6bc1ddf5c7d3bb156c6c912bc31059",
+          "exact": true
+        },
+        "embeddings.bin": {
+          "elements": 342016,
+          "baseline_sha256": "8b5d9365ce04a90a26aa57663cdb9db0be82c6907b96e6e7c03c618da64a1d1e",
+          "candidate_sha256": "8b5d9365ce04a90a26aa57663cdb9db0be82c6907b96e6e7c03c618da64a1d1e",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "reference_logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "10457f0c729d04c544db5c3d58ed097af70bb043d73ff47e9684aa5f39640e74",
+          "candidate_sha256": "10457f0c729d04c544db5c3d58ed097af70bb043d73ff47e9684aa5f39640e74",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "decode_logits.bin": {
+          "elements": 2430976,
+          "baseline_sha256": "a7b3345e87a8da9b855a81113ca5f76655bbfd8d8bc4c2da8b05420a7f7ae761",
+          "candidate_sha256": "a7b3345e87a8da9b855a81113ca5f76655bbfd8d8bc4c2da8b05420a7f7ae761",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        }
+      },
+      "passed": true
+    },
+    "offline_2_image": {
+      "baseline": "/tmp/mobi-mnn-validation/baseline-offline-decode-2",
+      "candidate": "/tmp/mobi-mnn-validation/final-offline-2",
+      "device_executed": false,
+      "files": {
+        "tokens.bin": {
+          "elements": 321,
+          "baseline_sha256": "83a3ac232fe63be202ed20efbac06b8ba6fbb55e4e3a1fa4f62b8f768eca73bd",
+          "candidate_sha256": "83a3ac232fe63be202ed20efbac06b8ba6fbb55e4e3a1fa4f62b8f768eca73bd",
+          "exact": true
+        },
+        "logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "cdc21a3175e10044062d14f497e5781a753d826798199c65afc65294508efefa",
+          "candidate_sha256": "cdc21a3175e10044062d14f497e5781a753d826798199c65afc65294508efefa",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "generated.bin": {
+          "elements": 16,
+          "baseline_sha256": "742fceee8bb6e087ca76fbf80de242b7548c9c6fc2856fa4927631ee34bf969d",
+          "candidate_sha256": "742fceee8bb6e087ca76fbf80de242b7548c9c6fc2856fa4927631ee34bf969d",
+          "exact": true
+        },
+        "positions.bin": {
+          "elements": 963,
+          "baseline_sha256": "dbcafaf1668dc7dd1b28f6e047253713efb525db7c3a0872854981213666e370",
+          "candidate_sha256": "dbcafaf1668dc7dd1b28f6e047253713efb525db7c3a0872854981213666e370",
+          "exact": true
+        },
+        "embeddings.bin": {
+          "elements": 657408,
+          "baseline_sha256": "9d0626d6ca7636269ed450bba9197197c6cd0042f85eca200e2955a86a7a6f98",
+          "candidate_sha256": "9d0626d6ca7636269ed450bba9197197c6cd0042f85eca200e2955a86a7a6f98",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "reference_logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "cdc21a3175e10044062d14f497e5781a753d826798199c65afc65294508efefa",
+          "candidate_sha256": "cdc21a3175e10044062d14f497e5781a753d826798199c65afc65294508efefa",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "decode_logits.bin": {
+          "elements": 2430976,
+          "baseline_sha256": "cfd9f4dda17ab5bdd6c7433ef2e71a2b5162a59e23a2259b50df9f6818d49fbc",
+          "candidate_sha256": "cfd9f4dda17ab5bdd6c7433ef2e71a2b5162a59e23a2259b50df9f6818d49fbc",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        }
+      },
+      "passed": true
+    },
+    "online_1_image": {
+      "baseline": "/tmp/mobi-mnn-validation/corrected-old-online-1",
+      "candidate": "/tmp/mobi-mnn-validation/final-online-1",
+      "device_executed": false,
+      "files": {
+        "tokens.bin": {
+          "elements": 184,
+          "baseline_sha256": "f271acabedfa9a6ad74a2c668f6cd5890592cd7bdfcea20e2236121a40e1d1b9",
+          "candidate_sha256": "f271acabedfa9a6ad74a2c668f6cd5890592cd7bdfcea20e2236121a40e1d1b9",
+          "exact": true
+        },
+        "logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "7b1e7b387097151b3b5dd0beab08650f6ac0e1c886e077bc323c3ba15d520673",
+          "candidate_sha256": "7b1e7b387097151b3b5dd0beab08650f6ac0e1c886e077bc323c3ba15d520673",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "generated.bin": {
+          "elements": 3,
+          "baseline_sha256": "78b59c0e77a210d05649aa50f4fe711a5399a5c398e2891cf53b11458c6a43c6",
+          "candidate_sha256": "78b59c0e77a210d05649aa50f4fe711a5399a5c398e2891cf53b11458c6a43c6",
+          "exact": true
+        }
+      },
+      "passed": true
+    },
+    "online_2_image": {
+      "baseline": "/tmp/mobi-mnn-validation/corrected-old-online-2",
+      "candidate": "/tmp/mobi-mnn-validation/final-online-2",
+      "device_executed": false,
+      "files": {
+        "tokens.bin": {
+          "elements": 355,
+          "baseline_sha256": "cdbc6e264fc7927152145ef568e69329391d98e65a47a646588fe6a22aa22714",
+          "candidate_sha256": "cdbc6e264fc7927152145ef568e69329391d98e65a47a646588fe6a22aa22714",
+          "exact": true
+        },
+        "logits.bin": {
+          "elements": 151936,
+          "baseline_sha256": "15bf97adde4e3d267afbcf91aee565c374d3a1df0a5ed0a332ebe7cb1e99fa7a",
+          "candidate_sha256": "15bf97adde4e3d267afbcf91aee565c374d3a1df0a5ed0a332ebe7cb1e99fa7a",
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "generated.bin": {
+          "elements": 3,
+          "baseline_sha256": "d51a82006a89c3c006f6e38686a2fcf1b19e389b7d17f6edde9b0148ecc0c559",
+          "candidate_sha256": "d51a82006a89c3c006f6e38686a2fcf1b19e389b7d17f6edde9b0148ecc0c559",
+          "exact": true
+        }
+      },
+      "passed": true
+    }
+  },
+  "visual_attention_oracle": {
+    "reference": "Independent FP64 softmax(Q K^T / sqrt(64)) V, all-visible mask",
+    "shape": [
+      1,
+      676,
+      16,
+      64
+    ],
+    "device_executed": false,
+    "baseline": {
+      "max_abs": 1.3716064534498322,
+      "relative_l2": 0.4587927606177047
+    },
+    "merged": {
+      "max_abs": 1.6583708744022374e-06,
+      "relative_l2": 2.127460738245506e-07
+    },
+    "baseline_vs_decoder_head128_scale": {
+      "relative_l2": 1.9810995023254262e-07,
+      "max_abs": 1.7474103819470344e-06
+    },
+    "finding": "Old CPU visual Attention used decoder head_dim=128 scale instead of vision head_dim=64; isolated runtime metadata restores the correct visual scale. This is not evidence that GPTQ weight values changed."
+  },
+  "frozen_visual_validation": {
+    "passed": true,
+    "device_tested": false,
+    "omc_executed": false,
+    "image": "/tmp/kirin_offline_npu2_verify/source.png",
+    "image_sha256": "714004819f065a9a4bb4fbdbb67dfe0749e3735c1b863eb5c400a4fbca6e7d50",
+    "checkpoint_sha256": "4ebd75fcb73613f9a7e9a3835fe9efb05899cb18e24b65b7c89ca6802043325e",
+    "reference_onnx_sha256": "d2e4ad274956734d141b13ec147b1c05c03bf95b1afc2a9d9be7e168d0fcf8b8",
+    "reference_external_data_sha256": {
+      "model.pb": "bba212c025fcd28dcffd5e066bad93592165536e1a9f4727aa94a6aaf7a922a8"
+    },
+    "native_onnx_sha256": "41d05c9f16c0af0815aabce55e4a27b6233d7ba04a449ef3f033e331d64e3c82",
+    "native_external_data_sha256": {
+      "native.pb": "fec647e29a0213daebdfab60f3e446dc231e7583ff295530aec59178250dab1b"
+    },
+    "parameters_sha256": "7f0b24c0d78722f9240bb931a3b3a0393ffe55bb0de42dd34a0322edf41aeb14",
+    "w4_lut_coverage_passed": true,
+    "encoded_matrices": 104,
+    "onnx_vs_frozen_quantized_hf": {
+      "image_embeddings": {
+        "relative_l2": 0.004639696554192566,
+        "max_abs": 0.04305696487426758,
+        "cosine": 0.9999892669460378
+      },
+      "deepstack_features": {
+        "relative_l2": 0.00673140033195492,
+        "max_abs": 0.10847902297973633,
+        "cosine": 0.9999773494110136
+      }
+    },
+    "fp32_vs_quantized_vision": {
+      "image_embeddings": {
+        "relative_l2": 0.15797999334998,
+        "max_abs": 1.641160488128662,
+        "cosine": 0.9874601965121341
+      },
+      "deepstack_0": {
+        "relative_l2": 0.07296564839662086,
+        "max_abs": 0.2874412536621094,
+        "cosine": 0.9973378083233942
+      },
+      "deepstack_1": {
+        "relative_l2": 0.1501013189106731,
+        "max_abs": 0.7155851721763611,
+        "cosine": 0.9888443078369744
+      },
+      "deepstack_2": {
+        "relative_l2": 0.2101212320986311,
+        "max_abs": 1.9043307304382324,
+        "cosine": 0.9779352879312802
+      }
+    },
+    "thresholds": {
+      "alignment_rtol": 0.01,
+      "quality_rtol": 0.3,
+      "min_cosine": 0.95
+    },
+    "scope": "One held-out image, image embeddings and each DeepStack; not an end-to-end quality benchmark"
+  },
+  "limitations": [
+    "No phone, HiAI IR execution, or OMC execution was tested.",
+    "Complete App linking/HAP needs proprietary HMS native CANNKit SDK components absent on this host.",
+    "Windows/BiSheng and other hardware backends were not tested.",
+    "These samples do not establish a full answer-quality or performance benchmark."
+  ]
+}

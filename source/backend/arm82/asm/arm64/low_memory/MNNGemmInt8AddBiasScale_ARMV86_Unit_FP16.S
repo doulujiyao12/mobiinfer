@@ -91,6 +91,19 @@
     fcvtn2 \d1\().8h, \s3\().4s
 .endm
 
+// Expand fp16 scale/sourceBias metadata (weightQuantInfoMode=1) into fp32 scale
+// (\sLo/\sHi) and final offset (\zLo/\zHi). Int8 weights are signed, so the packed
+// sourceBias IS the final offset (originOffset=0): widen only, no re-centering.
+// In-place widening: fcvtl2 reads the high halves before fcvtl overwrites the low.
+.macro EXPAND_QUANT_INFO_FP16_W8 sLo, sHi, zLo, zHi, wp
+    ld1 {\sLo\().8h}, [\wp], #16 // UNIT half scales
+    fcvtl2 \sHi\().4s, \sLo\().8h
+    fcvtl \sLo\().4s, \sLo\().4h
+    ld1 {\zLo\().8h}, [\wp], #16 // UNIT half sourceBias (final offset)
+    fcvtl2 \zHi\().4s, \zLo\().8h
+    fcvtl \zLo\().4s, \zLo\().4h
+.endm
+
 .macro REVERT_INPUT_DEQUANT_BIAS rg0, rg1, rg2, rg3
 mul \rg1, \rg2, \rg3
 sub \rg0, \rg0, \rg1
@@ -102,7 +115,8 @@ sub \rg0, \rg0, \rg1, LSL #5 // revert weight kernel sum
 .endm
 asm_function MNNGemmInt8AddBiasScale_ARMV86_Unit_FP16
 
-/* 
+/*
+Mirror of QuanPostTreatParameters in source/backend/cpu/compute/Int8FunctionsOpt.h; keep in sync.
 struct QuanPostTreatParameters {
     const float* scale;
     const float* biasFloat;
@@ -112,11 +126,15 @@ struct QuanPostTreatParameters {
     float roundValuePos = 0.5f;
     float roundValueNeg = -0.5f;
     float* srcKernelSum;
-    float* weightQuanBias;
+    float* weightKernelSum;
     float* fp32minmax;
     ssize_t blockNum = 1;
-    const int32_t* bias;
-    const float* extraScale = nullptr;
+    const int32_t* bias = nullptr;
+    const float* inputScale = nullptr;
+    const float* inputBias = nullptr;
+    float* accumBuffer = nullptr;
+    int32_t* indices = nullptr;
+    int32_t weightQuantInfoMode = 0; // #112: 0 FP32 scale/offset, 1 FP16 scale/sourceBias.
 };
 */
 
@@ -127,7 +145,7 @@ struct QuanPostTreatParameters {
 //Auto: x0:dst, x1:src, x2:weight, x3:src_depth_quad, x4:dst_step
 //x5:dst_depth_quad, x6: parameters, x7: realDstCount
 
-//Load from x6: x9: biasFloat, x8: srcKernelSum, x28: weightQuanBias, x14: fp32minmax
+//Load from x6: x9: biasFloat, x8: srcKernelSum, x28: weightKernelSum, x14: fp32minmax
 /* For FP16
 UNIT = 8;
 SRC_UNIT = 8;
@@ -152,6 +170,8 @@ lsl x22, x7, #3 // eDest * GEMM_INT8_SRC_UNIT
 ldr x23, [x6, #80]  // input scale
 ldr x27, [x6, #88]  // input bias
 ldr x10, [x6, #96]  // accumbuffer
+ldr w13, [x6, #112] // Metadata mode; keep it on the stack, x13 is the sz counter.
+str w13, [sp, #(16 * 9)]
 
 mov x15, x8      // input kernel sum
 mov x21, x23     // input dequant scale
@@ -242,10 +262,17 @@ LoopSzEnd_TILE_10:
     Int32ToFloat v16, v17, v18, v19
 
 Tile10Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (sz counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile10MetadataFP32
+    EXPAND_QUANT_INFO_FP16_W8 v20, v21, v25, v26, x2
+    b .LTile10MetadataReady
+.LTile10MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x2], #32  // scale
+    ld1 {v25.4s, v26.4s}, [x2], #32 // weight quan zeropoint
+.LTile10MetadataReady:
     ld1 {v22.4s, v23.4s}, [x8], #32 // x kernel sum
     ld1 {v24.d}[0], [x8], #8
-    ld1 {v25.4s, v26.4s}, [x2], #32 // weight quan zeropoint
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     MUL_SCALE v20, v8, v9, v12, v13
@@ -468,9 +495,16 @@ LoopSzEnd_TILE_8:
     Int32ToFloat v12, v13, v14, v15
 
 Tile8Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (sz counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile8MetadataFP32
+    EXPAND_QUANT_INFO_FP16_W8 v20, v21, v25, v26, x12
+    b .LTile8MetadataReady
+.LTile8MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.4s, v23.4s}, [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile8MetadataReady:
+    ld1 {v22.4s, v23.4s}, [x8] // x kernel sum
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     MUL_SCALE v20, v8, v9, v12, v13
@@ -639,9 +673,16 @@ LoopSzEnd_TILE_4:
     Int32ToFloat v4, v5, v6, v7
 
 Tile4Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (sz counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile4MetadataFP32
+    EXPAND_QUANT_INFO_FP16_W8 v20, v21, v25, v26, x12
+    b .LTile4MetadataReady
+.LTile4MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.4s}, [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile4MetadataReady:
+    ld1 {v22.4s}, [x8] // x kernel sum
     MUL_SCALE v20, v0, v1, v4, v5
     MUL_SCALE v21, v2, v3, v6, v7
     add x8, x8, x22, LSR #1
@@ -760,9 +801,16 @@ LoopSz_TILE_2:
     Int32ToFloat v0, v1, v2, v3
 
 Tile2Quan:
+    ldr w13, [sp, #(16 * 9)] // x13 (sz counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile2MetadataFP32
+    EXPAND_QUANT_INFO_FP16_W8 v20, v21, v25, v26, x12
+    b .LTile2MetadataReady
+.LTile2MetadataFP32:
     ld1 {v20.4s, v21.4s}, [x12], #32  // scale
-    ld1 {v22.d}[0], [x8] // x kernel sum
     ld1 {v25.4s, v26.4s}, [x12], #32 // weight quan zeropoint
+.LTile2MetadataReady:
+    ld1 {v22.d}[0], [x8] // x kernel sum
     fmul v0.4s, v0.4s, v20.4s
     fmul v1.4s, v1.4s, v20.4s
     fmul v2.4s, v2.4s, v21.4s
@@ -853,6 +901,11 @@ TILE_1:
 LoopDz_TILE_1:
     mov x11, x1 // src
     mov x19, #0
+    // running fp32 accumulator across blocks within this OC chunk -- replaces the
+    // [x10] AccumBuffer stack ping-pong.  v22/v23 are unused inside w8's TILE_1
+    // inner loop (only v2 / v8..v11 / v16..v19 are touched there).
+    movi v22.4s, #0 // oc:0-3 running accum
+    movi v23.4s, #0 // oc:4-7 running accum
 TILE1_BLOCKNUM:
     mov x13, x3 // src_depth_quad
 
@@ -878,49 +931,60 @@ LoopSzEnd_TILE_1:
     scvtf v26.4s, v26.4s
 
 Tile1Quan:
+    // v22/v23 hold the per-OC-chunk running fp32 accumulator (zeroed at LoopDz_TILE_1
+    // entry).  The [x10] AccumBuffer is gone for TILE_1: each block's dequant chain
+    // fmla's straight into v22/v23, so we save 1 ld + 1 st per block AND avoid the
+    // need for a first-block branch that the [x10]-based path required.
+    ldr w13, [sp, #(16 * 9)] // x13 (sz counter) is dead here; reloaded per block.
+    cmp w13, #1
+    bne .LTile1MetadataFP32
+    // v22/v23 accumulators and v25/v26 dot results stay live; the in-place
+    // widening touches only v0/v1/v8/v9, which the fp32 path loads fresh.
+    EXPAND_QUANT_INFO_FP16_W8 v0, v1, v8, v9, x12
+    b .LTile1MetadataReady
+.LTile1MetadataFP32:
     ld1 {v0.4s, v1.4s}, [x12], #32  // scale
-    ld1 {v6.s}[0], [x8] // x kernel sum
-    ld1 {v8.4s, v9.4s}, [x12], #32 // weight quan zeropoint
-    fmul v25.4s, v25.4s, v0.4s
-    fmul v26.4s, v26.4s, v1.4s
+    ld1 {v8.4s, v9.4s}, [x12], #32  // weight quan zeropoint
+.LTile1MetadataReady:
+    ld1 {v4.s}[0], [x23], x25       // input scale (loaded earlier for scale_eff fusion)
+    ld1 {v6.s}[0], [x8]             // x kernel sum
     add x8, x8, x22, LSR #1
 
-    ld1 {v4.s}[0], [x23], x25
-    fmul v25.4s, v25.4s, v4.s[0]
-    fmul v26.4s, v26.4s, v4.s[0]
+    // P1.2 scale_eff fusion: scale * input_scale off the v22/v23 critical path.
+    fmul v0.4s, v0.4s, v4.s[0]
+    fmul v1.4s, v1.4s, v4.s[0]
+
+    // Per-block dequant chain into v22/v23 directly.
+    fmla v22.4s, v25.4s, v0.4s      // v22 += accum_fp * scale_eff
+    fmla v23.4s, v26.4s, v1.4s
     TILE1_MLA:
-    MLA_WEIGHTZERO v25, v6, v8, 0 // tile:0, oc:0-3
-    MLA_WEIGHTZERO v26, v6, v9, 0 // tile:0, oc:4-7
+    MLA_WEIGHTZERO v22, v6, v8, 0   // v22 += zp * xks
+    MLA_WEIGHTZERO v23, v6, v9, 0
 
     cbz x27, TILE1_ADD_DSTV
-    ld1 {v6.s}[0], [x27], x25 // input dequant bias
-    ld1 {v8.4s, v9.4s}, [x28], #32 // weight kernel sum
-    MLA_WEIGHTZERO v25, v6, v8, 0 // tile:0, oc:0-3
-    MLA_WEIGHTZERO v26, v6, v9, 0 // tile:0, oc:4-7
+    ld1 {v6.s}[0], [x27], x25       // input dequant bias
+    ld1 {v8.4s, v9.4s}, [x28], #32  // weight kernel sum
+    MLA_WEIGHTZERO v22, v6, v8, 0   // v22 += wks * inputBias
+    MLA_WEIGHTZERO v23, v6, v9, 0
 
     TILE1_ADD_DSTV:
-    cbz x19, TILE1_TEMP_BUFFER
-    ld1 {v16.4s, v17.4s}, [x10]
-    fadd v25.4s, v25.4s, v16.4s
-    fadd v26.4s, v26.4s, v17.4s
+    // v22/v23 already hold the updated running accum.
 
     TILE1_TEMP_BUFFER:
     add x19, x19, #1
     cmp x19, x26
-    beq TILE1_POST
-    st1 {v25.4s, v26.4s}, [x10]
-    b TILE1_BLOCKNUM
+    bne TILE1_BLOCKNUM
 
     TILE1_POST:
     sub x24, x24, #1
     cbz x9, TILE1_CVT_FP16
     ld1 {v16.4s, v17.4s}, [x20], #32 // bias
-    fadd v25.4s, v25.4s, v16.4s
-    fadd v26.4s, v26.4s, v17.4s
+    fadd v22.4s, v22.4s, v16.4s
+    fadd v23.4s, v23.4s, v17.4s
 
     TILE1_CVT_FP16:
-    fcvtn v0.4h, v25.4s
-    fcvtn2 v0.8h, v26.4s
+    fcvtn v0.4h, v22.4s
+    fcvtn2 v0.8h, v23.4s
     cbz x14, TILE1_STORE
     fmax v0.8h, v0.8h, v29.8h
     fmin v0.8h, v0.8h, v31.8h

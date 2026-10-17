@@ -44,17 +44,24 @@ class ChatListComponent(private val context: Context,
         }
     }
     private lateinit var recyclerView: RecyclerView
-    private lateinit var linearLayoutManager: LinearLayoutManager
     private lateinit var adapter: ChatRecyclerViewAdapter
     private lateinit var emptyView: View
     private lateinit var emptyModelAvatarView: ModelAvatarView
     private lateinit var emptyMessageTextView: TextView
     private lateinit var btnScrollToBottom: View
     private var isUserScrolling: Boolean = false
-    private var forceBottomDuringStreaming: Boolean = false
     private var modelName:String? = null
     private var historyData: List<ChatDataItem>? = null
     private var onResumeAutoScrollListener: (() -> Unit)? = null
+    private val maintainBottomRunnable = Runnable {
+        if (!isUserScrolling) {
+            val remainingDistance = distanceFromBottomPx()
+            if (remainingDistance > 0) {
+                recyclerView.scrollBy(0, remainingDistance)
+            }
+            updateScrollToBottomButtonVisibility()
+        }
+    }
 
     init {
         setupRecyclerView()
@@ -97,8 +104,11 @@ class ChatListComponent(private val context: Context,
     private fun setupRecyclerView() {
         recyclerView = binding.recyclerView
         recyclerView.setItemAnimator(null)
-        linearLayoutManager = LinearLayoutManager(context)
-        recyclerView.setLayoutManager(linearLayoutManager)
+        // LinearLayoutManager falls back to anchoring on position 0 whenever
+        // updateAnchorFromChildren() fails, which a streaming item's height changes trigger
+        // routinely. stackFromEnd moves that fallback to the last item so the list cannot jump
+        // back to the top of the conversation.
+        recyclerView.setLayoutManager(LinearLayoutManager(context).apply { stackFromEnd = true })
         binding.layoutBottomContainer.addOnLayoutChangeListener { v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             val insets: WindowInsets? = v.rootWindowInsets
             val bottomInset = insets!!.systemWindowInsetBottom
@@ -112,7 +122,7 @@ class ChatListComponent(private val context: Context,
             override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
                 super.onScrollStateChanged(recyclerView, newState)
                 if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
-                    forceBottomDuringStreaming = false
+                    recyclerView.removeCallbacks(maintainBottomRunnable)
                 }
                 isUserScrolling = resolveUserScrollingState(isUserScrolling, newState, isAtBottom())
                 updateScrollToBottomButtonVisibility()
@@ -177,56 +187,40 @@ class ChatListComponent(private val context: Context,
         }
     }
 
-    private fun scrollToEnd() {
-        recyclerView.postDelayed({
-            val position = adapter.itemCount - 1
-            linearLayoutManager.scrollToPositionWithOffset(position, -9999)
-        }, 100)
-    }
-
     private fun scrollToBottom() {
         Log.d(TAG, "scrollToBottom")
         val position = adapter.itemCount - 1
         if (position >= 0) {
             recyclerView.post {
                 recyclerView.scrollToPosition(position)
-                recyclerView.post {
-                    linearLayoutManager.scrollToPositionWithOffset(position, -99999)
-                    recyclerView.post(object : Runnable {
-                        private var attempts = 0
+                recyclerView.post(object : Runnable {
+                    private var attempts = 0
 
-                        override fun run() {
-                            val remainingDistance = distanceFromBottomPx()
-                            if (remainingDistance <= scrollToBottomThresholdPx() || attempts >= 4) {
-                                updateScrollToBottomButtonVisibility()
-                                return
-                            }
-                            attempts += 1
-                            recyclerView.scrollBy(0, remainingDistance)
-                            recyclerView.post(this)
+                    override fun run() {
+                        val remainingDistance = distanceFromBottomPx()
+                        if (remainingDistance <= scrollToBottomThresholdPx() || attempts >= 4) {
+                            updateScrollToBottomButtonVisibility()
+                            return
                         }
-                    })
-                }
+                        attempts += 1
+                        recyclerView.scrollBy(0, remainingDistance)
+                        recyclerView.post(this)
+                    }
+                })
             }
         }
     }
 
     private fun resumeAutoScroll() {
         isUserScrolling = false
-        forceBottomDuringStreaming = true
         scrollToBottom()
         updateScrollToBottomButtonVisibility()
         onResumeAutoScrollListener?.invoke()
     }
 
     private fun maintainBottomDuringStreaming() {
-        recyclerView.post {
-            val remainingDistance = distanceFromBottomPx()
-            if (remainingDistance > 0) {
-                recyclerView.scrollBy(0, remainingDistance)
-            }
-            updateScrollToBottomButtonVisibility()
-        }
+        recyclerView.removeCallbacks(maintainBottomRunnable)
+        recyclerView.postOnAnimation(maintainBottomRunnable)
     }
 
     private fun updateScrollToBottomButtonVisibility() {
@@ -255,10 +249,18 @@ class ChatListComponent(private val context: Context,
             return 0
         }
 
-        val range = recyclerView.computeVerticalScrollRange()
-        val extent = recyclerView.computeVerticalScrollExtent()
-        val offset = recyclerView.computeVerticalScrollOffset()
-        return (range - extent - offset).coerceAtLeast(0)
+        // computeVerticalScrollRange() is only an estimate (laidOutArea / laidOutItemCount *
+        // totalItemCount), and a short user message next to a very tall streaming assistant
+        // message throws it off by an order of magnitude.
+        val layoutManager = recyclerView.layoutManager as? LinearLayoutManager
+        val lastItemView = layoutManager?.findViewByPosition(totalItemCount - 1)
+        val viewportBottom = recyclerView.height - recyclerView.paddingBottom
+        if (lastItemView != null) {
+            return (lastItemView.bottom - viewportBottom).coerceAtLeast(0)
+        }
+
+        // The last item is not laid out yet, so it sits below the viewport: advance one viewport.
+        return (viewportBottom - recyclerView.paddingTop).coerceAtLeast(0)
     }
 
     private fun addResponsePlaceholder() {
@@ -271,11 +273,7 @@ class ChatListComponent(private val context: Context,
     fun updateAssistantResponse(chatDataItem: ChatDataItem) {
         adapter.updateRecentItem(chatDataItem)
         if (!isUserScrolling) {
-            if (forceBottomDuringStreaming) {
-                maintainBottomDuringStreaming()
-            } else {
-                scrollToEnd()
-            }
+            maintainBottomDuringStreaming()
         }
         updateEmptyViewVisibility()
         updateScrollToBottomButtonVisibility()
@@ -283,7 +281,6 @@ class ChatListComponent(private val context: Context,
 
     fun onStartSendMessage(userData: ChatDataItem) {
         isUserScrolling = false
-        forceBottomDuringStreaming = false
         adapter.addItem(userData)
         addResponsePlaceholder()
         updateEmptyViewVisibility()

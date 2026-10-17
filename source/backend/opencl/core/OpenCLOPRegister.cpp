@@ -11,6 +11,7 @@ extern void ___OpenCLMatMulBufCreator__OpType_MatMul__BUFFER__();
 extern void ___OpenCLRasterBufCreator__OpType_Raster__BUFFER__();
 extern void ___OpenCLLayerNormBufCreator__OpType_LayerNorm__BUFFER__();
 extern void ___OpenCLDepthwiseConvolutionBufCreator__OpType_ConvolutionDepthwise__BUFFER__();
+extern void ___OpenCLTopKV2BufCreator__OpType_TopKV2__BUFFER__();
 extern void ___OpenCLInterpBufCreator__OpType_Interp__BUFFER__();
 extern void ___OpenCLBinaryBufCreator__OpType_Eltwise__BUFFER__();
 extern void ___OpenCLBinaryBufCreator__OpType_BinaryOp__BUFFER__();
@@ -31,7 +32,6 @@ extern void ___OpenCLUnaryBufCreator__OpType_TanH__BUFFER__();
 extern void ___OpenCLFuseBufCreator__OpType_Extra__BUFFER__();
 extern void ___OpenCLGridSampleBufCreator__OpType_GridSample__BUFFER__();
 extern void ___OpenCLScaleBufCreator__OpType_Scale__BUFFER__();
-extern void ___OpenCLTopKV2BufCreator__OpType_TopKV2__BUFFER__();
 #endif
 extern void ___OpenCLDepthwiseConvolutionCreator__OpType_ConvolutionDepthwise__IMAGE__();
 extern void ___OpenCLMatMulCreator__OpType_MatMul__IMAGE__();
@@ -47,6 +47,7 @@ extern void ___OpenCLRasterCreator__OpType_Raster__IMAGE__();
 extern void ___OpenCLFuseCreator__OpType_Extra__IMAGE__();
 extern void ___OpenCLLoopCreator__OpType_While__IMAGE__();
 extern void ___OpenCLTrainableParamCreator__OpType_TrainableParam__IMAGE__();
+extern void ___OpenCLTopKV2Creator__OpType_TopKV2__IMAGE__();
 extern void ___OpenCLReluCreator__OpType_ReLU__IMAGE__();
 extern void ___OpenCLReluCreator__OpType_PReLU__IMAGE__();
 extern void ___OpenCLReluCreator__OpType_ReLU6__IMAGE__();
@@ -64,11 +65,18 @@ extern void ___OpenCLInterpCreator__OpType_Interp__IMAGE__();
 extern void ___OpenCLGridSampleCreator__OpType_GridSample__IMAGE__();
 
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern void ___OpenCLRopeBufCreator__OpType_RoPE__BUFFER__();
 extern void ___OpenCLSelfAttentionBufCreator__OpType_FmhaV2__BUFFER__();
 extern void ___OpenCLSplitGeluBufCreator__OpType_SplitGeLU__BUFFER__();
 extern void ___OpenCLGroupNormBufCreator__OpType_GroupNorm__BUFFER__();
 extern void ___OpenCLLinearAttentionBufCreator__OpType_LinearAttention__BUFFER__();
 extern void ___OpenCLAttentionBufCreator__OpType_Attention__BUFFER__();
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+extern void ___OpenCLFusedProjBufCreator__OpType_FusedLinear__BUFFER__();
+#ifdef MNN_GATED_RMS_NORM
+extern void ___OpenCLGatedRMSNormBufCreator__OpType_GatedRMSNorm__BUFFER__();
+#endif
+#endif
 #endif
 void registerOpenCLOps() {
 #ifndef MNN_OPENCL_BUFFER_CLOSED
@@ -80,6 +88,7 @@ ___OpenCLMatMulBufCreator__OpType_MatMul__BUFFER__();
 ___OpenCLRasterBufCreator__OpType_Raster__BUFFER__();
 ___OpenCLLayerNormBufCreator__OpType_LayerNorm__BUFFER__();
 ___OpenCLDepthwiseConvolutionBufCreator__OpType_ConvolutionDepthwise__BUFFER__();
+___OpenCLTopKV2BufCreator__OpType_TopKV2__BUFFER__();
 ___OpenCLInterpBufCreator__OpType_Interp__BUFFER__();
 ___OpenCLBinaryBufCreator__OpType_Eltwise__BUFFER__();
 ___OpenCLBinaryBufCreator__OpType_BinaryOp__BUFFER__();
@@ -100,7 +109,6 @@ ___OpenCLUnaryBufCreator__OpType_TanH__BUFFER__();
 ___OpenCLFuseBufCreator__OpType_Extra__BUFFER__();
 ___OpenCLGridSampleBufCreator__OpType_GridSample__BUFFER__();
 ___OpenCLScaleBufCreator__OpType_Scale__BUFFER__();
-___OpenCLTopKV2BufCreator__OpType_TopKV2__BUFFER__();
 #endif
 ___OpenCLDepthwiseConvolutionCreator__OpType_ConvolutionDepthwise__IMAGE__();
 ___OpenCLMatMulCreator__OpType_MatMul__IMAGE__();
@@ -116,6 +124,7 @@ ___OpenCLRasterCreator__OpType_Raster__IMAGE__();
 ___OpenCLFuseCreator__OpType_Extra__IMAGE__();
 ___OpenCLLoopCreator__OpType_While__IMAGE__();
 ___OpenCLTrainableParamCreator__OpType_TrainableParam__IMAGE__();
+___OpenCLTopKV2Creator__OpType_TopKV2__IMAGE__();
 ___OpenCLReluCreator__OpType_ReLU__IMAGE__();
 ___OpenCLReluCreator__OpType_PReLU__IMAGE__();
 ___OpenCLReluCreator__OpType_ReLU6__IMAGE__();
@@ -133,11 +142,18 @@ ___OpenCLInterpCreator__OpType_Interp__IMAGE__();
 ___OpenCLGridSampleCreator__OpType_GridSample__IMAGE__();
 
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+___OpenCLRopeBufCreator__OpType_RoPE__BUFFER__();
 ___OpenCLSelfAttentionBufCreator__OpType_FmhaV2__BUFFER__();
 ___OpenCLSplitGeluBufCreator__OpType_SplitGeLU__BUFFER__();
 ___OpenCLGroupNormBufCreator__OpType_GroupNorm__BUFFER__();
 ___OpenCLLinearAttentionBufCreator__OpType_LinearAttention__BUFFER__();
 ___OpenCLAttentionBufCreator__OpType_Attention__BUFFER__();
+#ifndef MNN_OPENCL_BUFFER_CLOSED
+___OpenCLFusedProjBufCreator__OpType_FusedLinear__BUFFER__();
+#ifdef MNN_GATED_RMS_NORM
+___OpenCLGatedRMSNormBufCreator__OpType_GatedRMSNorm__BUFFER__();
+#endif
+#endif
 #endif
 }
 }

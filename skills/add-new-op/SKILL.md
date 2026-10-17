@@ -22,13 +22,15 @@ description: 为 MNN 框架新增算子。包含 Schema 定义、形状计算、
 
 > **严禁访问以下目录**：`schema/private/` 和 `source/internal/`，包含内部私有代码，**不得读取、修改或引用**。
 
+> **名字必须等于真实物理量**：新增或修改任何后端算子 / kernel 代码时，变量、字段、宏名指代的必须是代码里真正装的那个量——`blockSize` 是"块内元素数"还是"每行块数"、`step` 是元素数还是字节数、shape 门禁的自变量是通道数还是 tile 数。名字骗人不会报错（编译、对拍、单测都过），但后续基于它写的阈值、门控、分档会一起错。写完对着实际索引 / 指针算术复核一遍，不符就改名。
+
 ---
 
 ## 核心文件清单
 
 | 目录/文件 | 作用 | 何时修改 |
 |----------|------|---------|
-| `schema/default/MNN.fbs` | 算子类型和参数定义 | **每个新算子都需要** |
+| `schema/default/MNN.fbs` | 算子类型和参数定义（开源版） | **每个新算子都需要**；内部仓库实际生成走 `schema/private/`，计划开源发布的算子**两份都要改**，详见 `step1-schema.md` §1.5 |
 | `schema/default/CaffeOps.fbs` | Caffe 框架算子参数 | 有参数时 |
 | `schema/default/TensorflowOp.fbs` | TF 框架算子参数 | 有参数时 |
 | `source/shape/Shape*.cpp` | 形状（维度）计算 | 输出形状与输入不同时 |

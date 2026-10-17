@@ -41,6 +41,7 @@
             "ATAN2",
             "SUB",
             "MUL",
+            "MUL_SILU",
             "DIV",
             "POW",
             "VMAX",
@@ -268,6 +269,12 @@
             "LAYERNORM_SCALE"
         ]
     },
+    "norm_binary.comp": {
+        "useFP16": true,
+        "macro": [
+            "LAYERNORM_SCALE"
+        ]
+    },
     "argmax.comp": {
         "useFP16": true,
         "macro": [
@@ -371,6 +378,9 @@
     "attention_prefill_kblock_softmax_online.comp": {
         "useFP16": true
     },
+    "attention_prefill_kblock_softmax_online_subgroup.comp": {
+        "useFP16": true
+    },
     "attention_prefill_kblock_qkv_acc.comp": {
         "useFP16": true
     },
@@ -380,10 +390,28 @@
     "attention_prefill_kblock_finalize.comp": {
         "useFP16": true
     },
+    "attention_prefill_coop_qk.comp": {
+        "useFP16": true
+    },
+    "attention_prefill_coop_qkv.comp": {
+        "useFP16": true
+    },
+    "rope.comp": {
+        "useFP16": true
+    },
     "linear_attn_conv_silu.comp": {
         "useFP16": true
     },
     "linear_attn_conv_state_update.comp": {
+        "useFP16": true
+    },
+    "linear_attn_short_conv.comp": {
+        "useFP16": true
+    },
+    "linear_attn_short_conv_state_update.comp": {
+        "useFP16": true
+    },
+    "linear_attn_short_conv_output.comp": {
         "useFP16": true
     },
     "linear_attn_qkv_prep.comp": {
@@ -413,6 +441,9 @@
     "matmul_coop.comp": {
         "useFP16": true
     },
+    "matmul_coop_rm.comp": {
+        "useFP16": true
+    },
     "int4_weight_to_coop.comp": {
         "useFP16": true
     },
@@ -423,6 +454,18 @@
         "useFP16": true
     },
     "gemv_dequant_int4_nosubgroup.comp": {
+        "useFP16": true
+    },
+    "gemv_dequant_int2.comp": {
+        "useFP16": true
+    },
+    "gemv_dequant_int2_nosubgroup.comp": {
+        "useFP16": true
+    },
+    "gemv_dequant_int3.comp": {
+        "useFP16": true
+    },
+    "gemv_dequant_int3_nosubgroup.comp": {
         "useFP16": true
     },
     "gemv_dequant_int8.comp": {
@@ -440,10 +483,22 @@
     "int8_weight_to_pack.comp": {
         "useFP16": true
     },
+    "int2_weight_to_pack.comp": {
+        "useFP16": true
+    },
+    "int3_weight_to_pack.comp": {
+        "useFP16": true
+    },
     "conv1x1_int4_weight_prepare.comp": {
         "useFP16": false
     },
     "conv1x1_int8_weight_prepare.comp": {
+        "useFP16": false
+    },
+    "conv1x1_int2_weight_prepare.comp": {
+        "useFP16": false
+    },
+    "conv1x1_int3_weight_prepare.comp": {
         "useFP16": false
     },
     "conv1x1_quant_meta_prepare.comp": {
@@ -451,5 +506,41 @@
     },
     "gemm_m8n4.comp": {
         "useFP16": true
+    },
+    "conv1x1_int8_weight_sumK.comp": {
+        "useFP16": false
+    },
+    "conv1x1_int4_weight_sumK.comp": {
+        "useFP16": false
+    },
+    "dynamic_int4_to_int8_unpack.comp": {
+        "useFP16": false
+    },
+    "dynamic_quant_minmax.comp": {
+        "useFP16": true
+    },
+    "dynamic_quant_reduce_minmax.comp": {
+        "useFP16": true
+    },
+    "dynamic_quant_pack.comp": {
+        "useFP16": true
+    },
+    "dynamic_quant_reduce_sum.comp": {
+        "useFP16": false
+    },
+    "dynamic_w8a8_coop_gemm.comp": {
+        "useFP16": false
+    },
+    "dynamic_w8a8_coop_gemm_fused.comp": {
+        "useFP16": true
+    },
+    "dynamic_w8a8_dequant_correction.comp": {
+        "useFP16": true
+    },
+    "topkv2.comp": {
+        "useFP16": true,
+        "macro": [
+            "SORT_DESC"
+        ]
     }
 }

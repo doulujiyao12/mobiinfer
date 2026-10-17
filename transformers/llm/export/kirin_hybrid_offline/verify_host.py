@@ -30,7 +30,10 @@ def verify(a):
 
     def driver(mode, allowed=(0,)):
         with (a.output / (mode + '.log')).open('w') as f:
-            r = subprocess.run([str(a.driver), str(a.package / 'config.json'), str(a.output), mode], stdout=f, stderr=f)
+            command = [str(a.driver), str(a.package / 'config.json'), str(a.output), mode]
+            if a.decode_steps != 1:
+                command.append(str(a.decode_steps))
+            r = subprocess.run(command, stdout=f, stderr=f)
         if r.returncode not in allowed:
             raise RuntimeError(f'C++ {mode} failed ({r.returncode}): {a.output / (mode + ".log")}')
 
@@ -111,11 +114,17 @@ def verify(a):
     reference = np.fromfile(a.output / 'reference_logits.bin', np.float32)
     np.testing.assert_allclose(actual, reference, atol=1e-4, rtol=1e-5)
     generated = np.fromfile(a.output / 'generated.bin', np.int32)
-    assert len(generated) == 1 and generated[0] == int(reference.reshape(-1, cfg.text_config.vocab_size)[-1].argmax())
+    assert 1 <= len(generated) <= a.decode_steps
+    assert generated[0] == int(reference.reshape(-1, cfg.text_config.vocab_size)[-1].argmax())
+    if a.decode_steps != 1:
+        decode = np.fromfile(a.output / 'decode_logits.bin', np.float32)
+        assert decode.size == len(generated) * cfg.text_config.vocab_size
+        assert np.isfinite(decode).all()
     checks.update(tokens=len(ids), image_tokens=len(where), mrope='HF exact', embeddings='exact',
                   cpu_prefill_logits_max_abs=float(np.max(np.abs(actual-reference))),
                   cpu_prefill_logits_cosine=float(np.dot(actual, reference)/(np.linalg.norm(actual)*np.linalg.norm(reference))),
-                  first_token=int(generated[0]), first_piece=tokenizer.decode(generated),
+                  first_token=int(generated[0]), first_piece=tokenizer.decode(generated[:1]),
+                  decode_steps_captured=len(generated), generated_text=tokenizer.decode(generated),
                   retry_and_decode='passed; see run.log', omc_executed=False)
     checks['build_manifest_sha256'] = build_hash
     checks['visual_output_sha256'] = [hashlib.sha256(np.asarray(f,dtype=np.float32).tobytes()).hexdigest() for f in outputs]
@@ -128,5 +137,7 @@ if __name__ == '__main__':
     for name in ('driver','package','build','model','image','output'):
         p.add_argument('--'+name, type=Path, required=True)
     p.add_argument('--copies',type=int,choices=(1,2),default=1,help='Repeat the same image to validate multiple image spans')
+    p.add_argument('--decode-steps',type=int,choices=range(1,65),default=1,
+                   help='Greedy decode steps to capture for runtime-upgrade comparisons')
     p.add_argument('--vision-reference',type=Path,help='Reuse previously verified CPU vision outputs only after byte/hash checks')
     verify(p.parse_args())

@@ -224,6 +224,7 @@ def configure_extension_build():
     # llm include
     engine_include_dirs += [os.path.join(root_dir, "transformers", "llm", "engine", "include")]
     engine_include_dirs += [os.path.join(root_dir, "3rd_party")]
+    engine_include_dirs += [os.path.join(root_dir, "3rd_party", "half")]
     if has_numpy:
         engine_include_dirs += [np.get_include()]
 
@@ -312,6 +313,7 @@ def configure_extension_build():
     tools_include_dirs += [os.path.join(root_dir, "3rd_party",\
                                           "flatbuffers", "include")]
     tools_include_dirs += [os.path.join(root_dir, "3rd_party")]
+    tools_include_dirs += [os.path.join(root_dir, "3rd_party", "half")]
     tools_include_dirs += [os.path.join(root_dir, "3rd_party", "imageHelper")]
     tools_include_dirs += [os.path.join(root_dir, "source", "core")]
     tools_include_dirs += [os.path.join(root_dir, "schema", "current")]
@@ -462,7 +464,7 @@ if __name__ == '__main__':
         download_url='https://github.com/alibaba/MNN',
         author='alibaba MNN Team',
         author_email='lichuan.wlc@alibaba-inc.com',
-        python_requires='>=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*',
+        python_requires='>=3.8',
         # PyPI package information.
         classifiers=[
             'Development Status :: 5 - Production/Stable',
@@ -471,10 +473,13 @@ if __name__ == '__main__':
             'Intended Audience :: Science/Research',
             'License :: OSI Approved :: BSD License',
             'Programming Language :: C++',
-            'Programming Language :: Python :: 2.7',
-            'Programming Language :: Python :: 3.5',
-            'Programming Language :: Python :: 3.6',
-            'Programming Language :: Python :: 3.7',
+            'Programming Language :: Python :: 3.8',
+            'Programming Language :: Python :: 3.9',
+            'Programming Language :: Python :: 3.10',
+            'Programming Language :: Python :: 3.11',
+            'Programming Language :: Python :: 3.12',
+            'Programming Language :: Python :: 3.13',
+            'Programming Language :: Python :: 3.14',
             'Topic :: Scientific/Engineering',
             'Topic :: Scientific/Engineering :: Mathematics',
             'Topic :: Scientific/Engineering :: Artificial Intelligence',

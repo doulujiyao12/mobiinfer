@@ -4,12 +4,22 @@ from transformers import PreTrainedTokenizer, AutoTokenizer
 
 class LlmTokenizer(PreTrainedTokenizer):
     def __init__(self, tokenizer_path, model_type, **kwargs):
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True, use_fast=False)
-        except:
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True, use_fast=True)
+        prefer_fast = model_type in ('qwen3_vl', 'qwen3_vl_moe')
+        tokenizer = None
+        for use_fast in ([True, False] if prefer_fast else [False, True]):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_path, trust_remote_code=True, use_fast=use_fast
+                )
+                break
+            except Exception:
+                continue
+        if tokenizer is None:
+            raise RuntimeError(f'Failed to load tokenizer from {tokenizer_path}')
+        self.tokenizer = tokenizer
         self.tokenizer_path = tokenizer_path
         self.model_type = model_type
+        self.decode_buffer = []
         # stop_ids
         self.stop_ids = []
         self.stop_ids.append(self.tokenizer.eos_token_id)
@@ -24,14 +34,28 @@ class LlmTokenizer(PreTrainedTokenizer):
                 self.stop_ids.append(eot_id[1])
         except:
             pass
+        from collections.abc import Iterable
         if hasattr(self.tokenizer, 'generation_config') and self.tokenizer.generation_config is not None:
             eos_token_id = self.tokenizer.generation_config.eos_token_id
-            from collections.abc import Iterable
             if isinstance(eos_token_id, int):
                 self.stop_ids.append(eos_token_id)
             elif isinstance(eos_token_id, Iterable):
                 for id in eos_token_id:
                     self.stop_ids.append(id)
+        gen_cfg_path = os.path.join(tokenizer_path, 'generation_config.json')
+        if os.path.isfile(gen_cfg_path):
+            import json
+            try:
+                with open(gen_cfg_path, 'r') as f:
+                    gen_cfg = json.load(f)
+                eos_token_id = gen_cfg.get('eos_token_id')
+                if isinstance(eos_token_id, int):
+                    self.stop_ids.append(eos_token_id)
+                elif isinstance(eos_token_id, Iterable):
+                    for id in eos_token_id:
+                        self.stop_ids.append(id)
+            except Exception:
+                pass
         # gemma4: <turn|> (token 106) is end-of-turn
         try:
             turn_ids = self.tokenizer.encode('<turn|>', add_special_tokens=False)
@@ -72,26 +96,37 @@ class LlmTokenizer(PreTrainedTokenizer):
         return self.tokenizer.vocab_size
 
     def id_to_str(self, token_id):
+        token_id = int(token_id)
+        word = self._decode_token_ids(token_id)
+        if '\uFFFD' not in word:
+            return self.flush_decode_buffer() + word
+        # Smollm tokenizer can produce half of a Chinese character, so buffer
+        # token IDs until they form valid text. Bound retries so malformed bytes
+        # or a literal replacement character cannot swallow the rest of a reply.
+        self.decode_buffer.append(token_id)
+        buffer_txt = self._decode_token_ids(self.decode_buffer)
+        if not buffer_txt.endswith('\uFFFD'):
+            self.decode_buffer.clear()
+            return buffer_txt
+        if len(self.decode_buffer) >= 4:
+            # Keep the last three IDs for a possible four-byte UTF-8 character.
+            return self._decode_token_ids(self.decode_buffer.pop(0))
+        return ''
+
+    def _decode_token_ids(self, token_ids):
         try:
-            word = self.tokenizer.decode(int(token_id))
-        except:
-            def contains_replacement(text): return '\uFFFD' in text
-            def decode_id(token_id):
-                return self.tokenizer.convert_tokens_to_string(
-                        self.tokenizer._convert_id_to_token(int(token_id)))
-            def decode_ids(token_ids):
-                return self.tokenizer.convert_tokens_to_string(
-                        self.tokenizer.convert_ids_to_tokens(token_ids))
-            word = decode_id(int(token_id))
-            # Smollm tokenizer will produce half chinese character, using buffer to decode
-            if contains_replacement(word):
-                self.decode_buffer.append(token_id)
-                buffer_txt = decode_ids(self.decode_buffer)
-                if not contains_replacement(buffer_txt):
-                    word = buffer_txt
-                    self.decode_buffer.clear()
-                else:
-                    word = ''
+            return self.tokenizer.decode(token_ids)
+        except Exception:
+            tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            return self.tokenizer.convert_tokens_to_string(tokens)
+
+    def flush_decode_buffer(self):
+        if not self.decode_buffer:
+            return ''
+        word = self._decode_token_ids(self.decode_buffer)
+        self.decode_buffer.clear()
         return word
 
     @classmethod
@@ -177,11 +212,52 @@ class LlmTokenizer(PreTrainedTokenizer):
         file_path = os.path.join(save_directory, "tokenizer.mtok")
         MAGIC_NUMBER = 430
         PIPELINE = 4
+        POST_OP_SEQUENCE_A = 0
+        POST_OP_SPECIAL_TOKEN = 1
 
         def pack_str(s):
             if isinstance(s, str):
                 s = s.encode('utf-8')
             return struct.pack('<H', len(s)) + s
+
+        def extract_single_post_processor_ops(post_processor):
+            if not isinstance(post_processor, dict):
+                return []
+            ptype = post_processor.get('type', '')
+            if ptype == 'Sequence':
+                for child in post_processor.get('processors', []):
+                    ops = extract_single_post_processor_ops(child)
+                    if ops:
+                        return ops
+                return []
+            if ptype != 'TemplateProcessing':
+                return []
+
+            ops = []
+            special_token_map = post_processor.get('special_tokens', {})
+            for item in post_processor.get('single', []):
+                if not isinstance(item, dict) or len(item) != 1:
+                    return []
+                key, value = next(iter(item.items()))
+                if key == 'Sequence':
+                    if value.get('id') != 'A':
+                        return []
+                    ops.append((POST_OP_SEQUENCE_A, None))
+                    continue
+                if key == 'SpecialToken':
+                    ids = value.get('ids', [])
+                    if not ids:
+                        special_name = value.get('id')
+                        if isinstance(special_name, str):
+                            special_info = special_token_map.get(special_name, {})
+                            ids = special_info.get('ids', [])
+                    if not isinstance(ids, list):
+                        return []
+                    for token_id in ids:
+                        ops.append((POST_OP_SPECIAL_TOKEN, int(token_id)))
+                    continue
+                return []
+            return ops
 
         with open(file_path, "w", encoding="utf8") as fp:
             # Text header: magic number + type
@@ -198,7 +274,12 @@ class LlmTokenizer(PreTrainedTokenizer):
             prefix_list = []
             if hasattr(self.tokenizer, 'get_prefix_tokens'):
                 prefix_list = self.tokenizer.get_prefix_tokens()
-            if len(prefix_list) == 0:
+            # A single-sequence post-processor already adds its tokens on every
+            # engine-side encode(); probing encode('A') here would store them as
+            # prefix tokens again and apply them twice (e.g. MiniCPM5's
+            # TemplateProcessing '<s> A' produced a doubled BOS).
+            post_ops = extract_single_post_processor_ops(tj.get('post_processor'))
+            if len(prefix_list) == 0 and len(post_ops) == 0:
                 try:
                     ids = self.tokenizer.encode('A')
                     get_txt = self.tokenizer.decode(ids[-1])
@@ -516,6 +597,16 @@ class LlmTokenizer(PreTrainedTokenizer):
             bos_bytes = bos_token.encode('utf-8') if bos_token else b''
             fp.write(struct.pack('<H', len(bos_bytes)))
             fp.write(bos_bytes)
+
+            # --- Single-sequence post-processor program ---
+            # Preserve TemplateProcessing(single=...) so the C++ runtime can
+            # replay special-token insertions around sequence A.
+            post_single_ops = extract_single_post_processor_ops(tj.get('post_processor'))
+            fp.write(struct.pack('<H', len(post_single_ops)))
+            for op_type, token_id in post_single_ops:
+                fp.write(struct.pack('<B', op_type))
+                if op_type == POST_OP_SPECIAL_TOKEN:
+                    fp.write(struct.pack('<I', int(token_id)))
 
         return file_path
 

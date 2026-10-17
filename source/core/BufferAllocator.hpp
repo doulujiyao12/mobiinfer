@@ -9,6 +9,7 @@
 #ifndef BufferAllocator_hpp
 #define BufferAllocator_hpp
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <memory>
@@ -37,6 +38,7 @@ public:
     MemNode *left = nullptr, *right = nullptr;
     std::vector<MemNode*> children;
     std::vector<Tensor*> tensors;
+    DeferBufferAllocator* allocator = nullptr;
 };
 
 struct ChunkBySize {
@@ -60,6 +62,7 @@ public:
     size_t offset() const;
     bool invalid() const;
     void attach(Tensor* tensor);
+    MemNode* node() const { return mNode; }
     uint8_t* ptr() const {
         if (mNode) {
             return static_cast<uint8_t*>(mNode->base) + mNode->offset + second;

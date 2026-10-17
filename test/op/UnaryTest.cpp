@@ -17,6 +17,12 @@ using namespace MNN::Express;
 using namespace std;
 using namespace MNN;
 
+// Defined in test/backend/cpu/RVVAbsMaxTest.cpp. Exercises the RVV FP32 abs-max
+// kernel directly and checks that it is registered on the shared function table.
+// A direct kernel test alone cannot catch an unregistered C++ overload, so it
+// runs from this registered case.
+bool MNNTestRVVAbsMaxFunctions();
+
 static VARP _UnaryInt8(VARP x, UnaryOpOperation operation, std::vector<int8_t> buffer) {
     flatbuffers::FlatBufferBuilder builder(MNN_DEFAULT_FLATBUFFER_SIZE);
     auto bufferOffset = builder.CreateVector(buffer);
@@ -562,9 +568,10 @@ public:
         auto res = test<float, float>(MNN::Express::_Abs, "AbsTest", 0.01,
                     {-1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0}, {1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0},
                     {8}, {8});
-        return res && test<int32_t, int32_t>(MNN::Express::_Abs, "AbsTest", 0,
+        auto intRes = test<int32_t, int32_t>(MNN::Express::_Abs, "AbsTest", 0,
                                          {-1, -2, 3, 4, -1, -2, 3, 4}, {1, 2, 3, 4, 1, 2, 3, 4},
                                          {8}, {8});
+        return res && intRes && (MNNTestSuite::get()->pStaus.forwardType != MNN_FORWARD_CPU || MNNTestRVVAbsMaxFunctions());
     }
 };
 class NegativeTest : public UnaryTestCommon {
@@ -748,14 +755,51 @@ class SiluTest : public UnaryTestCommon {
 public:
     virtual ~SiluTest() = default;
     virtual bool run(int precision) {
-        int size = 32;
-        std::vector<float> data_in(size), data_out(size);
-        for (int i = 0; i < size; ++i) {
-            data_in[i] = 0.25 * i - 4;
-            data_out[i] = data_in[i] / (1 + expf(-data_in[i]));
+        // Basic: 32 values from -4 to +3.75
+        {
+            int size = 32;
+            std::vector<float> data_in(size), data_out(size);
+            for (int i = 0; i < size; ++i) {
+                data_in[i] = 0.25f * i - 4;
+                data_out[i] = data_in[i] / (1 + expf(-data_in[i]));
+            }
+            if (!test<float, float>(_Silu, "SiluTest_basic", 0.01,
+                        data_in, data_out, {size}, {size})) return false;
         }
-        return test<float, float>(_Silu, "SiluTest", 0.01,
-                    data_in, data_out, {size}, {size});
+        // Edge values: 0, large positive, large negative
+        {
+            std::vector<float> data_in = {0.0f, 100.0f, -100.0f, 1.0f, -1.0f, 0.001f, -0.001f};
+            int size = (int)data_in.size();
+            std::vector<float> data_out(size);
+            for (int i = 0; i < size; ++i) {
+                data_out[i] = data_in[i] / (1 + expf(-data_in[i]));
+            }
+            if (!test<float, float>(_Silu, "SiluTest_edge", 0.01,
+                        data_in, data_out, {size}, {size})) return false;
+        }
+        // Odd size: 37 elements to test vector tail handling
+        {
+            int size = 37;
+            std::vector<float> data_in(size), data_out(size);
+            for (int i = 0; i < size; ++i) {
+                data_in[i] = 0.3f * i - 5.5f;
+                data_out[i] = data_in[i] / (1 + expf(-data_in[i]));
+            }
+            if (!test<float, float>(_Silu, "SiluTest_odd", 0.01,
+                        data_in, data_out, {size}, {size})) return false;
+        }
+        // Large batch: 1024 elements
+        {
+            int size = 1024;
+            std::vector<float> data_in(size), data_out(size);
+            for (int i = 0; i < size; ++i) {
+                data_in[i] = 0.02f * i - 10.0f;
+                data_out[i] = data_in[i] / (1 + expf(-data_in[i]));
+            }
+            if (!test<float, float>(_Silu, "SiluTest_large", 0.01,
+                        data_in, data_out, {size}, {size})) return false;
+        }
+        return true;
     }
 };
 class AcoshTest : public UnaryTestCommon {
@@ -1099,10 +1143,15 @@ public:
                     {4}, {4}, scale, zeros, _CoshInt8);
     }
 };
+// Metal has no erf / erfc / erfinv unary kernel at all ("The Creator Don't support type
+// [UnaryOp]"). The float cases survive that through the CPU fallback, but on the quantized path
+// the output is left unwritten and compares as garbage: -5.82493e-20 against -0.910314 here,
+// 3.98259e+15 against 1.91031 for erfc, 1 against 0.370807 for erfinv (M4, master 7612655a22).
 class ErfTestInt8 : public UnaryTestCommon {
 public:
     virtual ~ErfTestInt8() = default;
     virtual bool run(int precision) {
+        MNNTEST_CPU_ONLY();
         float scale[2] = {0.0127, 0.0078}, zeros[2] = {1.0, 1.0};
         return test<float, float>(_Erf, "ErfTestInt8", 0.01,
                     {-1.2, 0., 0.4, 1.6}, {-0.91031396, 0., 0.42839235, 0.9763484},
@@ -1113,6 +1162,7 @@ class ErfcTestInt8 : public UnaryTestCommon {
 public:
     virtual ~ErfcTestInt8() = default;
     virtual bool run(int precision) {
+        MNNTEST_CPU_ONLY();
         float scale[2] = {0.0127, 0.02}, zeros[2] = {1.0, 1.0};
         return test<float, float>(_Erfc, "ErfcTestInt8", 0.01,
                     {-1.2, 0., 0.4, 1.6}, {1.910314, 1., 0.57160765, 0.02365161},
@@ -1123,6 +1173,7 @@ class ErfinvTestInt8 : public UnaryTestCommon {
 public:
     virtual ~ErfinvTestInt8() = default;
     virtual bool run(int precision) {
+        MNNTEST_CPU_ONLY();
         float scale[2] = {0.0128, 0.016}, zeros[2] = {1.0, 1.0};
         return test<float, float>(_Erfinv, "ErfinvTestInt8", 0.05,
                     {0, 0.4, 0.6, 0.9}, {0., 0.37080714, 0.5951161, 1.1630871},

@@ -10,6 +10,8 @@
 #import "backend/metal/MNNMetalContext.h"
 #import "backend/metal/MetalBackend.hpp"
 #import "LayerNormSimdGroupShader.hpp"
+#import "backend/metal/MetalEnv.hpp"
+#import "core/TensorUtils.hpp"
 
 #if MNN_METAL_ENABLED
 namespace MNN {
@@ -27,6 +29,7 @@ bool MetalLayerNorm::onClone(Backend* bn, const Op* op, Execution** dst) {
         return true;
     }
     *dst = new MetalLayerNorm(bn, mResource);
+    MNN_METAL_PROFILE_REGISTER_CLONE(bn, op, *dst);
     return true;
 }
 
@@ -49,6 +52,7 @@ std::shared_ptr<MetalLayerNorm::Resource> MetalLayerNorm::makeResource(Backend *
         auto externalSize = layernorm->external()->size();
         gamma_size = static_cast<int32_t>(externalInfo[1]) / sizeof(float);
     }
+    res->mGammaSize = gamma_size;
     if (gamma_size > 0) {
         res->mHasGammaBeta = true;
         res->mGammaBuffer.reset(Tensor::createDevice<uint8_t>({(int)(gamma_size * sizeof(float))}));
@@ -65,7 +69,7 @@ std::shared_ptr<MetalLayerNorm::Resource> MetalLayerNorm::makeResource(Backend *
         const float* gamma_data = layernorm->gamma()->data();
         auto gammaPtr = MetalBackend::getBuffer(res->mGammaBuffer.get());
         memcpy((uint8_t*)gammaPtr.first.contents + gammaPtr.second, (const void *)gamma_data, gamma_size * sizeof(float));
-        
+
         if (layernorm->beta()->size() != gamma_size) {
             MNN_ERROR("Size of gamma and beta are not match in MetalLayerNorm.\n");
         }
@@ -77,16 +81,58 @@ std::shared_ptr<MetalLayerNorm::Resource> MetalLayerNorm::makeResource(Backend *
     return res;
 }
 
+int MetalLayerNorm::rmsSimdGroups(int legacy) const {
+    // One row == one threadgroup. At prefill `mOutside` is the token count, so the
+    // dispatch already has plenty of threadgroups and a wider one only steals
+    // occupancy; at decode `mOutside` is 1 and the entire norm runs as a single
+    // threadgroup, which is where extra simdgroups buy real parallelism.
+    if (mOutside > 1) {
+        return legacy;
+    }
+    // Below this the row cannot keep even the legacy lanes busy, and the extra
+    // threadgroup barrier costs more than the split saves.
+    constexpr int kMinChannelUnit = 128;
+    if (mChannelUnit < kMinChannelUnit) {
+        return legacy;
+    }
+    // Keep the wide-row decode shape identical on M4 and M5.
+    return 8;
+}
+
+int MetalLayerNorm::rmsTokensPerGroup() const {
+    // One threadgroup per token wastes a threadgroup slot on 32 threads. Packing
+    // several tokens into one threadgroup keeps the per-simdgroup work and the
+    // reduction identical while cutting the threadgroup count by the same
+    // factor. Only pays once there are far more tokens than the pack width, so
+    // decode (mOutside == 1) stays on the one-threadgroup-per-token form.
+    constexpr int kMinOutside = 256;
+    if (mOutside < kMinOutside) {
+        return 1;
+    }
+    const int env = MetalEnv::get().lnRowParallel;
+    return (env >= 1 && env <= 32) ? env : 1;
+}
+
 ErrorCode MetalLayerNorm::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    mIsFused = false;
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
 
     auto input = inputs[0], output = outputs[0];
-    
+    auto c4 = TensorUtils::getDescribe(input)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4;
+
     mOutside = 1;
     mInside = 1;
     int rank = input->dimensions();
-    if (mResource->mGroup > 1) {
+    const bool channelNCHW = !c4 && rank == 4 && input->length(2) == 1 && input->length(3) == 1 &&
+                             mResource->mAxisSize == 1 && mResource->mGammaSize == input->length(1);
+    if (c4) {
+        mOutside = input->length(0);
+        mInside = input->length(1);
+    } else if (channelNCHW) {
+        mOutside = input->length(0);
+        mInside = input->length(1);
+    } else if (mResource->mGroup > 1) {
         mOutside = input->length(0) * mResource->mGroup;
         for (int i = 1; i < rank; i++) {
             mInside *= input->length(i);
@@ -109,136 +155,344 @@ ErrorCode MetalLayerNorm::onResize(const std::vector<Tensor *> &inputs, const st
     bool parallel = (mInside > 32) && ((mInside & 3) == 0);
     auto inside = parallel ? mInside/4 : mInside;
     auto rt = (MetalRuntime *)backend->runtime();
-    if(rt->supportSimdGroupReduce()) {
-        // basic marco info
-        std::string ftype = "float";
-        std::string ftype4 = "float4";
-        if (backend->useFp16InsteadFp32()) {
-            ftype = "half";
-            ftype4 = "half4";
-        }
 
-        MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
-        auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
-        option.preprocessorMacros = @{
-            @"ftype" : @(ftype.c_str()),
-            @"ftype4" : @(ftype4.c_str()),
-        };
-        std::vector<std::string> baseKeys = {"layernorm_sg_reduce", ftype};
-        if(mResource->mRMSNorm) {
-            // pretty much threads compute all inside dims in a threadgroup
-            if(mOutside / 512.0 * mInside / 512.0 > 1.0) {
+    if (c4) {
+        mIsNC4HW4 = true;
+        mChannelUnit = UP_DIV(mInside, 4);
+        if (inputs.size() == 2 && outputs.size() == 2) {
+            if(rt->supportSimdGroupReduce()) {
+                std::string ftype = "float";
+                std::string ftype4 = "float4";
+                if (backend->useFp16InsteadFp32()) {
+                    ftype = "half";
+                    ftype4 = "half4";
+                }
+
+                MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
+                option.preprocessorMacros = @{
+                    @"ftype" : @(ftype.c_str()),
+                    @"ftype4" : @(ftype4.c_str()),
+                };
+                std::vector<std::string> baseKeys = {"layernorm_sg_reduce", ftype};
+                if(mResource->mRMSNorm) {
+                    const int tokensPerTg = rmsTokensPerGroup();
+                    const bool rowParallel = tokensPerTg > 1;
+                    const bool tokenLane = MetalEnv::get().lnTokenLane && mOutside >= 32;
+                    const int simds = rowParallel ? tokensPerTg : rmsSimdGroups(2);
+                    const int sumReread = MetalEnv::get().lnSumReread ? 1 : 0;
+                    const char* fname = tokenLane    ? "binary_layernorm_c4_rms_tok_sg"
+                                      : rowParallel ? "binary_layernorm_c4_rms_row_sg"
+                                                    : "binary_layernorm_c4_rms_sg";
+                    auto keys = baseKeys;
+                    keys.emplace_back(fname);
+                    keys.emplace_back(std::to_string(simds));
+                    keys.emplace_back(std::to_string(sumReread));
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        auto rmsOption = [[MTLCompileOptions alloc] init];
+                        rmsOption.preprocessorMacros = @{
+                            @"ftype" : @(ftype.c_str()),
+                            @"ftype4" : @(ftype4.c_str()),
+                            @"LN_SIMDS" : @(simds),
+                            @"LN_SUM_REREAD" : @(sumReread),
+                        };
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, fname, rmsOption);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    if (tokenLane) {
+                        mThreads = std::make_pair(MTLSizeMake(1, UP_DIV(mOutside, simds * 32), 1), MTLSizeMake(simds * 32, 1, 1));
+                    } else if (rowParallel) {
+                        mThreads = std::make_pair(MTLSizeMake(1, UP_DIV(mOutside, simds), 1), MTLSizeMake(simds * 32, 1, 1));
+                    } else {
+                        mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(simds * 32, 1, 1));
+                    }
+                } else {
+                    auto keys = baseKeys;
+                    keys.emplace_back("binary_layernorm_c4_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "binary_layernorm_c4_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(64, 1, 1));
+                }
+            } else {
+                if(mResource->mRMSNorm) {
+                    mPipeline = [context pipelineWithName:@"binary_layernorm_c4_rms" fp16:backend->useFp16InsteadFp32()];
+                } else {
+                    mPipeline = [context pipelineWithName:@"binary_layernorm_c4" fp16:backend->useFp16InsteadFp32()];
+                }
+                mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake((NSUInteger)mChannelUnit, (NSUInteger)mOutside, 1)];
+            }
+        } else if(rt->supportSimdGroupReduce()) {
+            std::string ftype = "float";
+            std::string ftype4 = "float4";
+            if (backend->useFp16InsteadFp32()) {
+                ftype = "half";
+                ftype4 = "half4";
+            }
+
+            MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
+            auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
+            option.preprocessorMacros = @{
+                @"ftype" : @(ftype.c_str()),
+                @"ftype4" : @(ftype4.c_str()),
+            };
+            std::vector<std::string> baseKeys = {"layernorm_sg_reduce", ftype};
+            if(mResource->mRMSNorm) {
+                const int tokensPerTg = rmsTokensPerGroup();
+                const bool rowParallel = tokensPerTg > 1;
+                const int simds = rowParallel ? tokensPerTg : rmsSimdGroups(1);
+                const char* fname = rowParallel ? "layernorm_c4_rms_row_sg" : "layernorm_c4_rms_sg";
                 auto keys = baseKeys;
-                keys.emplace_back("layernorm_in_all_rms_sg");
+                keys.emplace_back(fname);
+                keys.emplace_back(std::to_string(simds));
                 auto pipeline = rt->findPipeline(keys);
                 if (nil == pipeline) {
-                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_in_all_rms_sg", option);
+                    auto rmsOption = [[MTLCompileOptions alloc] init];
+                    rmsOption.preprocessorMacros = @{
+                        @"ftype" : @(ftype.c_str()),
+                        @"ftype4" : @(ftype4.c_str()),
+                        @"LN_SIMDS" : @(simds),
+                    };
+                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, fname, rmsOption);
+                    rt->insertPipeline(keys, pipeline);
+                }
+                mPipeline = pipeline;
+                if (rowParallel) {
+                    mThreads = std::make_pair(MTLSizeMake(1, UP_DIV(mOutside, simds), 1), MTLSizeMake(simds * 32, 1, 1));
+                } else {
+                    mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(simds * 32, 1, 1));
+                }
+            } else {
+                auto keys = baseKeys;
+                keys.emplace_back("layernorm_c4_sg");
+                auto pipeline = rt->findPipeline(keys);
+                if (nil == pipeline) {
+                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_c4_sg", option);
                     rt->insertPipeline(keys, pipeline);
                 }
                 mPipeline = pipeline;
                 mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(32, 1, 1));
-            } else if(parallel) {
-                if(inside >= 16 && inside * mOutside >= 2048) {
-                    auto keys = baseKeys;
-                    keys.emplace_back("layernorm_x16_rms_sg");
+            }
+        } else {
+            if(mResource->mRMSNorm) {
+                mPipeline = [context pipelineWithName:@"layernorm_c4_rms" fp16:backend->useFp16InsteadFp32()];
+            } else {
+                mPipeline = [context pipelineWithName:@"layernorm_c4" fp16:backend->useFp16InsteadFp32()];
+            }
+            mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake((NSUInteger)mChannelUnit, (NSUInteger)mOutside, 1)];
+        }
+    } else {
+        mIsNC4HW4 = false;
+        mIsBinaryNCHW = inputs.size() == 2 && outputs.size() == 2 && channelNCHW;
+        if(rt->supportSimdGroupReduce()) {
+            // basic marco info
+            std::string ftype = "float";
+            std::string ftype4 = "float4";
+            if (backend->useFp16InsteadFp32()) {
+                ftype = "half";
+                ftype4 = "half4";
+            }
+
+            MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
+            auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
+            option.preprocessorMacros = @{
+                @"ftype" : @(ftype.c_str()),
+                @"ftype4" : @(ftype4.c_str()),
+            };
+            std::vector<std::string> baseKeys = {"layernorm_sg_reduce", ftype};
+            if (mIsBinaryNCHW) {
+                auto keys = baseKeys;
+                if (mResource->mRMSNorm) {
+                    keys.emplace_back("binary_layernorm_x4_rms_sg");
                     auto pipeline = rt->findPipeline(keys);
                     if (nil == pipeline) {
-                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x16_rms_sg", option);
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "binary_layernorm_x4_rms_sg", option);
                         rt->insertPipeline(keys, pipeline);
                     }
                     mPipeline = pipeline;
-                    mThreads = std::make_pair(MTLSizeMake(UP_DIV(inside, 4), mOutside, 1), MTLSizeMake(32, 1, 1));
                 } else {
-                    auto keys = baseKeys;
-                    keys.emplace_back("layernorm_x4_rms_sg");
+                    keys.emplace_back("binary_layernorm_x4_sg");
                     auto pipeline = rt->findPipeline(keys);
                     if (nil == pipeline) {
-                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x4_rms_sg", option);
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "binary_layernorm_x4_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                }
+                mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(64, 1, 1));
+            } else if(mResource->mRMSNorm) {
+                // pretty much threads compute all inside dims in a threadgroup
+                // Also use this path for small outside (e.g. LLM decode) to avoid
+                // redundant square_sum computation in layernorm_x4_rms_sg — but only
+                // when the alternative (x4_rms_sg) grid is too small to saturate the
+                // GPU. On Apple GPUs (~10 cores * 32 lanes), once UP_DIV(inside,4) *
+                // outside > 32 the x4 kernel already fills the SMs, so the cost of
+                // its duplicated square_sum is negligible compared to serializing
+                // through a single-simdgroup in_all_rms dispatch. Without this cap
+                // Qwen3-0.6B decode (outside=1, inside=1024, x4 grid=256) hits the
+                // in_all path and only lights up 32 lanes per RMSNorm, adding ~5%
+                // total decode latency.
+                const int mInsideSg = (mInside + 3) / 4;  // grid width for x4_rms_sg
+                const bool smallXforInAll = (mInsideSg * mOutside) <= 32;
+                if(mOutside / 512.0 * mInside / 512.0 > 1.0 ||
+                   (mOutside <= 4 && mInside > 128 && smallXforInAll)) {
+                    auto keys = baseKeys;
+                    keys.emplace_back("layernorm_in_all_rms_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_in_all_rms_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(32, 1, 1));
+                } else if(parallel) {
+                    if(inside >= 16 && inside * mOutside >= 2048) {
+                        auto keys = baseKeys;
+                        keys.emplace_back("layernorm_x16_rms_sg");
+                        auto pipeline = rt->findPipeline(keys);
+                        if (nil == pipeline) {
+                            pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x16_rms_sg", option);
+                            rt->insertPipeline(keys, pipeline);
+                        }
+                        mPipeline = pipeline;
+                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(inside, 4), mOutside, 1), MTLSizeMake(32, 1, 1));
+                    } else {
+                        auto keys = baseKeys;
+                        keys.emplace_back("layernorm_x4_rms_sg");
+                        auto pipeline = rt->findPipeline(keys);
+                        if (nil == pipeline) {
+                            pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x4_rms_sg", option);
+                            rt->insertPipeline(keys, pipeline);
+                        }
+                        mPipeline = pipeline;
+                        mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
+                    }
+                } else {
+                    auto keys = baseKeys;
+                    keys.emplace_back("layernorm_x1_rms_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x1_rms_sg", option);
                         rt->insertPipeline(keys, pipeline);
                     }
                     mPipeline = pipeline;
                     mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
                 }
-            } else {                    
-                auto keys = baseKeys;
-                keys.emplace_back("layernorm_x1_rms_sg");
-                auto pipeline = rt->findPipeline(keys);
-                if (nil == pipeline) {
-                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x1_rms_sg", option);
-                    rt->insertPipeline(keys, pipeline);
+            } else {
+                if(mOutside / 512.0 * mInside / 512.0 > 1.0) {
+                    auto keys = baseKeys;
+                    keys.emplace_back("layernorm_in_all_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_in_all_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(32, 1, 1));
+                } else if(parallel) {
+                    auto keys = baseKeys;
+                    keys.emplace_back("layernorm_x4_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x4_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
+                } else {
+                    auto keys = baseKeys;
+                    keys.emplace_back("layernorm_x1_sg");
+                    auto pipeline = rt->findPipeline(keys);
+                    if (nil == pipeline) {
+                        pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x1_sg", option);
+                        rt->insertPipeline(keys, pipeline);
+                    }
+                    mPipeline = pipeline;
+                    mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
                 }
-                mPipeline = pipeline;
-                mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
             }
         } else {
-            if(mOutside / 512.0 * mInside / 512.0 > 1.0) {
-                auto keys = baseKeys;
-                keys.emplace_back("layernorm_in_all_sg");
-                auto pipeline = rt->findPipeline(keys);
-                if (nil == pipeline) {
-                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_in_all_sg", option);
-                    rt->insertPipeline(keys, pipeline);
-                }
-                mPipeline = pipeline;
-                mThreads = std::make_pair(MTLSizeMake(1, mOutside, 1), MTLSizeMake(32, 1, 1));
-            } else if(parallel) {
-                auto keys = baseKeys;
-                keys.emplace_back("layernorm_x4_sg");
-                auto pipeline = rt->findPipeline(keys);
-                if (nil == pipeline) {
-                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x4_sg", option);
-                    rt->insertPipeline(keys, pipeline);
-                }
-                mPipeline = pipeline;
-                mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
-            } else {
-                auto keys = baseKeys;
-                keys.emplace_back("layernorm_x1_sg");
-                auto pipeline = rt->findPipeline(keys);
-                if (nil == pipeline) {
-                    pipeline = backend->makeComputePipelineWithSourceOption(gLayerNormSgReduce, "layernorm_x1_sg", option);
-                    rt->insertPipeline(keys, pipeline);
-                }
-                mPipeline = pipeline;
-                mThreads = std::make_pair(MTLSizeMake(inside, mOutside, 1), MTLSizeMake(32, 1, 1));
+            if (mIsBinaryNCHW) {
+                return NOT_SUPPORT;
             }
+            if(mResource->mRMSNorm){
+                mPipeline = [context pipelineWithName:parallel ? @"layernorm_x4_rms" : @"layernorm_x1_rms" fp16:backend->useFp16InsteadFp32()];
+            }else{
+                mPipeline = [context pipelineWithName:parallel ? @"layernorm_x4" : @"layernorm_x1" fp16:backend->useFp16InsteadFp32()];
+            }
+            mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake((NSUInteger)inside, (NSUInteger)mOutside, 1)];
         }
-    } else {
-        if(mResource->mRMSNorm){
-            mPipeline = [context pipelineWithName:parallel ? @"layernorm_x4_rms" : @"layernorm_x1_rms" fp16:backend->useFp16InsteadFp32()];
-        }else{
-            mPipeline = [context pipelineWithName:parallel ? @"layernorm_x4" : @"layernorm_x1" fp16:backend->useFp16InsteadFp32()];
-        }
-        mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake((NSUInteger)inside, (NSUInteger)mOutside, 1)];
     }
+
     return NO_ERROR;
 }
 
 void MetalLayerNorm::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
 
+    if (mIsFused) {
+#if MNN_METAL_OP_PROFILE
+        static_cast<MetalBackend *>(this->backend())->profileDropCurrentSample();
+#endif
+        return;  // LN is fused into Conv1x1 GEMV kernel — skip dispatch
+    }
+
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
     auto input = inputs[0], output = outputs[0];
-    [encoder setComputePipelineState:mPipeline];
-    MetalBackend::setTensor(input, encoder, 0);
-    MetalBackend::setTensor(output, encoder, 1);
-    [encoder setBuffer:mShapeBuffer offset:0 atIndex:2];
-    if (!mResource->mHasGammaBeta) {
-        // Set fake buffer to avoid validate
-        MetalBackend::setTensor(input, encoder, 3);
-        MetalBackend::setTensor(input, encoder, 4);
-    } else {
-        MetalBackend::setTensor(mResource->mGammaBuffer.get(), encoder, 3);
-        MetalBackend::setTensor(mResource->mBetaBuffer.get(), encoder, 4);
+
+    if (mPipeline == nil) {
+        MNN_ERROR("MetalLayerNorm: mPipeline is nil!\n");
+        return;
     }
 
+    [encoder setComputePipelineState:mPipeline];
+    if (inputs.size() == 2 && outputs.size() == 2 && (mIsNC4HW4 || mIsBinaryNCHW)) {
+        MetalBackend::setTensor(inputs[0], encoder, 0);
+        MetalBackend::setTensor(inputs[1], encoder, 1);
+        MetalBackend::setTensor(outputs[0], encoder, 2);
+        MetalBackend::setTensor(outputs[1], encoder, 3);
+        [encoder setBuffer:mShapeBuffer offset:0 atIndex:4];
+        if (!mResource->mHasGammaBeta) {
+            MetalBackend::setTensor(inputs[0], encoder, 5);
+            MetalBackend::setTensor(inputs[0], encoder, 6);
+        } else {
+            MetalBackend::setTensor(mResource->mGammaBuffer.get(), encoder, 5);
+            MetalBackend::setTensor(mResource->mBetaBuffer.get(), encoder, 6);
+        }
+    } else {
+        MetalBackend::setTensor(input, encoder, 0);
+        MetalBackend::setTensor(output, encoder, 1);
+        [encoder setBuffer:mShapeBuffer offset:0 atIndex:2];
+        if (!mResource->mHasGammaBeta) {
+            // Set fake buffer to avoid validate
+            MetalBackend::setTensor(input, encoder, 3);
+            MetalBackend::setTensor(input, encoder, 4);
+        } else {
+            MetalBackend::setTensor(mResource->mGammaBuffer.get(), encoder, 3);
+            MetalBackend::setTensor(mResource->mBetaBuffer.get(), encoder, 4);
+        }
+    }
     [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
     MNN_PRINT_ENCODER(context, encoder);
 }
 
 class MetalLayerNormCreator : public MetalBackend::Creator {
 public:
-    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend, const std::vector<Tensor *> &outputs) const {
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend,
+                                const std::vector<Tensor *> &outputs) const {
+        if (inputs.empty() || outputs.empty()) {
+            return nullptr;
+        }
+        const bool c4 = op->defaultDimentionFormat() == MNN_DATA_FORMAT_NC4HW4 ||
+                        TensorUtils::getDescribe(inputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4;
+        if (c4 && (inputs[0]->dimensions() < 2 ||
+                   (inputs[0]->length(1) > 0 && inputs[0]->length(1) % 4 != 0))) {
+            return nullptr;
+        }
         auto res = MetalLayerNorm::makeResource(backend, op->main_as_LayerNorm());
         if (nullptr == res) {
             return nullptr;

@@ -21,55 +21,92 @@
 namespace MNN {
 class AttentionBufExecution : public MetalExecution {
 public:
-    AttentionBufExecution(Backend *backend, bool kv_cache);
+    AttentionBufExecution(Backend* backend, bool kvCache, bool outputC4,
+                          std::shared_ptr<KVQuantParameter> kvQuantParam);
     virtual ~AttentionBufExecution() = default;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual ErrorCode onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
 
-    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
+    virtual void onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                          id<MTLComputeCommandEncoder> encoder) override;
+    // Encode replay: param-buffer contents and kv-dependent grids/bytes are
+    // patched per token; structural changes (decode-path switch, KV realloc)
+    // bail out to a normal encode + re-record (stale bindings are caught by
+    // replay validation).
+    virtual bool onReplayUpdate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override {
         if (nullptr == dst) {
             return true;
         }
-        auto exe = new AttentionBufExecution(bn, mKVCache);
-        if (bn->getMetaPtr() == backend()->getMetaPtr()) {
+        auto param = op->main_as_AttentionParam();
+        const bool kvShared = nullptr != param && param->kv_shared_layer_index() >= 0;
+        const bool canShare = mKVCache && bn->getMetaPtr() == mMeta && mMeta != nullptr;
+        if (kvShared && !canShare) {
+            // A private cache would hold the placeholder K/V instead of the owner's.
+            return false;
+        }
+        auto exe = new AttentionBufExecution(bn, mKVCache, mOutputC4, mKVQuantParameter);
+        if (canShare) {
             exe->mKVCacheManager = mKVCacheManager;
+            exe->mIsKVShared = kvShared;
         }
         *dst = exe;
+        MNN_METAL_PROFILE_REGISTER_CLONE(bn, op, *dst);
         return true;
     }
 
 private:
     void _init();
-    void compilerShader(const std::vector<Tensor *> &inputs);
+    void compilerShader(const std::vector<Tensor*>& inputs);
     void handleKVAllocMemory();
-    bool mKVCache;
+    // How many q-sequence pieces the three-stage prefill splits into, so that
+    // mTempQK + mTempSoftMax stay inside a byte budget. Requires mSeqLen and
+    // mKvMaxLen to be current. Always a power of two; 1 means no split.
+    int _resolveQseqSplit() const;
+    // Per-token encode-path decisions (split-kv / fused decode-qk-softmax /
+    // simd flags / causal flags) + KV memory bookkeeping. Shared by onEncode
+    // and onReplayUpdate so replayed tokens recompute identical state.
+    void _computePathFlags(const std::vector<Tensor*>& inputs);
+    void _writeCopyParam(const Tensor* key, const Tensor* value);
+    void _writeQKVParam(const std::vector<Tensor*>& inputs, int seqLenPiece);
+    void _writeSoftmaxParam(int seqLenPiece);
+    // Structural fingerprint of the current encode path; replay is only valid
+    // while it matches the value captured at the end of the last onEncode.
+    uint32_t _pathSignature() const;
+    uint32_t mLastEncodeSig = 0;
+    id<MTLBuffer> mLastKScaleBuffer = nil;
+    id<MTLBuffer> mLastVScaleBuffer = nil;
+    // K/V cache tensor identities at last encode. KV expansion DESTROYS the
+    // old cache tensors (mPastKey.reset), leaving dangling tensor pointers in
+    // the recorded bindings — onReplayUpdate must detect the swap by pointer
+    // identity (never dereferenced) before any recorded tensor is validated.
+    const Tensor* mLastKTensor = nullptr;
+    const Tensor* mLastVTensor = nullptr;
+    bool mKVCache = true;
     std::shared_ptr<MetalKVCacheManager> mKVCacheManager = nullptr;
+    // Reuses another layer's kvcache: reads the shared buffers, never writes or resizes them.
+    bool mIsKVShared = false;
+    int _pastKvLength() const;
     float mScale;
+    bool mOutputC4 = false;
     bool mShortSeq = false;
-    bool mUseSimpleAttention = false;
-    bool mUseFlashAttention = false;
-    bool mUseFlashAttentionFused = false;
-    std::shared_ptr<Tensor> mTempQK, mTempSoftMax, mTempOutput;
+    std::shared_ptr<Tensor> mTempQK, mTempSoftMax;
     int mNumHead = 0, mHeadDim = 0, mValueH = 0, mKvNumHead = 0;
     int mSeqLen;
     // for simd/tensor maxtrix load alignment
     int mKvAlignNum = 32;
     id<MTLComputePipelineState> mKernel_softmax = nil;
-    
+
     id<MTLComputePipelineState> mKernel_qk = nil;
     id<MTLComputePipelineState> mKernel_qkv = nil;
     id<MTLComputePipelineState> mKernel_copy = nil;
+    id<MTLComputePipelineState> mKernel_qk_softmax = nil;
     id<MTLComputePipelineState> mKernelPrefill_qk = nil;
     id<MTLComputePipelineState> mKernelPrefill_qkv = nil;
+    id<MTLComputePipelineState> mKernel_flashAttn = nil;
     id<MTLBuffer> mParamQKV;
     id<MTLBuffer> mParamSoftmax;
     id<MTLBuffer> mParamCopy;
 
-    id<MTLComputePipelineState> mKernel_flash_softmax = nil;
-    id<MTLComputePipelineState> mKernel_flash_matmul_qkv = nil;
-    id<MTLComputePipelineState> mKernel_flash_scale = nil;
-    id<MTLComputePipelineState> mKernel_flash_fused = nil;
-    
 private:
     KVMeta* mMeta;
     bool mQkSimdReduce = false;
@@ -78,21 +115,104 @@ private:
     bool mSftmSimdReduce = false;
     bool mQkvSimdReduce = false;
     bool mQkvSimdMatrix = false;
+    bool mDecodeQkSoftmax = false;
+    // Q-head-split decode_qk_softmax (auto: group_size==2, non-tensor-API
+    // device, kv>=512): grid.z = group_size, one threadgroup per q-head.
+    bool mQkQsplit = false;
+    bool mCopySimdReduce = false;
+    // Fused decode SDPA (roadmap #20 restart): decode_splitkv sweeps the whole
+    // kv range in one threadgroup per q-head group (a group is mSdpaQhPerTg q
+    // heads) and writes the final output itself, no reduce dispatch. Despite
+    // the name this flag gates the SDPA path as a whole -- mSdpaNtg > 1 turns
+    // the same path into the 2-pass form below. Default auto-on
+    // (MNN_METAL_DECODE_SDPA); =0 falls back to fused decode_qk_softmax
+    // (kv<=cap) / three-stage decode_qk (kv>cap). NSG device-tiered via
+    // MNN_METAL_DECODE_SDPA_NSG (0 = auto: tensor-API/M5 -> 32, M4-class ->
+    // clamp(256 / threadgroup count, 4, 32), further capped to 16 at kv<512).
+    bool mSdpaSinglePass = false;
+    int mSdpaNsg = 8;
+    // q heads per threadgroup (SDPA_QH_PER_TG). 1 = one TG per q head; >1 shares each
+    // KV row across a slice of the GQA group. MNN_METAL_DECODE_SDPA_QH_PER_TG.
+    int mSdpaQhPerTg = 1;
+    id<MTLComputePipelineState> mKernel_sdpa = nil;
+    // 2-pass split-KV (MNN_METAL_DECODE_SDPA_NTG > 1): the kv sweep is spread
+    // over mSdpaNtg threadgroups on grid.x, each publishing (S, m) + unnormalized
+    // O partials that mKernel_sdpaReduce recombines. mSdpaNtg == 1 keeps the
+    // single-pass dispatch and leaves the reduce pipeline / buffers unused.
+    int mSdpaNtg = 1;
+    id<MTLComputePipelineState> mKernel_sdpaReduce = nil;
+    std::shared_ptr<Tensor> mSdpaPartialOut;
+    std::shared_ptr<Tensor> mSdpaPartialSm;
+    // Fused prefill attention on the Metal tensor API (matmul2d + input
+    // cooperative tensors, single-simdgroup scope): S and O stay in registers
+    // across the whole KV sweep, so the O(n^2) score matrix never reaches
+    // global memory. MNN_METAL_PREFILL_FA_TENSORAPI (default on for causal models).
+    bool mFaTcPrefill = false;
+    bool mFaTcUnavailable = false;
+    // Head_dim slices spread over the dispatch grid's z axis (1 = whole head_dim
+    // in one threadgroup). Splitting shrinks the persistent O register footprint
+    // at the cost of recomputing QK per slice; see MetalEnv faTcDSplit.
+    int mFaTcDSplit = 1;
+    id<MTLComputePipelineState> mKernel_faTc = nil;
+    // M4 fused prefill (prefill_flash_attn_sg): STEEL-like Q=32 / KV=16@D>=128,
+    // S/O in simdgroup fragments, no mTempQK. Auto-on at seq>=1024 generally;
+    // the measured M4 Pro 32q/8kv/head_dim128 shape starts at seq512.
+    // MNN_METAL_PREFILL_FA_SG=1/0 force on/off.
+    bool mFaSgPrefill = false;
+    bool mFaSgUnavailable = false;
+    // FA-SG dispatch geometry, kept in sync with the compiled macro set:
+    // q rows per threadgroup and simdgroups per threadgroup.
+    int mFaSgBq = 32;
+    int mFaSgNsg = 4;
+    id<MTLComputePipelineState> mKernel_faSg = nil;
+    // Causal triangular dispatch for prefill_qk (simdgroup-matrix path):
+    // launch only the trapezoid of tiles at or below the causal diagonal;
+    // the CAUSAL_BOUND softmax reduces/writes only each row's causally-valid
+    // prefix (+24 zero pad) and prefill_qkv truncates its AV loop, so the
+    // upper-triangle region of mTempQK/mTempSoftMax is never read or written.
+    // Interior (fully-valid) tiles also skip per-element mask logic. Gated on
+    // mCausalLayout (standard causal mask, data-driven).
+    bool mQkCausalTri = false;
+    // CAUSAL_BOUND: bounded softmax + prefill_qkv AV early-exit. Independent of
+    // the QK-side CAUSAL_TRI trapezoid dispatch — this can activate on the
+    // tensor-API path (M5+) too, whereas CAUSAL_TRI is currently only wired for
+    // the simdgroup-matrix path (16x16 tile coord inversion). Also gated on
+    // mCausalLayout.
+    bool mCausalBound = false;
+    // Data-driven causal layout: true iff the mask is standard lower-triangular
+    // causal (scalar sentinel / absent + kv-cache), so DEFAULT_MASK causal
+    // arithmetic is valid and causal-tri / causal-bound / FA-v1 / faTc may
+    // engage. A real-tensor mask (SWA / prefix-LM / cross-attn) forces this
+    // false so every element is honored via ADD_MASK/SET_MASK. Detected in
+    // _computePathFlags from inputs[3]'s shape (mHasTensorMask), no env needed.
+    bool mCausalLayout = false;
+    // Fused prefill flash-attention. Currently opt-in via env var
+    // MNN_ENABLE_FLASH_ATTN_PREFILL=1 and gated to head_dim in {64,128},
+    // non-quant KV, causal-only. Kernel body TBD in follow-up commit; for now
+    // this flag routes through the existing prefill_qk/softmax/prefill_qkv
+    // pipeline (i.e. no behavior change) so the wiring and eligibility check
+    // can land independently of the fused shader.
+    bool mFlashAttnPrefill = false;
+
 private:
-    bool mHasMask = false;
+    // A per-element tensor mask is present (dims>=2): must be bound at buffer 7
+    // and read per position. A scalar mask (dims<2) is NOT a tensor mask -- it is
+    // llm.cpp's "no per-element mask needed" sentinel; causal-ness for that case
+    // comes from kv-cache (DEFAULT_MASK), tracked by mCausalLayout.
+    bool mHasTensorMask = false;
     bool mIsAddMask = false;
-    bool mCausalMaskScalar = false; // scalar mask input means causal mask
-    int mBatch, mKvSeqLen, mKvMaxLen;
+    int mBatch, mKvSeqLen, mKvMaxLen, mCurrentKvLen = 0;
     int mQseqSplitNum = 1;
     std::shared_ptr<Tensor> mTempK, mTempV;
-    std::shared_ptr<Tensor> mRunningStats; // [Batch, Head, SeqLen, 2]
-    std::shared_ptr<Tensor> mCorrectionScale; // [Batch, Head, SeqLen]
     bool mKvInDisk;
-    
+
+    // KV static quantization (only V is quantized on Metal)
+    std::shared_ptr<KVQuantParameter> mKVQuantParameter = nullptr;
+    bool mQuantValue = false; // whether V cache is stored as int8
+    bool mQuantKey = false;   // whether K cache is stored as int8
 };
 
 } // namespace MNN
-#endif/* MNN_SUPPORT_TRANSFORMER_FUSE */
-#endif/* MNN_METAL_ENABLED */
-#endif/* MetalAttention_hpp */
-
+#endif /* MNN_SUPPORT_TRANSFORMER_FUSE */
+#endif /* MNN_METAL_ENABLED */
+#endif /* MetalAttention_hpp */

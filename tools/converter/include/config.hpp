@@ -43,6 +43,8 @@ public:
     bool weightQuantAsymmetric = true;
     int weightQuantBlock = -1;
     bool useHQQ = false;
+    // Bit-width for quant scale/zero-point storage. 32 = fp32, 16 = fp16; future: 8/4.
+    int weightQuantScaleBit = 32;
     // The path of the model compression file that stores the int8 calibration table
     // or sparse parameters.
     std::string compressionParamsFile = "";
@@ -57,6 +59,12 @@ public:
     bool convertMatmulToConv = true;
     bool useGeluApproximation = true;
     bool transformerFuse = false;
+    bool transformerFuseC4 = true;
+    // Convert-time construction of FusedLinear projection groups (inside the
+    // FuseTransformerC4 pass, so they are also gated by transformerFuseC4).
+    bool transformerFuseQkvProj = true;
+    bool transformerFuseGateUpProj = true;
+    bool transformerFuseLnProj = true;
     bool allowCustomOp = false;
     bool groupConvNative = false;
     std::string customOpLibs = "";
@@ -67,6 +75,13 @@ public:
     bool mnn2json = false;
     bool dumpInfo = false;
     bool saveExternalData = false;
+#ifdef ENABLE_RKNN_CONVERT_MODE
+    bool rknnSidecar = false;
+    std::string rknnTarget = "";
+    std::string rknnPython = "";
+    std::string rknnScript = "";
+    std::string rknnOutputDir = "";
+#endif
     bool inSubGraph = false;
     // using external data when convert
     int64_t externalTreshold = 1024 * 64;
@@ -77,6 +92,7 @@ public:
     bool splitQuantBlock = false;
     // Enable verbose output for each optimization pass (like LLVM's -debug-pass)
     bool dumpPass = false;
+    int cliExitCode = 1;
 };
 
 #endif // CONFIG_HPP

@@ -36,12 +36,6 @@ void MNNPackedMatMulFP16(float* C, const float* A, const float* B, const size_t*
 // parameter: [aStride, l, h, cStride, bExtraStride]
 void MNNPackedMatMulRemainFP16(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 
-#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
-void MNNPackedMatMulFP16_int4(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemainFP16_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulFP16_int8(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemainFP16_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-#endif
 
 #ifdef __aarch64__
 #ifdef MNN_LOW_MEMORY
@@ -80,6 +74,436 @@ void MNNDualMatVecFp16(const float* S, const float* k, const float* q, float* ou
 void MNNDecayRankOneUpdateFp16(float* S, const float* k, const float* delta, float decay, size_t dk, size_t dv);
 }
 
+#if defined(__aarch64__) && defined(MNN_USE_NEON)
+// ──────────────────────────────────────────────────────────────────────────
+// MNNFusedGatedDeltaFp16 — FP16 specialization of the fused gated-delta-rule
+// kernel. See documentation in CommonOptFunction.h for the math.
+//
+// Pointers are typed `float*` for ABI uniformity with the FP32 version (the
+// dispatch table holds a single function pointer signature), but the
+// underlying memory is fp16. d_v is processed in chunks of 32 (= 4 v.8h
+// registers per accumulator) to keep all per-chunk state in registers,
+// which matters at d_v=128 where holding both out_k and out_q for the
+// whole row would otherwise exceed the 32 NEON v register budget.
+// ──────────────────────────────────────────────────────────────────────────
+// BUG FIX (bugfix/linear-attn-fp16): The previous implementation used fp16
+// accumulators throughout (float16x8_t + vfmaq_f16 / vmulq_f16 / vsubq_f16).
+// For Qwen3.5's linear_attention the state matrix S is recurrent -- errors
+// from each timestep's k·k^T rank-1 update compound over prefill (thousands
+// of tokens) and decode.  fp16 (10-bit mantissa) cannot represent the
+// accumulated sum accurately; the state drifts toward a degenerate rank
+// structure and the model starts emitting repetitive tokens on decode
+// ("edge devices and edge devices", "The output is the output of the model").
+//
+// This rewrite keeps fp16 storage (S / k / q / v / out) but promotes ALL
+// arithmetic to fp32 via vcvt_f32_f16 / vcvt_f16_f32 in-loop.  The chunk
+// size drops from 32 to 16 to keep a full column strip of fp32 accumulators
+// (4 x float32x4_t = 16 elements) in registers.  Compared to the fp16 path
+// this costs 2 vcvt insns per 4 fp16 loads and doubles the register
+// pressure for accumulators, but eliminates the drift entirely -- and
+// scalars decay/beta/kq stay fp32 rather than being narrowed to fp16.
+//
+// Follows the fp32 MNNFusedGatedDeltaDefault layout in CommonOptFunction.cpp
+// but replaces vld1q_f32 with vcvt_f32_f16(vld1_f16(...)) on load and
+// vst1_f32 with vst1_f16(vcvt_f16_f32(...)) on store.
+static void MNNFusedGatedDeltaFp16(float* S_, const float* k_, const float* q_, const float* v_, float* out_,
+                                   float decay, float beta, float kq, size_t dk, size_t dv) {
+    auto S = reinterpret_cast<__fp16*>(S_);
+    auto k = reinterpret_cast<const __fp16*>(k_);
+    auto q = reinterpret_cast<const __fp16*>(q_);
+    auto vIn = reinterpret_cast<const __fp16*>(v_);
+    auto out = reinterpret_cast<__fp16*>(out_);
+
+    const float32x4_t vDecay = vdupq_n_f32(decay);
+    const float32x4_t vBeta = vdupq_n_f32(beta);
+    const float32x4_t vKq = vdupq_n_f32(kq);
+
+    const size_t kChunk = 16;
+    size_t j = 0;
+    for (; j + kChunk <= dv; j += kChunk) {
+        // ── Pass 1: out_k = S^T @ k, out_q = S^T @ q for this column chunk (fp32 accum) ──
+        float32x4_t ok0 = vdupq_n_f32(0.0f), ok1 = vdupq_n_f32(0.0f);
+        float32x4_t ok2 = vdupq_n_f32(0.0f), ok3 = vdupq_n_f32(0.0f);
+        float32x4_t oq0 = vdupq_n_f32(0.0f), oq1 = vdupq_n_f32(0.0f);
+        float32x4_t oq2 = vdupq_n_f32(0.0f), oq3 = vdupq_n_f32(0.0f);
+        for (size_t i = 0; i < dk; ++i) {
+            const float ki = static_cast<float>(k[i]);
+            const float qi = static_cast<float>(q[i]);
+            const __fp16* row = S + i * dv + j;
+            float32x4_t s0 = vcvt_f32_f16(vld1_f16(row));
+            float32x4_t s1 = vcvt_f32_f16(vld1_f16(row + 4));
+            float32x4_t s2 = vcvt_f32_f16(vld1_f16(row + 8));
+            float32x4_t s3 = vcvt_f32_f16(vld1_f16(row + 12));
+            ok0 = vfmaq_n_f32(ok0, s0, ki);
+            ok1 = vfmaq_n_f32(ok1, s1, ki);
+            ok2 = vfmaq_n_f32(ok2, s2, ki);
+            ok3 = vfmaq_n_f32(ok3, s3, ki);
+            oq0 = vfmaq_n_f32(oq0, s0, qi);
+            oq1 = vfmaq_n_f32(oq1, s1, qi);
+            oq2 = vfmaq_n_f32(oq2, s2, qi);
+            oq3 = vfmaq_n_f32(oq3, s3, qi);
+        }
+
+        // ── Inline analytic correction (fp32 regs) ──
+        float32x4_t v0 = vcvt_f32_f16(vld1_f16(vIn + j));
+        float32x4_t v1 = vcvt_f32_f16(vld1_f16(vIn + j + 4));
+        float32x4_t v2 = vcvt_f32_f16(vld1_f16(vIn + j + 8));
+        float32x4_t v3 = vcvt_f32_f16(vld1_f16(vIn + j + 12));
+        // delta = beta * (v - decay * out_k)
+        float32x4_t d0 = vmulq_f32(vBeta, vsubq_f32(v0, vmulq_f32(vDecay, ok0)));
+        float32x4_t d1 = vmulq_f32(vBeta, vsubq_f32(v1, vmulq_f32(vDecay, ok1)));
+        float32x4_t d2 = vmulq_f32(vBeta, vsubq_f32(v2, vmulq_f32(vDecay, ok2)));
+        float32x4_t d3 = vmulq_f32(vBeta, vsubq_f32(v3, vmulq_f32(vDecay, ok3)));
+        // out = decay * out_q + kq * delta
+        float32x4_t o0 = vfmaq_f32(vmulq_f32(vDecay, oq0), vKq, d0);
+        float32x4_t o1 = vfmaq_f32(vmulq_f32(vDecay, oq1), vKq, d1);
+        float32x4_t o2 = vfmaq_f32(vmulq_f32(vDecay, oq2), vKq, d2);
+        float32x4_t o3 = vfmaq_f32(vmulq_f32(vDecay, oq3), vKq, d3);
+        vst1_f16(out + j, vcvt_f16_f32(o0));
+        vst1_f16(out + j + 4, vcvt_f16_f32(o1));
+        vst1_f16(out + j + 8, vcvt_f16_f32(o2));
+        vst1_f16(out + j + 12, vcvt_f16_f32(o3));
+
+        // ── Pass 2: S = decay * S + k ⊗ delta (delta d0..d3 still in fp32 regs) ──
+        for (size_t i2 = 0; i2 < dk; ++i2) {
+            const float ki2 = static_cast<float>(k[i2]);
+            __fp16* row = S + i2 * dv + j;
+            float32x4_t s0 = vcvt_f32_f16(vld1_f16(row));
+            float32x4_t s1 = vcvt_f32_f16(vld1_f16(row + 4));
+            float32x4_t s2 = vcvt_f32_f16(vld1_f16(row + 8));
+            float32x4_t s3 = vcvt_f32_f16(vld1_f16(row + 12));
+            float32x4_t r0 = vfmaq_n_f32(vmulq_f32(vDecay, s0), d0, ki2);
+            float32x4_t r1 = vfmaq_n_f32(vmulq_f32(vDecay, s1), d1, ki2);
+            float32x4_t r2 = vfmaq_n_f32(vmulq_f32(vDecay, s2), d2, ki2);
+            float32x4_t r3 = vfmaq_n_f32(vmulq_f32(vDecay, s3), d3, ki2);
+            vst1_f16(row, vcvt_f16_f32(r0));
+            vst1_f16(row + 4, vcvt_f16_f32(r1));
+            vst1_f16(row + 8, vcvt_f16_f32(r2));
+            vst1_f16(row + 12, vcvt_f16_f32(r3));
+        }
+    }
+
+    // ── Scalar tail (defensive; d_v < 16 remainder) ──
+    for (; j < dv; ++j) {
+        float ok = 0.0f, oq = 0.0f;
+        for (size_t i = 0; i < dk; ++i) {
+            float s = (float)S[i * dv + j];
+            ok += s * (float)k[i];
+            oq += s * (float)q[i];
+        }
+        float delta_j = beta * ((float)vIn[j] - decay * ok);
+        out[j] = (__fp16)(decay * oq + kq * delta_j);
+        for (size_t i = 0; i < dk; ++i) {
+            float s = (float)S[i * dv + j];
+            S[i * dv + j] = (__fp16)(decay * s + (float)k[i] * delta_j);
+        }
+    }
+}
+
+// BUG FIX (bugfix/linear-attn-fp16): same as MNNFusedGatedDeltaFp16 above but
+// for the decode-path helpers.  The original asm implementations in
+// MNNRankOneUpdateFp16.S accumulate in fp16, which drifts across ~60 decode
+// steps and produces repetitive tokens even after the prefill state is
+// clean.  These C++ replacements override the asm assignments below.
+static void MNNDualMatVecFp16_Fp32Accum(const float* S_, const float* k_, const float* q_, float* out_k_,
+                                         float* out_q_, size_t dk, size_t dv) {
+    auto S = reinterpret_cast<const __fp16*>(S_);
+    auto k = reinterpret_cast<const __fp16*>(k_);
+    auto q = reinterpret_cast<const __fp16*>(q_);
+    auto out_k = reinterpret_cast<__fp16*>(out_k_);
+    auto out_q = reinterpret_cast<__fp16*>(out_q_);
+    size_t j = 0;
+    for (; j + 4 <= dv; j += 4) {
+        float32x4_t ok = vdupq_n_f32(0.0f);
+        float32x4_t oq = vdupq_n_f32(0.0f);
+        for (size_t i = 0; i < dk; ++i) {
+            float32x4_t s = vcvt_f32_f16(vld1_f16(S + i * dv + j));
+            ok = vfmaq_n_f32(ok, s, static_cast<float>(k[i]));
+            oq = vfmaq_n_f32(oq, s, static_cast<float>(q[i]));
+        }
+        vst1_f16(out_k + j, vcvt_f16_f32(ok));
+        vst1_f16(out_q + j, vcvt_f16_f32(oq));
+    }
+    for (; j < dv; ++j) {
+        float ok = 0.0f, oq = 0.0f;
+        for (size_t i = 0; i < dk; ++i) {
+            float s = static_cast<float>(S[i * dv + j]);
+            ok += s * static_cast<float>(k[i]);
+            oq += s * static_cast<float>(q[i]);
+        }
+        out_k[j] = static_cast<__fp16>(ok);
+        out_q[j] = static_cast<__fp16>(oq);
+    }
+}
+
+static void MNNDecayRankOneUpdateFp16_Fp32Accum(float* S_, const float* k_, const float* delta_, float decay,
+                                                 size_t dk, size_t dv) {
+    auto S = reinterpret_cast<__fp16*>(S_);
+    auto k = reinterpret_cast<const __fp16*>(k_);
+    auto delta = reinterpret_cast<const __fp16*>(delta_);
+    const float32x4_t vDecay = vdupq_n_f32(decay);
+    for (size_t i = 0; i < dk; ++i) {
+        float k_val = static_cast<float>(k[i]);
+        __fp16* row = S + i * dv;
+        size_t j = 0;
+        for (; j + 4 <= dv; j += 4) {
+            float32x4_t s = vcvt_f32_f16(vld1_f16(row + j));
+            float32x4_t d = vcvt_f32_f16(vld1_f16(delta + j));
+            float32x4_t r = vfmaq_n_f32(vmulq_f32(vDecay, s), d, k_val);
+            vst1_f16(row + j, vcvt_f16_f32(r));
+        }
+        for (; j < dv; ++j) {
+            row[j] = static_cast<__fp16>(decay * static_cast<float>(row[j]) + k_val * static_cast<float>(delta[j]));
+        }
+    }
+}
+
+// fp16 counterpart of MNNNormPackedFloat<Pack>, pack = 8.  Pointers are typed
+// `float*` for ABI uniformity with the fp32 slot; the memory is fp16 except for
+// gamma/beta, which CPULayerNorm keeps fp32 in every precision mode.
+//   source, residual  [UP_DIV(channels,8), batch, 8] fp16  addends, inputs[0..1]
+//   sumOut            [UP_DIV(channels,8), batch, 8] fp16  their sum, outputs[0]
+//   normOut           [UP_DIV(channels,8), batch, 8] fp16  normalized, outputs[1]
+//   gamma, beta       [channels]                    fp32  optional affine pair
+// residual/sumOut are an optional pair: both null for the plain 1-in/1-out form,
+// where source is normalized straight into normOut.
+//
+// sumOut is write-only: every statistic and normOut itself come from the fp32
+// sum recomputed by loadExact*, never from the fp16-rounded value stored there.
+static void MNNNormPackedFp16(float* normOut_, float* sumOut_, const float* source_, const float* residual_,
+                              const float* gamma, const float* beta, float epsilon, size_t batch, size_t channels,
+                              bool RMSNorm, int tId, int threadNumber) {
+    MNN_ASSERT((residual_ == nullptr) == (sumOut_ == nullptr));
+    MNN_ASSERT(threadNumber > 0);
+    constexpr size_t kPack = 8;
+    constexpr size_t kTokenTile = 4;
+    auto normOut = reinterpret_cast<__fp16*>(normOut_);
+    auto sumOut = reinterpret_cast<__fp16*>(sumOut_);
+    auto source = reinterpret_cast<const __fp16*>(source_);
+    auto residual = reinterpret_cast<const __fp16*>(residual_);
+
+    const size_t fullBlocks = channels / kPack;
+    const size_t remain = channels - fullBlocks * kPack;
+    const size_t tileCount = UP_DIV(batch, kTokenTile);
+    const bool affine = gamma != nullptr && beta != nullptr;
+    const float invChannels = 1.0f / static_cast<float>(channels);
+    // RMSNorm needs no mean, so pass 1 can accumulate the squares itself and pass 2
+    // drops out; the fp32 recompute in pass 3 then costs no more loads than a
+    // read-back of sumOut would have.
+    const bool squaresFromPass1 = RMSNorm && residual != nullptr;
+
+    auto loadExactPair = [&](size_t offset) {
+        float32x4_t value = vcvt_f32_f16(vld1_f16(source + offset));
+        if (residual != nullptr) {
+            value = vaddq_f32(value, vcvt_f32_f16(vld1_f16(residual + offset)));
+        }
+        return value;
+    };
+    auto loadExactLane = [&](size_t index) {
+        float value = static_cast<float>(source[index]);
+        if (residual != nullptr) {
+            value += static_cast<float>(residual[index]);
+        }
+        return value;
+    };
+
+    for (size_t tile = static_cast<size_t>(tId); tile < tileCount; tile += static_cast<size_t>(threadNumber)) {
+        const size_t tokenBase = tile * kTokenTile;
+        const size_t tokenCount = ALIMIN(kTokenTile, batch - tokenBase);
+        float means[kTokenTile] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t squareAcc[kTokenTile] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                                            vdupq_n_f32(0.0f)};
+        float squareSums[kTokenTile] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        // ── Pass 1: store source + residual into `sumOut`, and accumulate either the
+        //    mean (LayerNorm) or the squares (RMSNorm).  Skipped entirely for the hot
+        //    RMSNorm-without-residual case.
+        if (residual != nullptr || !RMSNorm) {
+            float32x4_t meanAcc[kTokenTile] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                                              vdupq_n_f32(0.0f)};
+            for (size_t block = 0; block < fullBlocks; ++block) {
+                for (size_t token = 0; token < tokenCount; ++token) {
+                    const size_t offset = (block * batch + tokenBase + token) * kPack;
+                    float32x4_t lo = loadExactPair(offset);
+                    float32x4_t hi = loadExactPair(offset + 4);
+                    if (residual != nullptr) {
+                        vst1_f16(sumOut + offset, vcvt_f16_f32(lo));
+                        vst1_f16(sumOut + offset + 4, vcvt_f16_f32(hi));
+                    }
+                    if (squaresFromPass1) {
+                        squareAcc[token] = vfmaq_f32(squareAcc[token], lo, lo);
+                        squareAcc[token] = vfmaq_f32(squareAcc[token], hi, hi);
+                    } else if (!RMSNorm) {
+                        meanAcc[token] = vaddq_f32(meanAcc[token], vaddq_f32(lo, hi));
+                    }
+                }
+            }
+            for (size_t token = 0; token < tokenCount; ++token) {
+                means[token] = vaddvq_f32(meanAcc[token]);
+            }
+            if (remain > 0) {
+                for (size_t token = 0; token < tokenCount; ++token) {
+                    const size_t offset = (fullBlocks * batch + tokenBase + token) * kPack;
+                    for (size_t lane = 0; lane < remain; ++lane) {
+                        const float value = loadExactLane(offset + lane);
+                        if (residual != nullptr) {
+                            sumOut[offset + lane] = static_cast<__fp16>(value);
+                        }
+                        if (squaresFromPass1) {
+                            squareSums[token] += value * value;
+                        } else if (!RMSNorm) {
+                            means[token] += value;
+                        }
+                    }
+                    if (sumOut != nullptr) {
+                        for (size_t lane = remain; lane < kPack; ++lane) {
+                            sumOut[offset + lane] = static_cast<__fp16>(0.0f);
+                        }
+                    }
+                }
+            }
+            if (!RMSNorm) {
+                for (size_t token = 0; token < tokenCount; ++token) {
+                    means[token] *= invChannels;
+                }
+            }
+        }
+
+        float32x4_t meanVec[kTokenTile];
+        for (size_t token = 0; token < tokenCount; ++token) {
+            meanVec[token] = vdupq_n_f32(means[token]);
+        }
+
+        // ── Pass 2: sum of squared deviations, unless pass 1 already has them.
+        if (!squaresFromPass1) {
+            for (size_t block = 0; block < fullBlocks; ++block) {
+                for (size_t token = 0; token < tokenCount; ++token) {
+                    const size_t offset = (block * batch + tokenBase + token) * kPack;
+                    float32x4_t lo = vsubq_f32(loadExactPair(offset), meanVec[token]);
+                    float32x4_t hi = vsubq_f32(loadExactPair(offset + 4), meanVec[token]);
+                    squareAcc[token] = vfmaq_f32(squareAcc[token], lo, lo);
+                    squareAcc[token] = vfmaq_f32(squareAcc[token], hi, hi);
+                }
+            }
+            if (remain > 0) {
+                for (size_t token = 0; token < tokenCount; ++token) {
+                    const size_t offset = (fullBlocks * batch + tokenBase + token) * kPack;
+                    for (size_t lane = 0; lane < remain; ++lane) {
+                        const float diff = loadExactLane(offset + lane) - means[token];
+                        squareSums[token] += diff * diff;
+                    }
+                }
+            }
+        }
+        float invStds[kTokenTile] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (size_t token = 0; token < tokenCount; ++token) {
+            const float squareSum = squareSums[token] + vaddvq_f32(squareAcc[token]);
+            invStds[token] = 1.0f / std::sqrt(squareSum * invChannels + epsilon);
+        }
+
+        // ── Pass 3: scale, affine, store.
+        for (size_t block = 0; block < fullBlocks; ++block) {
+            float32x4_t gammaLo, gammaHi, betaLo, betaHi;
+            if (affine) {
+                gammaLo = vld1q_f32(gamma + block * kPack);
+                gammaHi = vld1q_f32(gamma + block * kPack + 4);
+                betaLo = vld1q_f32(beta + block * kPack);
+                betaHi = vld1q_f32(beta + block * kPack + 4);
+            }
+            for (size_t token = 0; token < tokenCount; ++token) {
+                const size_t offset = (block * batch + tokenBase + token) * kPack;
+                float32x4_t lo = vsubq_f32(loadExactPair(offset), meanVec[token]);
+                float32x4_t hi = vsubq_f32(loadExactPair(offset + 4), meanVec[token]);
+                lo = vmulq_n_f32(lo, invStds[token]);
+                hi = vmulq_n_f32(hi, invStds[token]);
+                if (affine) {
+                    lo = vfmaq_f32(betaLo, lo, gammaLo);
+                    hi = vfmaq_f32(betaHi, hi, gammaHi);
+                }
+                vst1_f16(normOut + offset, vcvt_f16_f32(lo));
+                vst1_f16(normOut + offset + 4, vcvt_f16_f32(hi));
+            }
+        }
+        if (remain > 0) {
+            const size_t channelBase = fullBlocks * kPack;
+            for (size_t token = 0; token < tokenCount; ++token) {
+                const size_t offset = (fullBlocks * batch + tokenBase + token) * kPack;
+                for (size_t lane = 0; lane < remain; ++lane) {
+                    float value = (loadExactLane(offset + lane) - means[token]) * invStds[token];
+                    if (affine) {
+                        value = value * gamma[channelBase + lane] + beta[channelBase + lane];
+                    }
+                    normOut[offset + lane] = static_cast<__fp16>(value);
+                }
+                for (size_t lane = remain; lane < kPack; ++lane) {
+                    normOut[offset + lane] = static_cast<__fp16>(0.0f);
+                }
+            }
+        }
+    }
+}
+
+// Decode-path (L=1) fused depthwise Conv1D(K=4) + SiLU over a contiguous
+// channel range, following the same fp16-storage / fp32-accumulate rule as the
+// kernels above. Layouts: state [channels][3] (vld3q deinterleave), weights
+// [channels][4] (vld4q), x [channels] contiguous, out [channels]. SiLU runs in
+// fp32 (MNNSiLuLowp) on a stack tile; dst must not alias src there, so two
+// tiles are used.
+static void MNNDecodeConv1DSiluK4Fp16(float* stateF, const float* xF, const float* wF, float* outF, int channels) {
+    auto state = reinterpret_cast<__fp16*>(stateF);
+    auto x = reinterpret_cast<const __fp16*>(xF);
+    auto w = reinterpret_cast<const __fp16*>(wF);
+    auto out = reinterpret_cast<__fp16*>(outF);
+    constexpr int kTile = 256;
+    float accBuf[kTile];
+    float actBuf[kTile];
+    for (int ch = 0; ch < channels; ch += kTile) {
+        const int nblk = (channels - ch < kTile) ? (channels - ch) : kTile;
+        int i = 0;
+        for (; i + 8 <= nblk; i += 8) {
+            float16x8x3_t s = vld3q_f16(state + 3 * (ch + i));
+            float16x8x4_t ww = vld4q_f16(w + 4 * (ch + i));
+            float16x8_t xv = vld1q_f16(x + ch + i);
+            float32x4_t a0 = vmulq_f32(vcvt_f32_f16(vget_low_f16(s.val[0])), vcvt_f32_f16(vget_low_f16(ww.val[0])));
+            float32x4_t a1 = vmulq_f32(vcvt_f32_f16(vget_high_f16(s.val[0])), vcvt_f32_f16(vget_high_f16(ww.val[0])));
+            a0 = vfmaq_f32(a0, vcvt_f32_f16(vget_low_f16(s.val[1])), vcvt_f32_f16(vget_low_f16(ww.val[1])));
+            a1 = vfmaq_f32(a1, vcvt_f32_f16(vget_high_f16(s.val[1])), vcvt_f32_f16(vget_high_f16(ww.val[1])));
+            a0 = vfmaq_f32(a0, vcvt_f32_f16(vget_low_f16(s.val[2])), vcvt_f32_f16(vget_low_f16(ww.val[2])));
+            a1 = vfmaq_f32(a1, vcvt_f32_f16(vget_high_f16(s.val[2])), vcvt_f32_f16(vget_high_f16(ww.val[2])));
+            a0 = vfmaq_f32(a0, vcvt_f32_f16(vget_low_f16(xv)), vcvt_f32_f16(vget_low_f16(ww.val[3])));
+            a1 = vfmaq_f32(a1, vcvt_f32_f16(vget_high_f16(xv)), vcvt_f32_f16(vget_high_f16(ww.val[3])));
+            vst1q_f32(accBuf + i, a0);
+            vst1q_f32(accBuf + i + 4, a1);
+            float16x8x3_t ns;
+            ns.val[0] = s.val[1];
+            ns.val[1] = s.val[2];
+            ns.val[2] = xv;
+            vst3q_f16(state + 3 * (ch + i), ns);
+        }
+        for (; i < nblk; ++i) {
+            __fp16* st = state + 3 * (ch + i);
+            const __fp16* wc = w + 4 * (ch + i);
+            const float xv = static_cast<float>(x[ch + i]);
+            accBuf[i] = static_cast<float>(st[0]) * static_cast<float>(wc[0]) +
+                        static_cast<float>(st[1]) * static_cast<float>(wc[1]) +
+                        static_cast<float>(st[2]) * static_cast<float>(wc[2]) + xv * static_cast<float>(wc[3]);
+            st[0] = st[1];
+            st[1] = st[2];
+            st[2] = x[ch + i];
+        }
+        MNNSiLuLowp(actBuf, accBuf, nblk);
+        int j = 0;
+        for (; j + 8 <= nblk; j += 8) {
+            float32x4_t v0 = vld1q_f32(actBuf + j);
+            float32x4_t v1 = vld1q_f32(actBuf + j + 4);
+            vst1q_f16(out + ch + j, vcombine_f16(vcvt_f16_f32(v0), vcvt_f16_f32(v1)));
+        }
+        for (; j < nblk; ++j) {
+            out[ch + j] = static_cast<__fp16>(actBuf[j]);
+        }
+    }
+}
+#endif // __aarch64__ && MNN_USE_NEON
 
 namespace MNN {
 
@@ -140,6 +564,229 @@ static void ARM82CountMinMaxValue(float* source, float* minVal, float* maxVal, s
 static void MNNPackedMatMulFP16_SME2(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
     MNNPackedMatMulRemainFP16_SME2(C, A, B, 16, parameter, postParameters, bias, k, b);
 }
+#endif
+
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE) && defined(MNN_USE_NEON)
+// NEON path for SME/NEON mixed Attention. It reads the [H/64, L/2, 64, 2] KV cache
+// packed by the SME2 path and keeps the Arm82 FP16 output packing.
+// e-rows are tiled by ET so the KV block is loaded and deinterleaved once per tile
+// instead of once per e-row; per-row accumulation order is unchanged.
+template <int ET>
+static void MNNPackedMatMulRemainFP16WithSme2PackedB_E(float* C, const float* A, const float* B, size_t eSize,
+                                                       const size_t* parameter) {
+    const size_t aStride = parameter[0] / sizeof(FLOAT16);
+    const size_t l = parameter[1];
+    const size_t h = parameter[2];
+    const size_t cStride = parameter[3] / sizeof(FLOAT16);
+    const size_t bStride = UP_DIV(l, 2) * 128 + parameter[5] / sizeof(FLOAT16);
+    const auto aPtr = reinterpret_cast<const FLOAT16*>(A);
+    const auto bPtr = reinterpret_cast<const FLOAT16*>(B);
+    auto cPtr = reinterpret_cast<FLOAT16*>(C);
+    for (size_t e0 = 0; e0 < eSize; e0 += ET) {
+        const int eN = static_cast<int>(ALIMIN(eSize - e0, static_cast<size_t>(ET)));
+        size_t y = 0;
+        for (; y + 8 <= h; y += 8) {
+            float32x4_t sumLo[ET];
+            float32x4_t sumHi[ET];
+            for (int i = 0; i < ET; ++i) {
+                sumLo[i] = vdupq_n_f32(0.0f);
+                sumHi[i] = vdupq_n_f32(0.0f);
+            }
+            const auto bBase = bPtr + (y / 64) * bStride + (y % 64) * 2;
+            for (size_t z = 0; z < l; z += 2) {
+                const auto raw = reinterpret_cast<const uint16_t*>(bBase + z * 64);
+                const auto raw0 = vld1q_u16(raw);
+                const auto raw1 = vld1q_u16(raw + 8);
+                const auto values0 = vreinterpretq_f16_u16(vuzp1q_u16(raw0, raw1));
+                const auto values1 = vreinterpretq_f16_u16(vuzp2q_u16(raw0, raw1));
+                const auto v0lo = vcvt_f32_f16(vget_low_f16(values0));
+                const auto v0hi = vcvt_f32_f16(vget_high_f16(values0));
+                const auto v1lo = vcvt_f32_f16(vget_low_f16(values1));
+                const auto v1hi = vcvt_f32_f16(vget_high_f16(values1));
+                for (int i = 0; i < ET; ++i) {
+                    if (i < eN) {
+                        const auto a = aPtr + (e0 + i) * 2 + (z / 2) * aStride;
+                        const float a0 = static_cast<float>(a[0]);
+                        const float a1 = static_cast<float>(a[1]);
+                        sumLo[i] = vfmaq_n_f32(sumLo[i], v0lo, a0);
+                        sumHi[i] = vfmaq_n_f32(sumHi[i], v0hi, a0);
+                        sumLo[i] = vfmaq_n_f32(sumLo[i], v1lo, a1);
+                        sumHi[i] = vfmaq_n_f32(sumHi[i], v1hi, a1);
+                    }
+                }
+            }
+            for (int i = 0; i < ET; ++i) {
+                if (i < eN) {
+                    vst1q_f16(cPtr + (y / 8) * cStride + (e0 + i) * 8,
+                              vcombine_f16(vcvt_f16_f32(sumLo[i]), vcvt_f16_f32(sumHi[i])));
+                }
+            }
+        }
+        for (int i = 0; i < ET; ++i) {
+            if (i >= eN) {
+                break;
+            }
+            const size_t e = e0 + i;
+            for (size_t yy = y; yy < h; ++yy) {
+                float sum = 0.0f;
+                const auto aBase = aPtr + e * 2;
+                const auto bBase = bPtr + (yy / 64) * bStride + (yy % 64) * 2;
+                for (size_t z = 0; z < l; z += 2) {
+                    const auto weight = bBase + z * 64;
+                    const auto a = aBase + (z / 2) * aStride;
+                    sum += static_cast<float>(weight[0]) * static_cast<float>(a[0]);
+                    sum += static_cast<float>(weight[1]) * static_cast<float>(a[1]);
+                }
+                cPtr[(yy / 8) * cStride + e * 8 + yy % 8] = static_cast<FLOAT16>(sum);
+            }
+        }
+    }
+}
+
+static void MNNPackedMatMulRemainFP16WithSme2PackedB(float* C, const float* A, const float* B, size_t eSize,
+                                                      const size_t* parameter, const float* postParameters,
+                                                      const float* bias, const float* k, const float* b) {
+    MNN_ASSERT(postParameters == nullptr && bias == nullptr && k == nullptr && b == nullptr);
+    MNN_ASSERT(parameter[1] % 2 == 0);
+    if (eSize <= 4) {
+        MNNPackedMatMulRemainFP16WithSme2PackedB_E<4>(C, A, B, eSize, parameter);
+        return;
+    }
+    MNNPackedMatMulRemainFP16WithSme2PackedB_E<8>(C, A, B, eSize, parameter);
+}
+
+static void MNNPackedMatMulFP16WithSme2PackedB(float* C, const float* A, const float* B, const size_t* parameter,
+                                                const float* postParameters, const float* bias, const float* k,
+                                                const float* b) {
+    MNNPackedMatMulRemainFP16WithSme2PackedB(C, A, B, 16, parameter, postParameters, bias, k, b);
+}
+
+// Clang 15's target-attributed FMLAL lowering fails on the Harmony SDK.
+// Keep upstream's FP32-accumulating NEON implementation as the fallback.
+#if !defined(__clang__) || __clang_major__ >= 16
+#define MNN_ARM82_HAS_FMLAL_KERNEL 1
+template <int ET, int HT = 8>
+__attribute__((target("arch=armv8.2-a+fp16fml")))
+static void MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E(float* C, const float* A, const float* B, size_t eSize,
+                                                         const size_t* parameter, const float* postParameters,
+                                                         const float* bias, const float* k, const float* b) {
+    MNN_ASSERT(postParameters == nullptr && bias == nullptr && k == nullptr && b == nullptr);
+    const size_t aStride = parameter[0] / sizeof(FLOAT16);
+    const size_t l = parameter[1];
+    const size_t h = parameter[2];
+    const size_t cStride = parameter[3] / sizeof(FLOAT16);
+    const size_t bStride = UP_DIV(l, 2) * 128 + parameter[5] / sizeof(FLOAT16);
+    const auto aPtr = reinterpret_cast<const FLOAT16*>(A);
+    const auto bPtr = reinterpret_cast<const FLOAT16*>(B);
+    auto cPtr = reinterpret_cast<FLOAT16*>(C);
+    MNN_ASSERT(l % 2 == 0);
+    for (size_t e0 = 0; e0 < eSize; e0 += ET) {
+        const int eN = static_cast<int>(ALIMIN(eSize - e0, static_cast<size_t>(ET)));
+        size_t y = 0;
+        for (; y + HT <= h; y += HT) {
+            float32x4_t sumLo[HT / 8][ET];
+            float32x4_t sumHi[HT / 8][ET];
+            for (int j = 0; j < HT / 8; ++j) {
+                for (int i = 0; i < ET; ++i) {
+                    sumLo[j][i] = vdupq_n_f32(0.0f);
+                    sumHi[j][i] = vdupq_n_f32(0.0f);
+                }
+            }
+            const auto bBase = bPtr + (y / 64) * bStride + (y % 64) * 2;
+            for (size_t z = 0; z < l; z += 2) {
+                for (int j = 0; j < HT / 8; ++j) {
+                    const auto raw = reinterpret_cast<const uint16_t*>(bBase + z * 64 + j * 16);
+                    const auto raw0 = vld1q_u16(raw);
+                    const auto raw1 = vld1q_u16(raw + 8);
+                    const auto values0 = vreinterpretq_f16_u16(vuzp1q_u16(raw0, raw1));
+                    const auto values1 = vreinterpretq_f16_u16(vuzp2q_u16(raw0, raw1));
+                    if (ET == 2 && eN == 2) {
+                        const auto av = vld1_f16(aPtr + e0 * 2 + (z / 2) * aStride);
+                        sumLo[j][0] = vfmlalq_lane_low_f16(sumLo[j][0], values0, av, 0);
+                        sumHi[j][0] = vfmlalq_lane_high_f16(sumHi[j][0], values0, av, 0);
+                        sumLo[j][0] = vfmlalq_lane_low_f16(sumLo[j][0], values1, av, 1);
+                        sumHi[j][0] = vfmlalq_lane_high_f16(sumHi[j][0], values1, av, 1);
+                        sumLo[j][1] = vfmlalq_lane_low_f16(sumLo[j][1], values0, av, 2);
+                        sumHi[j][1] = vfmlalq_lane_high_f16(sumHi[j][1], values0, av, 2);
+                        sumLo[j][1] = vfmlalq_lane_low_f16(sumLo[j][1], values1, av, 3);
+                        sumHi[j][1] = vfmlalq_lane_high_f16(sumHi[j][1], values1, av, 3);
+                    } else {
+                        for (int i = 0; i < ET; ++i) {
+                            if (i < eN) {
+                                const auto a = aPtr + (e0 + i) * 2 + (z / 2) * aStride;
+                                const auto a0 = vdupq_n_f16(a[0]);
+                                const auto a1 = vdupq_n_f16(a[1]);
+                                sumLo[j][i] = vfmlalq_low_f16(sumLo[j][i], values0, a0);
+                                sumHi[j][i] = vfmlalq_high_f16(sumHi[j][i], values0, a0);
+                                sumLo[j][i] = vfmlalq_low_f16(sumLo[j][i], values1, a1);
+                                sumHi[j][i] = vfmlalq_high_f16(sumHi[j][i], values1, a1);
+                            }
+                        }
+                    }
+                }
+            }
+            for (int j = 0; j < HT / 8; ++j) {
+                for (int i = 0; i < ET; ++i) {
+                    if (i < eN) {
+                        vst1q_f16(cPtr + (y / 8 + j) * cStride + (e0 + i) * 8,
+                                  vcombine_f16(vcvt_f16_f32(sumLo[j][i]), vcvt_f16_f32(sumHi[j][i])));
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < ET; ++i) {
+            if (i >= eN) {
+                break;
+            }
+            const size_t e = e0 + i;
+            for (size_t yy = y; yy < h; ++yy) {
+                float sum = 0.0f;
+                const auto aBase = aPtr + e * 2;
+                const auto bBase = bPtr + (yy / 64) * bStride + (yy % 64) * 2;
+                for (size_t z = 0; z < l; z += 2) {
+                    const auto weight = bBase + z * 64;
+                    const auto a = aBase + (z / 2) * aStride;
+                    sum += static_cast<float>(weight[0]) * static_cast<float>(a[0]);
+                    sum += static_cast<float>(weight[1]) * static_cast<float>(a[1]);
+                }
+                cPtr[(yy / 8) * cStride + e * 8 + yy % 8] = static_cast<FLOAT16>(sum);
+            }
+        }
+    }
+}
+
+static void MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal(float* C, const float* A, const float* B, size_t eSize,
+                                                       const size_t* parameter, const float* postParameters,
+                                                       const float* bias, const float* k, const float* b) {
+    // Avoid turning an eight-column vector tail into scalar work with the wider tile.
+    if (eSize == 2 && parameter[2] % 16 == 0) {
+        MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E<2, 16>(C, A, B, eSize, parameter, postParameters, bias, k, b);
+        return;
+    }
+    if (eSize <= 2) {
+        MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E<2>(C, A, B, eSize, parameter, postParameters, bias, k, b);
+        return;
+    }
+    MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E<8>(C, A, B, eSize, parameter, postParameters, bias, k, b);
+}
+
+static void MNNPackedMatMulRemainFP16WithSme2PackedB_FmlalWide(float* C, const float* A, const float* B, size_t eSize,
+                                                           const size_t* parameter, const float* postParameters,
+                                                           const float* bias, const float* k, const float* b) {
+    if (eSize == 2 && parameter[2] % 32 == 0) {
+        MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E<2, 32>(C, A, B, eSize, parameter, postParameters, bias, k, b);
+        return;
+    }
+    MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal(C, A, B, eSize, parameter, postParameters, bias, k, b);
+}
+
+static void MNNPackedMatMulFP16WithSme2PackedB_Fmlal(float* C, const float* A, const float* B,
+                                                      const size_t* parameter, const float* postParameters,
+                                                      const float* bias, const float* k, const float* b) {
+    MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal_E<8>(C, A, B, 16, parameter, postParameters, bias, k, b);
+}
+#endif
+
 #endif
 #else
 static void ARM82CountMinMaxValue(float* source, float* minVal, float* maxVal, size_t size) {
@@ -237,6 +884,53 @@ static void MNNScaleAndAddBiasFP16(FLOAT16* dst, const FLOAT16* src, const FLOAT
             const FLOAT16* srcX = srcZ + 8 * p;
             auto res = vaddq_f16(vmulq_f16(vld1q_f16(srcX), alphaZ), biasZ);
             vst1q_f16(dstX, res);
+        }
+    }
+}
+
+// fp16 port of MNNRoPEComputeBasic (CommonOptFunction.cpp); one call handles a
+// token's [numHead, headDim] elements, cos/sin tables are already fp16.
+static void MNNRoPEComputeFP16(void* dst, const void* src, const void* cosEven, const void* cosOdd,
+                               const void* sinEven, const void* sinOdd, int numHead, int headDim,
+                               int ropeCutHeadDim) {
+    int ropeDim = ropeCutHeadDim;
+    if (ropeDim <= 0 || ropeDim > headDim) {
+        ropeDim = headDim;
+    }
+    ropeDim = (ropeDim / 2) * 2;
+    const int ropeHalfHeadDim = ropeDim / 2;
+
+    auto srcHalf = static_cast<const FLOAT16*>(src);
+    auto dstHalf = static_cast<FLOAT16*>(dst);
+    auto cosEvenHalf = static_cast<const FLOAT16*>(cosEven);
+    auto cosOddHalf = static_cast<const FLOAT16*>(cosOdd);
+    auto sinEvenHalf = static_cast<const FLOAT16*>(sinEven);
+    auto sinOddHalf = static_cast<const FLOAT16*>(sinOdd);
+    for (int j = 0; j < numHead; ++j) {
+        auto src0 = srcHalf + j * headDim;
+        auto src1 = src0 + ropeHalfHeadDim;
+        auto dst0 = dstHalf + j * headDim;
+        auto dst1 = dst0 + ropeHalfHeadDim;
+        int k = 0;
+        for (; k <= ropeHalfHeadDim - 8; k += 8) {
+            auto q0 = Vec::load(src0 + k);
+            auto q1 = Vec::load(src1 + k);
+            auto c0 = Vec::load(cosEvenHalf + k);
+            auto c1 = Vec::load(cosOddHalf + k);
+            auto s0 = Vec::load(sinEvenHalf + k);
+            auto s1 = Vec::load(sinOddHalf + k);
+            Vec::save(dst0 + k, Vec::fms(q0 * c0, q1, s0));
+            Vec::save(dst1 + k, Vec::fma(q1 * c1, q0, s1));
+        }
+        for (; k < ropeHalfHeadDim; ++k) {
+            float q0 = src0[k];
+            float q1 = src1[k];
+            dst0[k] = static_cast<FLOAT16>(q0 * cosEvenHalf[k] - q1 * sinEvenHalf[k]);
+            dst1[k] = static_cast<FLOAT16>(q1 * cosOddHalf[k] + q0 * sinOddHalf[k]);
+        }
+        if (ropeDim < headDim) {
+            ::memcpy(dstHalf + j * headDim + ropeDim, srcHalf + j * headDim + ropeDim,
+                     (headDim - ropeDim) * sizeof(FLOAT16));
         }
     }
 }
@@ -1163,6 +1857,68 @@ static void MNNFlashAttentionUpdateBlockOutput(float* dst, float* src, float* sc
     auto srcPtr = (float16_t*)src;
     const auto stride0 = plane * pack;
 
+    if (idx == kvBlocks - 1) {
+        // Last block: fuse the softmax normalization into this pass (single fp16 store, one less rounding step).
+        // Per-row reciprocals are hoisted via a chunked buffer to keep inner sweeps contiguous.
+        constexpr int kChunk = 256;
+        float nsBuf[kChunk];
+        if (idx > 0) {
+            for (int ic = 0; ic < seqStart; ic += kChunk) {
+                int iEnd = ALIMIN(ic + kChunk, seqStart);
+                for (int i = ic; i < iEnd; ++i) {
+                    nsBuf[i - ic] = 1.0f / normalizeScale[i];
+                }
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto pdst = dstPtr + j * stride0 + i * pack;
+                        float16x8_t dstF16 = vld1q_f16(pdst);
+                        float32x4_t nsvec = vdupq_n_f32(nsBuf[i - ic]);
+                        float32x4_t d0 = vmulq_f32(vcvt_f32_f16(vget_low_f16(dstF16)), nsvec);
+                        float32x4_t d1 = vmulq_f32(vcvt_f32_f16(vget_high_f16(dstF16)), nsvec);
+                        vst1q_f16(pdst, vcombine_f16(vcvt_f16_f32(d0), vcvt_f16_f32(d1)));
+                    }
+                }
+            }
+        }
+        int rowLo = (idx > 0) ? seqStart : 0;
+        for (int ic = rowLo; ic < plane; ic += kChunk) {
+            int iEnd = ALIMIN(ic + kChunk, plane);
+            for (int i = ic; i < iEnd; ++i) {
+                nsBuf[i - ic] = 1.0f / normalizeScale[i];
+            }
+            if (idx > 0) {
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto pdst = dstPtr + j * stride0 + i * pack;
+                        auto psrc = srcPtr + j * stride0 + i * pack;
+                        float16x8_t srcF16 = vld1q_f16(psrc);
+                        float16x8_t dstF16 = vld1q_f16(pdst);
+                        float32x4_t svec = vdupq_n_f32(scale[i]);
+                        float32x4_t nsvec = vdupq_n_f32(nsBuf[i - ic]);
+                        float32x4_t res0 = vfmaq_f32(vcvt_f32_f16(vget_low_f16(srcF16)), vcvt_f32_f16(vget_low_f16(dstF16)), svec);
+                        float32x4_t res1 = vfmaq_f32(vcvt_f32_f16(vget_high_f16(srcF16)), vcvt_f32_f16(vget_high_f16(dstF16)), svec);
+                        res0 = vmulq_f32(res0, nsvec);
+                        res1 = vmulq_f32(res1, nsvec);
+                        vst1q_f16(pdst, vcombine_f16(vcvt_f16_f32(res0), vcvt_f16_f32(res1)));
+                    }
+                }
+            } else {
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto pdst = dstPtr + j * stride0 + i * pack;
+                        auto psrc = srcPtr + j * stride0 + i * pack;
+                        float16x8_t srcF16 = vld1q_f16(psrc);
+                        float32x4_t nsvec = vdupq_n_f32(nsBuf[i - ic]);
+                        float32x4_t res0 = vmulq_f32(vcvt_f32_f16(vget_low_f16(srcF16)), nsvec);
+                        float32x4_t res1 = vmulq_f32(vcvt_f32_f16(vget_high_f16(srcF16)), nsvec);
+                        vst1q_f16(pdst, vcombine_f16(vcvt_f16_f32(res0), vcvt_f16_f32(res1)));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (idx == 0) {
         memcpy(dst, src, size * bytes);
     } else {
@@ -1231,58 +1987,6 @@ static void MNNFlashAttentionUpdateBlockOutput(float* dst, float* src, float* sc
                 float32x4_t res1 = vfmaq_f32(s1, d1, svec);
 
                 vst1q_f16(pdst, vcombine_f16(vcvt_f16_f32(res0), vcvt_f16_f32(res1)));
-            }
-        }
-    }
-
-    if (idx == kvBlocks - 1) {
-        for (int j = 0; j < depthQuad; ++j) {
-            const auto baseOffset = j * stride0;
-            int i = 0;
-            const int plane4 = plane - (plane % 4);
-            for (; i < plane4; i += 4) {
-                auto pdst0 = dstPtr + baseOffset + (i + 0) * pack;
-                auto pdst1 = dstPtr + baseOffset + (i + 1) * pack;
-                auto pdst2 = dstPtr + baseOffset + (i + 2) * pack;
-                auto pdst3 = dstPtr + baseOffset + (i + 3) * pack;
-
-                float16x8_t dst0 = vld1q_f16(pdst0);
-                float16x8_t dst1 = vld1q_f16(pdst1);
-                float16x8_t dst2 = vld1q_f16(pdst2);
-                float16x8_t dst3 = vld1q_f16(pdst3);
-
-                float32x4_t ns0 = vdupq_n_f32(1.0f / normalizeScale[i + 0]);
-                float32x4_t ns1 = vdupq_n_f32(1.0f / normalizeScale[i + 1]);
-                float32x4_t ns2 = vdupq_n_f32(1.0f / normalizeScale[i + 2]);
-                float32x4_t ns3 = vdupq_n_f32(1.0f / normalizeScale[i + 3]);
-
-                float32x4_t d00 = vmulq_f32(vcvt_f32_f16(vget_low_f16(dst0)),  ns0);
-                float32x4_t d10 = vmulq_f32(vcvt_f32_f16(vget_high_f16(dst0)), ns0);
-                float32x4_t d01 = vmulq_f32(vcvt_f32_f16(vget_low_f16(dst1)),  ns1);
-                float32x4_t d11 = vmulq_f32(vcvt_f32_f16(vget_high_f16(dst1)), ns1);
-                float32x4_t d02 = vmulq_f32(vcvt_f32_f16(vget_low_f16(dst2)),  ns2);
-                float32x4_t d12 = vmulq_f32(vcvt_f32_f16(vget_high_f16(dst2)), ns2);
-                float32x4_t d03 = vmulq_f32(vcvt_f32_f16(vget_low_f16(dst3)),  ns3);
-                float32x4_t d13 = vmulq_f32(vcvt_f32_f16(vget_high_f16(dst3)), ns3);
-
-                vst1q_f16(pdst0, vcombine_f16(vcvt_f16_f32(d00), vcvt_f16_f32(d10)));
-                vst1q_f16(pdst1, vcombine_f16(vcvt_f16_f32(d01), vcvt_f16_f32(d11)));
-                vst1q_f16(pdst2, vcombine_f16(vcvt_f16_f32(d02), vcvt_f16_f32(d12)));
-                vst1q_f16(pdst3, vcombine_f16(vcvt_f16_f32(d03), vcvt_f16_f32(d13)));
-            }
-
-            for (; i < plane; ++i) {
-                auto pdst = dstPtr + baseOffset + i * pack;
-                float32x4_t nsvec = vdupq_n_f32(1.0f / normalizeScale[i]);
-
-                float16x8_t dstF16 = vld1q_f16(pdst);
-                float32x4_t d0 = vcvt_f32_f16(vget_low_f16(dstF16));
-                float32x4_t d1 = vcvt_f32_f16(vget_high_f16(dstF16));
-
-                d0 = vmulq_f32(d0, nsvec);
-                d1 = vmulq_f32(d1, nsvec);
-
-                vst1q_f16(pdst, vcombine_f16(vcvt_f16_f32(d0), vcvt_f16_f32(d1)));
             }
         }
     }
@@ -2283,13 +2987,34 @@ static void MNNSoftmaxFp16_Pack8(float* dest, const float* source, float* runnin
     int reduceSizeOuter = UP_DIV(reduceSize, packUnit);
     int stride0 = outside * packUnit;
 
+    static const uint16_t idx16Data[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const uint32_t idx32Data[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    const uint16x8_t vIdx16 = vld1q_u16(idx16Data);
+    const uint32x4_t vIdx32Lo = vld1q_u32(idx32Data);
+    const uint32x4_t vIdx32Hi = vld1q_u32(idx32Data + 4);
+
     // Loop Tiling: Unroll K by 16
     // 16 * 8 * 2 = 256 Bytes
     for (int k = 0; k < outside; k += 16) {
         int count = ALIMIN(16, outside - k);
 
+        // Fast path: causal mask covers the whole tile, rows within a chunk are contiguous
+        if (mask && kvSeqOffset > (k + count - 1) + validOffset) {
+            if (updateScale) {
+                for (int i = 0; i < count; ++i) {
+                    updateScale[k + i] = 1.0f;
+                }
+            }
+            for (int j = 0; j < reduceSizeOuter; ++j) {
+                memset(softmaxDst + j * stride0 + k * packUnit, 0, count * packUnit * sizeof(__fp16));
+            }
+            continue;
+        }
+
         int validLens[16];
         bool isRowValid[16];
+        float currentMax[16];
+        float currentSum[16];
 
         for (int i = 0; i < count; ++i) {
             int currentK = k + i;
@@ -2301,148 +3026,105 @@ static void MNNSoftmaxFp16_Pack8(float* dest, const float* source, float* runnin
                 isRowValid[i] = true;
                 validLens[i] = mask ? ALIMIN(reduceSize, currentK + (validOffset + 1) - kvSeqOffset) : reduceSize;
             }
+            currentMax[i] = runningMax ? runningMax[currentK] : -65504.0f;
+            currentSum[i] = 0.0f;
         }
 
-        float currentMax[16];
         for (int i = 0; i < count; ++i) {
-            currentMax[i] = runningMax ? runningMax[k + i] : -65504.0f;
-        }
-
-        for (int j = 0; j < reduceSizeOuter; ++j) {
-            auto blockSrcBase = softmaxSrc + j * stride0 + k * packUnit;
-
-            for (int i = 0; i < count; ++i) {
-                if (!isRowValid[i]) continue;
-
-                int len = validLens[i];
-                int blockStart = j * packUnit;
-                if (blockStart >= len) continue;
-
-                auto srcPtr = blockSrcBase + i * packUnit;
-                int remain = len - blockStart;
-
-                if (remain >= packUnit) {
-                    float16x8_t val = vld1q_f16(srcPtr);
-                    float maxInVec = vmaxvq_f16(val);
-                    currentMax[i] = ALIMAX(currentMax[i], maxInVec);
-                } else {
-                    for (int p = 0; p < remain; ++p) {
-                        currentMax[i] = ALIMAX(currentMax[i], (float)srcPtr[p]);
-                    }
+            auto rowSrc = softmaxSrc + (k + i) * packUnit;
+            auto rowDst = softmaxDst + (k + i) * packUnit;
+            if (!isRowValid[i]) {
+                for (int j = 0; j < reduceSizeOuter; ++j) {
+                    memset(rowDst + j * stride0, 0, packUnit * sizeof(__fp16));
                 }
+                continue;
             }
-        }
+            const int len = validLens[i];
+            const int fullC = len / packUnit;
+            const int remain = len - fullC * packUnit;
 
-        float currentSum[16] = {0.0f};
-        float32x4_t vecSum0[16]; // Low part accumulator
-        float32x4_t vecSum1[16]; // High part accumulator
-        float32x4_t finalMaxVec[16];
-
-        for (int i = 0; i < count; ++i) {
-            vecSum0[i] = vdupq_n_f32(0.0f);
-            vecSum1[i] = vdupq_n_f32(0.0f);
-            finalMaxVec[i] = vdupq_n_f32(currentMax[i]);
-        }
-
-        for (int j = 0; j < reduceSizeOuter; ++j) {
-            auto blockSrcBase = softmaxSrc + j * stride0 + k * packUnit;
-            auto blockDstBase = softmaxDst + j * stride0 + k * packUnit;
-
-            for (int i = 0; i < count; ++i) {
-                if (!isRowValid[i]) {
-                    memset(blockDstBase + i * packUnit, 0, packUnit * sizeof(__fp16));
-                    continue;
-                }
-
-                int len = validLens[i];
-                int blockStart = j * packUnit;
-                if (blockStart >= len) {
-                    memset(blockDstBase + i * packUnit, 0, packUnit * sizeof(__fp16));
-                    continue;
-                }
-
-                auto srcPtr = blockSrcBase + i * packUnit;
-                auto dstPtr = blockDstBase + i * packUnit;
-                int remain = len - blockStart;
-
-                if (remain >= packUnit) {
-                    float16x8_t srcVal = vld1q_f16(srcPtr);
-
-                    // F16 -> F32 expansion
-                    float32x4_t low = vcvt_f32_f16(vget_low_f16(srcVal));
-                    float32x4_t high = vcvt_f32_f16(vget_high_f16(srcVal));
-
-                    // Subtract Max
-                    low = vsubq_f32(low, finalMaxVec[i]);
-                    high = vsubq_f32(high, finalMaxVec[i]);
-
-                    // Exp
-                    low = expApprox(low);
-                    high = expApprox(high);
-
-                    // Accumulate Sum
-                    vecSum0[i] = vaddq_f32(vecSum0[i], low);
-                    vecSum1[i] = vaddq_f32(vecSum1[i], high);
-
-                    // Store Exp result temporarily
-                    vst1q_f16(dstPtr, vcombine_f16(vcvt_f16_f32(low), vcvt_f16_f32(high)));
-                } else {
-                    // Handle Tail
-                    for (int p = 0; p < remain; ++p) {
-                        float val = expf((float)srcPtr[p] - currentMax[i]);
-                        currentSum[i] += val;
-                        dstPtr[p] = (__fp16)val;
-                    }
-                    memset(dstPtr + remain, 0, (packUnit - remain) * sizeof(__fp16));
-                }
+            // 1. row max: vertical accumulate, single horizontal reduce
+            float16x8_t vMax8 = vdupq_n_f16(-65504.0f);
+            for (int j = 0; j < fullC; ++j) {
+                vMax8 = vmaxq_f16(vMax8, vld1q_f16(rowSrc + j * stride0));
             }
+            if (remain > 0) {
+                // select lanes < remain; garbage lanes (possibly NaN) must be dropped before fmax
+                uint16x8_t m16 = vcltq_u16(vIdx16, vdupq_n_u16((uint16_t)remain));
+                uint16x8_t raw = vreinterpretq_u16_f16(vld1q_f16(rowSrc + fullC * stride0));
+                uint16x8_t fill = vreinterpretq_u16_f16(vdupq_n_f16(-65504.0f));
+                vMax8 = vmaxq_f16(vMax8, vreinterpretq_f16_u16(vbslq_u16(m16, raw, fill)));
+            }
+            const float finalMax = ALIMAX(currentMax[i], (float)vmaxvq_f16(vMax8));
+            currentMax[i] = finalMax;
+
+            // 2. exp(x - max) and row sum
+            const float32x4_t vMax = vdupq_n_f32(finalMax);
+            float32x4_t vSum0 = vdupq_n_f32(0.0f);
+            float32x4_t vSum1 = vdupq_n_f32(0.0f);
+            for (int j = 0; j < fullC; ++j) {
+                float16x8_t srcVal = vld1q_f16(rowSrc + j * stride0);
+                float32x4_t low = expApprox(vsubq_f32(vcvt_f32_f16(vget_low_f16(srcVal)), vMax));
+                float32x4_t high = expApprox(vsubq_f32(vcvt_f32_f16(vget_high_f16(srcVal)), vMax));
+                vSum0 = vaddq_f32(vSum0, low);
+                vSum1 = vaddq_f32(vSum1, high);
+                vst1q_f16(rowDst + j * stride0, vcombine_f16(vcvt_f16_f32(low), vcvt_f16_f32(high)));
+            }
+            if (remain > 0) {
+                float16x8_t srcVal = vld1q_f16(rowSrc + fullC * stride0);
+                float32x4_t low = expApprox(vsubq_f32(vcvt_f32_f16(vget_low_f16(srcVal)), vMax));
+                float32x4_t high = expApprox(vsubq_f32(vcvt_f32_f16(vget_high_f16(srcVal)), vMax));
+                const uint32x4_t vRemain = vdupq_n_u32((uint32_t)remain);
+                const float32x4_t vZero = vdupq_n_f32(0.0f);
+                low = vbslq_f32(vcltq_u32(vIdx32Lo, vRemain), low, vZero);
+                high = vbslq_f32(vcltq_u32(vIdx32Hi, vRemain), high, vZero);
+                vSum0 = vaddq_f32(vSum0, low);
+                vSum1 = vaddq_f32(vSum1, high);
+                vst1q_f16(rowDst + fullC * stride0, vcombine_f16(vcvt_f16_f32(low), vcvt_f16_f32(high)));
+            }
+            for (int j = fullC + (remain > 0 ? 1 : 0); j < reduceSizeOuter; ++j) {
+                memset(rowDst + j * stride0, 0, packUnit * sizeof(__fp16));
+            }
+            currentSum[i] = vaddvq_f32(vaddq_f32(vSum0, vSum1));
         }
 
-        // Horizontal reduction for sums
-        for (int i = 0; i < count; ++i) {
-            currentSum[i] += vaddvq_f32(vecSum0[i]) + vaddvq_f32(vecSum1[i]);
-        }
-
-        for (int i = 0; i < count; ++i) {
-            int currentK = k + i;
-            if (!isRowValid[i]) continue;
-
-            float scale;
-            if (runningMax && runningSum && updateScale) {
-                // Incremental Softmax logic
-                float oldMax = runningMax[currentK];
-                float scaleForSum = expf(oldMax - currentMax[i]);
+        if (runningMax != nullptr && runningSum != nullptr && updateScale != nullptr) {
+            // Incremental (flash) stats, 4 rows per step; masked rows fold to scale=1, sum=0
+            int i = 0;
+            for (; i + 3 < count; i += 4) {
+                float32x4_t vOld = vld1q_f32(runningMax + k + i);
+                float32x4_t vNew = vld1q_f32(currentMax + i);
+                float32x4_t vScale = expApprox(vsubq_f32(vOld, vNew));
+                float32x4_t vNewSum = vfmaq_f32(vld1q_f32(currentSum + i), vld1q_f32(runningSum + k + i), vScale);
+                vst1q_f32(runningSum + k + i, vNewSum);
+                vst1q_f32(runningMax + k + i, vNew);
+                vst1q_f32(updateScale + k + i, vScale);
+            }
+            for (; i < count; ++i) {
+                int currentK = k + i;
+                float scaleForSum = expf(runningMax[currentK] - currentMax[i]);
                 runningSum[currentK] = runningSum[currentK] * scaleForSum + currentSum[i];
                 runningMax[currentK] = currentMax[i];
                 updateScale[currentK] = scaleForSum;
-                continue;
-            } else {
-                // Standard Softmax logic
-                if (runningMax && runningSum) {
-                    currentSum[i] += runningSum[currentK] * expf(runningMax[currentK] - currentMax[i]);
-                }
-                scale = 1.0f / (currentSum[i] + 1e-20f);
             }
+        } else {
+            for (int i = 0; i < count; ++i) {
+                int currentK = k + i;
+                if (!isRowValid[i]) continue;
 
-            float16x8_t scaleVec = vdupq_n_f16((__fp16)scale);
+                float sum = currentSum[i];
+                if (runningMax && runningSum) {
+                    sum += runningSum[currentK] * expf(runningMax[currentK] - currentMax[i]);
+                }
+                float scale = 1.0f / (sum + 1e-20f);
+                float16x8_t scaleVec = vdupq_n_f16((__fp16)scale);
 
-            // Normalize Pass
-            for (int j = 0; j < reduceSizeOuter; ++j) {
-                int len = validLens[i];
-                int blockStart = j * packUnit;
-                if (blockStart >= len) break;
-
-                auto dstPtr = softmaxDst + j * stride0 + k * packUnit + i * packUnit;
-
-                if (len - blockStart >= packUnit) {
-                    float16x8_t val = vld1q_f16(dstPtr);
-                    val = vmulq_f16(val, scaleVec);
-                    vst1q_f16(dstPtr, val);
-                } else {
-                    int remain = len - blockStart;
-                    for (int p = 0; p < remain; ++p) {
-                        dstPtr[p] = (__fp16)((float)dstPtr[p] * scale);
-                    }
+                // Normalize Pass: tail lanes already hold zeros, full-vector multiply is safe
+                const int len = validLens[i];
+                for (int j = 0; j < reduceSizeOuter; ++j) {
+                    if (j * packUnit >= len) break;
+                    auto dstPtr = softmaxDst + j * stride0 + currentK * packUnit;
+                    vst1q_f16(dstPtr, vmulq_f16(vld1q_f16(dstPtr), scaleVec));
                 }
             }
         }
@@ -2691,12 +3373,11 @@ bool Arm82Functions::init() {
     gInstance->supportSDot = origin->supportSDot;
     gInstance->supportI8mm = origin->supportI8mm;
     gInstance->supportSME2 = origin->supportSME2;
-    gInstance->smeCoreNumber = origin->smeCoreNumber;
-#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
-    // Weight Dequant Gemm Kernels
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul_int8, MNNPackedMatMulFP16_int8);
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain_int8, MNNPackedMatMulRemainFP16_int8);
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE) && defined(__aarch64__) && defined(MNN_USE_NEON)
+    gInstance->supportFp16FML = origin->supportFp16FML;
 #endif
+    gInstance->smeCoreNumber = origin->smeCoreNumber;
+    gInstance->perfCoreNumber = origin->perfCoreNumber;
 #ifdef MNN_LOW_MEMORY
     // Dynamic Qaunt Helper Functions
     FUNC_PTR_ASSIGN(gInstance->MNNAbsMax, MNNAbsMaxFP16);
@@ -2725,12 +3406,44 @@ bool Arm82Functions::init() {
     FUNC_PTR_ASSIGN(gInstance->MNNFlashAttentionUpdateBlockOutput, MNNFlashAttentionUpdateBlockOutput);
     gInstance->MNNQuantAttentionKey = MNNQuantAttentionKeyFP16;
     gInstance->MNNQuantAttentionValue = MNNQuantAttentionValueFP16;
+#if defined(MNN_SME2) && defined(__aarch64__) && defined(MNN_USE_NEON)
+#ifdef MNN_ARM82_HAS_FMLAL_KERNEL
+    if (origin->supportFp16FML) {
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulWithSme2PackedB, MNNPackedMatMulFP16WithSme2PackedB_Fmlal);
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemainWithSme2PackedB, MNNPackedMatMulRemainFP16WithSme2PackedB_Fmlal);
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemainWithSme2PackedBWide, MNNPackedMatMulRemainFP16WithSme2PackedB_FmlalWide);
+    } else
+#endif
+    {
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemainWithSme2PackedBWide, MNNPackedMatMulRemainFP16WithSme2PackedB);
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulWithSme2PackedB, MNNPackedMatMulFP16WithSme2PackedB);
+        FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemainWithSme2PackedB, MNNPackedMatMulRemainFP16WithSme2PackedB);
+    }
+#endif
 
     // LinearAttention fp16 kernels
     FUNC_PTR_ASSIGN(gInstance->MNNRankOneUpdate, MNNRankOneUpdateFp16);
-    FUNC_PTR_ASSIGN(gInstance->MNNDualMatVec, MNNDualMatVecFp16);
-    FUNC_PTR_ASSIGN(gInstance->MNNDecayRankOneUpdate, MNNDecayRankOneUpdateFp16);
+    // fp16 decode normalizes q/k on fp32 scratch — reuse the fp32 NEON kernel.
+    gInstance->MNNNormalizeQKAndDot = origin->MNNNormalizeQKAndDot;
+    // Override the fp16-accumulator asm helpers with fp32-accumulator C++ versions;
+    // see the bugfix comment above MNNFusedGatedDeltaFp16.
+    FUNC_PTR_ASSIGN(gInstance->MNNDualMatVec, MNNDualMatVecFp16_Fp32Accum);
+    FUNC_PTR_ASSIGN(gInstance->MNNDecayRankOneUpdate, MNNDecayRankOneUpdateFp16_Fp32Accum);
+#if defined(__aarch64__) && defined(MNN_USE_NEON)
+    // Fused kernel uses NEON intrinsics directly (not extern asm), so the
+    // assignment must follow the same guard as the function body above.
+    FUNC_PTR_ASSIGN(gInstance->MNNFusedGatedDelta, MNNFusedGatedDeltaFp16);
+    FUNC_PTR_ASSIGN(gInstance->MNNDecodeConv1DSiluK4Fp16, MNNDecodeConv1DSiluK4Fp16);
+#endif
 #endif // MNN_SUPPORT_TRANSFORMER_FUSE
+
+#if defined(__aarch64__) && defined(MNN_USE_NEON)
+    // Packed-layout norm. Cannot inherit the base table's entry: that one assumes pack=4
+    // fp32 storage. Guarded like the kernel body; where it stays null CPULayerNorm's C4
+    // path reports NOT_SUPPORT rather than reading a stale fp32 entry.
+    FUNC_PTR_ASSIGN(gInstance->MNNNormPacked, MNNNormPackedFp16);
+#endif
+    FUNC_PTR_ASSIGN(gInstance->MNNRoPECompute, MNNRoPEComputeFP16);
 
     gInstance->MNNComputeMatMulForH_1 = _MNNComputeMatMulForH_1_FP16;
     gInstance->MNNComputeMatMulForE_1 = _MNNComputeMatMulForE_1_FP16;

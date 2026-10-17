@@ -22,8 +22,8 @@ private:
     struct GpuParam {
         ivec4 s0; // qLen, kLen, headNum, kvHeadNum
         ivec4 s1; // headDim, group, pastLen, totalLen
-        ivec4 s2; // maskQlen, maskKvlen, hasMask, cacheMaxLen
-        vec4 f0;  // scale, 0, 0, 0
+        ivec4 s2; // maskQlen, maskKvlen, maskMode(0:none,1:additive,2:causal), cacheMaxLen
+        vec4 f0;  // scale, 0, valueC4, outputC4
     };
 
     struct KVCache {
@@ -41,7 +41,10 @@ private:
 
     const Op* mOp = nullptr;
     bool mNeedKvCache = false;
+    bool mIsKVShared = false;
     bool mUseFP16 = false;
+    bool mValueC4 = false;
+    bool mOutputC4 = false;
     KVMeta* mMeta = nullptr;
 
     int mQueryLen = 0;
@@ -84,6 +87,7 @@ private:
     const VulkanPipeline* mQKBlockFullPipeline = nullptr;
     const VulkanPipeline* mQKBlockPipeline = nullptr;
     const VulkanPipeline* mSoftmaxOnlinePipeline = nullptr;
+    const VulkanPipeline* mSoftmaxSubgroupPipeline = nullptr; // subgroup-reduction softmax (when supported)
     const VulkanPipeline* mQKVAccFullPipeline = nullptr;
     const VulkanPipeline* mQKVAccPipeline = nullptr;
     const VulkanPipeline* mFinalizePipeline = nullptr;
@@ -91,12 +95,27 @@ private:
     std::shared_ptr<VulkanLayout::DescriptorSet> mQKBlockFullSet;
     std::shared_ptr<VulkanLayout::DescriptorSet> mQKBlockSet;
     std::shared_ptr<VulkanLayout::DescriptorSet> mSoftmaxOnlineSet;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mSoftmaxSubgroupSet;
     std::shared_ptr<VulkanLayout::DescriptorSet> mQKVAccFullSet;
     std::shared_ptr<VulkanLayout::DescriptorSet> mQKVAccSet;
     std::shared_ptr<VulkanLayout::DescriptorSet> mFinalizeSet;
 
     uint32_t mSoftmaxOnlineLocalSize = 0;
     uint32_t mDecodeQ1SubgroupLocalSize = 0;
+
+    // Cooperative matrix prefill path
+    bool mUseCoopMat = false;
+    uint32_t mCoopM = 0;
+    uint32_t mCoopN = 0;
+    uint32_t mCoopK = 0;
+    uint32_t mCoopSubgroupSize = 0;
+
+    const VulkanPipeline* mCoopQKPipeline = nullptr;
+    const VulkanPipeline* mCoopQKVPipeline = nullptr;
+    const VulkanPipeline* mCoopScaleOAccPipeline = nullptr;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mCoopQKSet;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mCoopQKVSet;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mCoopScaleOAccSet;
 };
 
 } // namespace MNN

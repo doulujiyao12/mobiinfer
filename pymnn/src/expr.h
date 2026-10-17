@@ -40,7 +40,8 @@ def_enum(Backend, MNNForwardType,
         MNN_FORWARD_METAL, "METAL",
         MNN_FORWARD_USER_1, "TRT",
         MNN_FORWARD_CUDA, "CUDA",
-        MNN_FORWARD_USER_0, "HIAI"
+        MNN_FORWARD_USER_0, "HIAI",
+        MNN_FORWARD_QNN, "QNN"
         )
 using MemoryMode = BackendConfig::MemoryMode;
 using PowerMode = BackendConfig::PowerMode;
@@ -1339,7 +1340,8 @@ static PyObject* PyMNNExpr_const(PyObject *self, PyObject *args, PyObject *kwarg
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|OO", kwlist, &value, &shapes, &format, &type)) {
         PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule/int_addr, [ints], |data_format, dtype)");
     }
-    if ((!isVals(value) && !isInt(value)) || !isInts(shapes) || (format != nullptr && !isdata_format(format)) || (type != nullptr && !isdtype(type))) {
+    if ((!isVals(value) && !isInt(value)) || !isInts(shapes) || (format != nullptr && !isdata_format(format)) ||
+        (type != nullptr && !isdtype(type))) {
         PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule/int_addr, [ints], |data_format, dtype)");
     }
     auto data_format = (format == nullptr ? NCHW : toEnum<Dimensionformat>(format));
@@ -1363,6 +1365,10 @@ static PyObject* PyMNNExpr_const(PyObject *self, PyObject *args, PyObject *kwarg
         if (PyCapsule_CheckExact(value)) {
             data = PyCapsule_GetPointer(value, NULL);
         } else if (isInt(value)) {
+            // Retain raw integer addresses for compatibility despite the memory-safety risk.
+            // Callers must keep a readable buffer of the required shape/format/dtype alive
+            // throughout this call. Invalid addresses or undersized buffers can cause
+            // out-of-bounds reads or crashes.
             data = PyLong_AsVoidPtr(value);
         } else if (PyBytes_Check(value)) {
             int64_t bytesize = PyBytes_Size(value);

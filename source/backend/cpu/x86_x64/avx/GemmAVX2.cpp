@@ -31,36 +31,6 @@ void _AVX_MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t
     AVX2GemmPostTreat(C, eSize, parameter, postParameters, bias);
 }
 
-#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
-void _AVX_MNNPackedMatMul_int4(float* C, const float* A, const float* B, const size_t* parameter,
-                               const float* postParameters, const float* bias, const float* k, const float* b) {
-    _AVX_MNNPackedMatMul_Main_int4(C, A, B, parameter, k, b);
-    if (nullptr != bias) {
-        AVX2GemmPostTreat(C, MNN_UNIT_E, parameter, postParameters, bias);
-    }
-}
-void _AVX_MNNPackedMatMulRemain_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter,
-                             const float* postParameters, const float* bias, const float* k, const float* b) {
-    _AVX_MNNPackednMatMulRemainCommon_int4(C, A, B, eSize, parameter, k, b);
-    if (nullptr != bias) {
-        AVX2GemmPostTreat(C, eSize, parameter, postParameters, bias);
-    }
-}
-void _AVX_MNNPackedMatMul_int8(float* C, const float* A, const float* B, const size_t* parameter,
-                               const float* postParameters, const float* bias, const float* k, const float* b) {
-    _AVX_MNNPackedMatMul_Main_int8(C, A, B, parameter, k, b);
-    if (nullptr != bias) {
-        AVX2GemmPostTreat(C, MNN_UNIT_E, parameter, postParameters, bias);
-    }
-}
-void _AVX_MNNPackedMatMulRemain_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter,
-                             const float* postParameters, const float* bias, const float* k, const float* b) {
-    _AVX_MNNPackednMatMulRemainCommon_int8(C, A, B, eSize, parameter, k, b);
-    if (nullptr != bias) {
-        AVX2GemmPostTreat(C, eSize, parameter, postParameters, bias);
-    }
-}
-#endif
 
 #ifdef MNN_LOW_MEMORY
 void _AVX_MNNAbsMaxFP32(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
@@ -216,7 +186,7 @@ void _AVX_MNNAsyQuantInfo(float* scale, float* bias, float* qscale, float* qbias
             scale[0] = 1.f;
             qscale[0] = 1.f;
             qbias[0] = -maxval;
-            bias[0] = maxval;
+            bias[0] = maxval - 128.f;
         } else {
             qscale[0] = 255.f / range;
             scale[0] = range / 255.f;
@@ -294,7 +264,7 @@ void _AVX_MNNAsyQuantInfo(float* scale, float* bias, float* qscale, float* qbias
                 qscale[qind] = 255.f / (max_ - min_);
                 qbias[qind] = roundf(-min_ * 255.f / (max_ - min_)) - 128.0f;
                 scalePtr[0] = (max_ - min_) / 255.f;
-                biasPtr[0] = min_;
+                biasPtr[0] = -(qbias[qind] + 128.f) * scalePtr[0];
             }
             realDstCount -= 1;
             qind += 1;

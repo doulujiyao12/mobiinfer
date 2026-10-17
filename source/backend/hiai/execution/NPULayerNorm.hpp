@@ -41,6 +41,10 @@ private:
     // Numerically same as mTileMultConst but kept separate for semantic
     // clarity (one is "Tile multiples" and one is "Reshape target shape").
     hiai::op::Const mAffineShapeConst;
+    hiai::op::Const constReshapeShape;
+    hiai::op::Const constOutputShape;
+    hiai::op::Const constNormGamma;
+    hiai::op::Const constNormBeta;
 };
 } // namespace MNN
 

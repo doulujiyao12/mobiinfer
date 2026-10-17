@@ -24,11 +24,15 @@ public:
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
+    virtual void prebuildOpenCLPrograms(const std::vector<Tensor*>& inputs,
+                                        const std::vector<Tensor*>& outputs) override;
+
 private:
     int getExecuteTime();
     void getInfoFromOpLowMemory(void *weight_ptr);
     void set1x1WeightLowMemory();
     void setGeneralWeightLowMemory();
+    void submitPrebuildPrograms(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
     void tuneGeneralCaseLowMemory(Tensor * input, Tensor * output);
 	void useFPWeightGemmLowMemory(Tensor * input, Tensor * output);
     void tuneGemvLowMemory(Tensor * input, Tensor * output);
@@ -45,6 +49,8 @@ private:
     std::shared_ptr<KernelWrap> mBufferToConv1x1Kernel = nullptr;
     uint32_t batchConvMode = 0; // batch > 1 convolution input arrage mode. 0 is need tune; 1 arrage to n/4chw4; 2 arrage to c/4hwn4
     std::shared_ptr<StrassenMatrixComputor> mStrassenComputor;
+    cl_mem mInputImage1d = nullptr;
+    cl_mem mGemmInputImage1d = nullptr;
 };
 
 } // namespace OpenCL

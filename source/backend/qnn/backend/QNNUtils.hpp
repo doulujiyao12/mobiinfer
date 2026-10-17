@@ -17,27 +17,28 @@
 #include "HTP/QnnHtpDevice.h"
 #include <MNN/HalideRuntime.h>
 #include <map>
+#include <string>
 #include "core/TensorUtils.hpp"
 
-#ifdef MNN_USE_ARMV82
-// FP32 <--> FP16 Function
-#include "backend/arm82/Arm82OptFunc.hpp"
-#define FLOAT_TO_HALF MNNQuantizeFP16
-#define HALF_TO_FLOAT MNNDequantizeFP16
-#else
 #include "half.hpp"
 #define FLOAT_TO_HALF QNN::QnnFloatToHalf
 #define HALF_TO_FLOAT QNN::QnnHalfToFloat
-#endif // MNN_USE_ARMV82
 
-#define CALL_QNN(apiCall)                                                       \
-    do {                                                                        \
-        int errorCode = ((apiCall) & 0xFFFF);                                   \
-        if (errorCode != QNN_SUCCESS) {                                         \
-            MNN_ERROR("Error in file %s, line %d: error code %d\n",             \
-                    __FILE__, __LINE__, errorCode);                             \
-            assert(errorCode == QNN_SUCCESS);                                   \
-        }                                                                       \
+#define CALL_QNN(apiCall)                                                                           \
+    do {                                                                                            \
+        int errorCode = ((apiCall) & 0xFFFF);                                                       \
+        if (errorCode != QNN_SUCCESS) {                                                             \
+            MNN_ERROR("Error in file %s, line %d: error code %d\n", __FILE__, __LINE__, errorCode); \
+        }                                                                                           \
+    } while (0)
+
+#define CALL_QNN_CHECK(apiCall, failAction)                                                         \
+    do {                                                                                            \
+        int errorCode = ((apiCall) & 0xFFFF);                                                       \
+        if (errorCode != QNN_SUCCESS) {                                                             \
+            MNN_ERROR("Error in file %s, line %d: error code %d\n", __FILE__, __LINE__, errorCode); \
+            failAction;                                                                             \
+        }                                                                                           \
     } while (0)
 
 #define DEFAULT_QUANTIZE_PARAMS     (Qnn_QuantizeParams_t { \
@@ -49,25 +50,35 @@
 namespace MNN {
 namespace QNN {
 
-#ifndef MNN_USE_ARMV82
+enum class QnnBackendKind {
+    None,
+    Htp,
+    Dsp,
+};
 
 void QnnFloatToHalf(const float* src, int16_t* dst, size_t size);
 
 void QnnHalfToFloat(const int16_t* src, float* dst, size_t size);
 
-#endif
-
 // the only symbol requiring dynamic loading
 typedef Qnn_ErrorHandle_t (*QnnInterface_getProviders_t)(const QnnInterface_t*** providerList, uint32_t* numProviders);
 extern QnnInterface_getProviders_t QnnInterface_getProviders;
 
-#ifdef MNN_WITH_PLUGIN
+#if defined(MNN_WITH_PLUGIN) || defined(MNN_QNN_OFFLINE_CONTEXT)
 typedef Qnn_ErrorHandle_t (*QnnSystemInterface_getProviders_t)(const QnnSystemInterface_t*** providerList,
                                                   uint32_t* numProviders);
 extern QnnSystemInterface_getProviders_t QnnSystemInterface_getProviders;
 #endif
 
 bool loadQNNSymbol();
+bool loadQNNSymbol(QnnBackendKind backend,
+                   const std::string& libraryDirectory = {});
+bool isDefaultQNNRuntimeAvailable();
+bool loadQNNSystemSymbol(const std::string& libraryDirectory = {});
+QnnBackendKind getLoadedQNNBackend();
+const char* getLoadedQNNBackendName();
+bool isLoadedQNNLibraryCompatible(QnnBackendKind backend,
+                                  const std::string& libraryDirectory);
 bool checkCapability(QNN_INTERFACE_VER_TYPE qnnInterface, QnnProperty_Key_t key);
 
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
@@ -85,6 +96,7 @@ extern void ___QNNConcatCreator__OpType_Pack__();
 extern void ___QNNConcatCreator__OpType_Unpack__();
 extern void ___QNNConvDepthwiseCreator__OpType_ConvolutionDepthwise__();
 extern void ___QNNConvolutionCreator__OpType_Convolution__();
+extern void ___QNNDeconvolutionCreator__OpType_Deconvolution__();
 extern void ___QNNFlattenCreator__OpType_Flatten__();
 extern void ___QNNLayerNormCreator__OpType_LayerNorm__();
 extern void ___QNNPaddingCreator__OpType_Padding__();
@@ -113,14 +125,15 @@ extern void ___QNNAttentionCreator__OpType_Attention__();
 extern void ___QNNQuantCreator__OpType_FloatToInt8__();
 extern void ___QNNDeQuantCreator__OpType_Int8ToFloat__();
 extern void ___QNNTopKV2Creator__OpType_TopKV2__();
+extern void ___QNNInterpCreator__OpType_Interp__();
 
 void registerQNNOps();
 
 extern Tensor::DimensionType gQnnTensorDimType;
 
-extern const std::map<Qnn_DataType_t, uint32_t> gQnnTypeSize;
+const std::map<Qnn_DataType_t, uint32_t>& qnnTypeSizes();
 
-extern std::string gParamMarker;
+extern const char gParamMarker[];
 
 std::vector<uint32_t> getNHWCShape(const Tensor * tensor);
 

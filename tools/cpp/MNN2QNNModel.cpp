@@ -11,14 +11,16 @@
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
 #include "core/MNNFileUtils.h"
+#ifndef _WIN32
 #include <sys/utsname.h>
+#endif
 
 using namespace rapidjson;
 
 using namespace MNN::Express;
 using namespace MNN;
 
-static bool generateConfigFile(const std::string & qnnSDKPath, int socID, int dspArch, const std::vector<std::string> & graphNameVec, const std::string & outputDir, std::string & configPath, std::string & subConfigPath) {
+static bool generateConfigFile(const std::string & qnnSDKPath, int socID, int dspArch, const std::vector<std::string> & graphNameVec, const std::string & outputDir, std::string & configPath, std::string & subConfigPath, bool tblive) {
     configPath = MNNFilePathConcat(outputDir, "context_config.json");
     subConfigPath = MNNFilePathConcat(outputDir, "htp_backend_extensions.json");
 
@@ -46,7 +48,16 @@ static bool generateConfigFile(const std::string & qnnSDKPath, int socID, int ds
     // "graphs" section
     rapidjson::Value graphs(rapidjson::kArrayType);
     rapidjson::Value graphObj(rapidjson::kObjectType);
-    graphObj.AddMember("vtcm_mb", 8, htpConfigAllocator);
+    int vtcmMb = 8;
+    if (tblive) {
+        if (const char* vtcmEnv = getenv("MNN_QNN_CONVERT_VTCM_MB")) {
+            const int value = atoi(vtcmEnv);
+            if (value > 0) {
+                vtcmMb = value;
+            }
+        }
+    }
+    graphObj.AddMember("vtcm_mb", vtcmMb, htpConfigAllocator);
     rapidjson::Value names(rapidjson::kArrayType);
     for (const auto& name : graphNameVec) {
         names.PushBack(rapidjson::Value(name.c_str(), contextAllocator).Move(), htpConfigAllocator);
@@ -77,7 +88,7 @@ static bool generateConfigFile(const std::string & qnnSDKPath, int socID, int ds
 
     // "context" section
     rapidjson::Value contextObj(rapidjson::kObjectType);
-    contextObj.AddMember("weight_sharing_enabled", true, htpConfigAllocator);
+    contextObj.AddMember("weight_sharing_enabled", !tblive, htpConfigAllocator);
     htpConfigDoc.AddMember("context", contextObj, htpConfigAllocator);
 
     rapidjson::StringBuffer htpConfigBuffer;
@@ -129,6 +140,12 @@ static bool parseDims(const std::string& s, std::vector<std::vector<int>>& out) 
 }
 
 static bool checkSystem() {
+#ifdef _WIN32
+    // On Windows, skip the system check as this tool is primarily for Linux
+    // but we allow it to compile on Windows for development purposes
+    MNN_PRINT("Warning: This tool is designed for x86_64 Linux systems. Running on Windows may have limitations.\n");
+    return true;
+#else
     struct utsname buf;
     if (uname(&buf) != 0) {
         MNN_ERROR("uname error\n");
@@ -139,12 +156,13 @@ static bool checkSystem() {
     }
     MNN_ERROR("This program must be run on a x86_64 Linux system. Current system: %s %s\n", buf.sysname, buf.machine);
     return false;
+#endif
 }
 
 int main(int argc, const char* argv[]) {
     if (argc < 6) {
         MNN_PRINT("This tool generates offline caches for the QNN backend.");
-        MNN_PRINT("Usage: %s <qnnSDKPath> <socId> <hexagonArch> <srcMNNPath> <outputDir> [totalShapeNum] [inputShape1] [inputShape2] ...\n", argv[0]);
+        MNN_PRINT("Usage: %s <qnnSDKPath> <socId> <hexagonArch> <srcMNNPath> <outputDir> [totalShapeNum] [inputShape1] [inputShape2] ... [--dump_intermediate_outputs] [--tblive]\n", argv[0]);
         MNN_PRINT("    <qnnSDKPath>      : Path to the QNN SDK directory.\n");
         MNN_PRINT("    <socId>           : Target SoC ID.\n");
         MNN_PRINT("                        Common SoCs: 8Gen2 -> 43, 8Gen3 -> 57, 8 Elite -> 69. For others, please refer to Qualcomm's documentation.\n");
@@ -155,6 +173,8 @@ int main(int argc, const char* argv[]) {
         MNN_PRINT("    [<totalShapeNum>] : Optional. Number of dynamic input shape configurations.\n");
         MNN_PRINT("    [<inputShapeN>]   : Optional. Input shape configuration. Can be a shape string or a path to a .mnn file.\n");
         MNN_PRINT("                     Shape string format for multiple inputs: dim1xdim2_dim3xdim4. Example: 1x3x512x512_1x256\n");
+        MNN_PRINT("    [--dump_intermediate_outputs] : Optional. Build a debug artifact with QNN intermediate outputs.\n");
+        MNN_PRINT("    [--tblive] : Optional. Enable TBLive QNN layout and quantization extensions. The default preserves the legacy QNN contract.\n");
         MNN_PRINT("Examples:\n");
         MNN_PRINT("  1. Use default shape from the MNN model:\n");
         MNN_PRINT("     %s /path/to/qnn/sdk 57 75 /path/to/model.mnn /path/to/output\n", argv[0]);
@@ -169,10 +189,37 @@ int main(int argc, const char* argv[]) {
         return -1;
     }
 
-    std::string qnnSdkPath = argv[1];
-    int socId = std::stoi(std::string(argv[2]));
-    int hexagonArch = std::stoi(std::string(argv[3]));
-    const char* srcMNNPath = argv[4];
+    std::vector<const char*> arguments;
+    arguments.reserve(argc);
+    arguments.emplace_back(argv[0]);
+    bool dumpIntermediateOutputs = false;
+    bool tblive = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument(argv[i]);
+        if (argument == "--tblive") {
+            tblive = true;
+            continue;
+        }
+        if (argument == "--dump_intermediate_outputs") {
+            dumpIntermediateOutputs = true;
+            continue;
+        }
+        if (argument.size() > 2 && argument[0] == '-' && argument[1] == '-') {
+            MNN_ERROR("Unknown option: %s\n", argv[i]);
+            return -1;
+        }
+        arguments.emplace_back(argv[i]);
+    }
+    const int argumentCount = static_cast<int>(arguments.size());
+    if (argumentCount < 6) {
+        MNN_ERROR("MNN2QNNModel: missing required positional arguments.\n");
+        return -1;
+    }
+
+    std::string qnnSdkPath = arguments[1];
+    int socId = std::stoi(std::string(arguments[2]));
+    int hexagonArch = std::stoi(std::string(arguments[3]));
+    const char* srcMNNPath = arguments[4];
     std::string modelBaseName = [](const std::string& path) {
         std::string filename = path;
         auto pos = path.find_last_of("/\\");
@@ -186,7 +233,11 @@ int main(int argc, const char* argv[]) {
         return filename;
     }(srcMNNPath);
     std::string modelSignature = "_" + std::to_string(socId) + "_" + std::to_string(hexagonArch);
-    std::string outputDir = argv[5];
+    std::string outputDir = arguments[5];
+    if (!MNNCreateDir(outputDir.c_str())) {
+        MNN_ERROR("Failed to create output directory: %s\n", outputDir.c_str());
+        return -1;
+    }
     std::string dstMNNPath = MNNFilePathConcat(outputDir, modelBaseName + modelSignature + ".mnn");
 
     std::vector<std::string> inputNames;
@@ -198,29 +249,33 @@ int main(int argc, const char* argv[]) {
     std::vector<std::vector<MNN::Express::VARP>> inputsVarpList;
 
     int totalShapeType = 1;
-    if(argc > 6) {
-        totalShapeType = std::stoi(argv[6]);
+    if (argumentCount > 6) {
+        totalShapeType = std::stoi(arguments[6]);
+        if (totalShapeType <= 0 || argumentCount < 7 + totalShapeType) {
+            MNN_ERROR("MNN2QNNModel: invalid dynamic input shape arguments.\n");
+            return -1;
+        }
         std::vector<std::vector<int>> temp;
-        if(parseDims(argv[7], temp)) {
+        if (parseDims(arguments[7], temp)) {
             inputShapeLists.resize(totalShapeType);
-            for(int i = 0; i < totalShapeType; i++) {
+            for (int i = 0; i < totalShapeType; i++) {
                 // Each inputs shape in model: 128x1x897_1x1x128x128_1x128
-                if(!parseDims(argv[7+i], inputShapeLists[i])) {
+                if (!parseDims(arguments[7 + i], inputShapeLists[i])) {
                     return -1;
                 }
             }
         } else {
             inputsVarpList.resize(totalShapeType);
-            for(int i = 0; i < totalShapeType; i++) {
-                inputsVarpList[i] = MNN::Express::Variable::load(argv[7+i]);
+            for (int i = 0; i < totalShapeType; i++) {
+                inputsVarpList[i] = MNN::Express::Variable::load(arguments[7 + i]);
             }
-            inputs = MNN::Express::Variable::load(argv[7]);
-            for (int i=0; i<inputs.size(); ++i) {
+            inputs = MNN::Express::Variable::load(arguments[7]);
+            for (int i = 0; i < inputs.size(); ++i) {
                 inputNames.emplace_back(inputs[i]->name());
             }
-            if(argc > 7+totalShapeType) {
-                outputs = MNN::Express::Variable::load(argv[7+totalShapeType]);
-                for (int i=0; i<outputs.size(); ++i) {
+            if (argumentCount > 7 + totalShapeType) {
+                outputs = MNN::Express::Variable::load(arguments[7 + totalShapeType]);
+                for (int i = 0; i < outputs.size(); ++i) {
                     outputNames.emplace_back(outputs[i]->name());
                 }
             }
@@ -255,7 +310,10 @@ int main(int argc, const char* argv[]) {
         }
 
         MNN::ScheduleConfig config;
-        config.type = MNN_CONVERT_QNN;
+        config.type = tblive ? MNN_FORWARD_QNN : MNN_CONVERT_QNN;
+        MNN::BackendConfig backendConfig;
+        backendConfig.flags = dumpIntermediateOutputs ? MNN_QNN_DUMP_INTERMEDIATE_OUTPUTS : 0;
+        config.backendConfig = &backendConfig;
         std::shared_ptr<Executor::RuntimeManager> rtmgr(Executor::RuntimeManager::createRuntimeManager(config));
         rtmgr->setCache(curQnnModelDir.c_str());
         MNN::Express::Module::Config mConfig;
@@ -342,7 +400,7 @@ int main(int argc, const char* argv[]) {
     std::string npuArtifactPath = MNNFilePathConcat(outputDir, npuArtifactName);
     {
         std::string configPath, subConfigPath;
-        if (!generateConfigFile(qnnSdkPath, socId, hexagonArch, qnnGraphNames, outputDir, configPath, subConfigPath)) {
+        if (!generateConfigFile(qnnSdkPath, socId, hexagonArch, qnnGraphNames, outputDir, configPath, subConfigPath, tblive)) {
             MNN_ERROR("[Error]: Failed to generate the config file!\n");
             return -1;
         }
@@ -456,6 +514,11 @@ int main(int argc, const char* argv[]) {
     for(int i = 0; i < qnnGraphNames.size(); i++) {
         attr->list->s[i] = qnnGraphNames[i];
     }
+    extra->attr.emplace_back(std::move(attr));
+    attr.reset(new MNN::AttributeT);
+
+    attr->key = "dump_intermediate_outputs";
+    attr->i = dumpIntermediateOutputs ? 1 : 0;
     extra->attr.emplace_back(std::move(attr));
     attr.reset(new MNN::AttributeT);
 

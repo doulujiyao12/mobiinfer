@@ -108,6 +108,9 @@ For the following tasks, **read the Skill entry file first** and execute step by
 
 ### 主要方案：单张 ViT 离线图 + 外置权重 + CPU LLM
 
+MNN 主线升级后的兼容修正、GPTQ 导出注意事项与数值验收见
+[MNN 主线合并与鸿蒙双模式验证](docs/inference/mnn-upstream-integration.md)。升级时必须检查连续 decoding，不能只检查 prefill 或权重字节。
+
 **现在“离线NPU”默认指本方案，原“离线NPU-2”按钮已改为“离线NPU”。**
 先阅读 [单图视觉离线 NPU 实现与验证](transformers/llm/export/kirin_hybrid_offline/README.md)。
 

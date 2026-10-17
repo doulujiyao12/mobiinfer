@@ -72,7 +72,7 @@ ErrorCode QNNCommonExecution::onEncode(const std::vector<Tensor *> &inputs, cons
 }
 
 ErrorCode QNNCommonExecution::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    return NO_ERROR;
+    return mBackend->isDedicatedQnnSession() ? mBackend->runGraphOnce() : NO_ERROR;
 }
 
 void QNNCommonExecution::setNodeName(const Op * op, const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
@@ -138,8 +138,19 @@ std::shared_ptr<QNNTensorWrapper> QNNCommonExecution::createStageTensor(const st
         tScaleOffsetEncoding.offset = mBackend->getNativeTensor(tensor)->v1.quantizeParams.scaleOffsetEncoding.offset;
         quantize.scaleOffsetEncoding = tScaleOffsetEncoding;
     }
-    std::shared_ptr<QNNTensorWrapper> tensorWrapper = QNNTensorWrapper::create(tensorName, QNN_TENSOR_TYPE_NATIVE, dataType, dimensions, quantize);
+    bool dumpTensor = mBackend->canDumpTensor(dataType, tensorName);
+    const auto tensorType = dumpTensor ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
+    std::shared_ptr<QNNTensorWrapper> tensorWrapper =
+        QNNTensorWrapper::create(tensorName, tensorType, dataType, dimensions, quantize);
+    if (dumpTensor && !mBackend->prepareDebugTensor(tensorWrapper)) {
+        tensorWrapper->getNativeTensor()->v1.type = QNN_TENSOR_TYPE_NATIVE;
+        dumpTensor = false;
+    }
+    // QNN requires APP_READ client buffers to remain null at graph-tensor creation.
     mBackend->addTensor(tensorWrapper->getNativeTensor());
+    if (dumpTensor && !mBackend->registerDebugTensor(tensorWrapper)) {
+        MNN_ERROR("MNN_QNN: Intermediate tensor %s will not be dumped.\n", tensorName.c_str());
+    }
     mTempTensorWrappers.push_back(tensorWrapper);
     return tensorWrapper;
 }

@@ -103,6 +103,30 @@ __kernel void conv2d_filter_buffer_to_nc4hw4_buffer_int4(GLOBAL_SIZE_2_DIMS
 }
 #endif
 
+#define INT4_2_UCHAR16(a, index)                                                                             \
+{                                                                                                            \
+    int index0 = yin * input_channel + xin + index;                                                          \
+    int index1 = (yin + 1) * input_channel + xin + index;                                                    \
+    int index2 = (yin + 2) * input_channel + xin + index;                                                    \
+    int index3 = (yin + 3) * input_channel + xin + index;                                                    \
+    int index4 = (yin + 4) * input_channel + xin + index;                                                    \
+    int index5 = (yin + 5) * input_channel + xin + index;                                                    \
+    int index6 = (yin + 6) * input_channel + xin + index;                                                    \
+    int index7 = (yin + 7) * input_channel + xin + index;                                                    \
+    uchar s0 = input_ptr[index0/2];                                                                          \
+    uchar s1 = input_ptr[index1/2];                                                                          \
+    uchar s2 = input_ptr[index2/2];                                                                          \
+    uchar s3 = input_ptr[index3/2];                                                                          \
+    uchar s4 = input_ptr[index4/2];                                                                          \
+    uchar s5 = input_ptr[index5/2];                                                                          \
+    uchar s6 = input_ptr[index6/2];                                                                          \
+    uchar s7 = input_ptr[index7/2];                                                                          \
+    a.s0 = ((index0 % 2) == 0 ? (s0 & 0xf0) : (s0 << 4)) | ((index1 % 2) == 0 ? (s1 >> 4) : (s1 & 0x0f));    \
+    a.s1 = ((index2 % 2) == 0 ? (s2 & 0xf0) : (s2 << 4)) | ((index3 % 2) == 0 ? (s3 >> 4) : (s3 & 0x0f));    \
+    a.s2 = ((index4 % 2) == 0 ? (s4 & 0xf0) : (s4 << 4)) | ((index5 % 2) == 0 ? (s5 >> 4) : (s5 & 0x0f));    \
+    a.s3 = ((index6 % 2) == 0 ? (s6 & 0xf0) : (s6 << 4)) | ((index7 % 2) == 0 ? (s7 >> 4) : (s7 & 0x0f));    \
+} 
+
 __kernel void conv2d_1x1_weight_quant_image(GLOBAL_SIZE_2_DIMS
 #ifdef USE_LOW_BIT_WEIGHT_INT4
                                             __global const uchar *input_ptr,
@@ -121,29 +145,10 @@ __kernel void conv2d_1x1_weight_quant_image(GLOBAL_SIZE_2_DIMS
     const int yin = y << 3;
 #ifdef USE_LOW_BIT_WEIGHT_INT4
     uchar16 out = 0;
-    uchar *out_ptr = (uchar*)&out;
-    for(int i = 0; i < 4; ++i){
-        int index0 = yin * input_channel + xin + i;
-        int index1 = (yin + 1) * input_channel + xin + i;
-        int index2 = (yin + 2) * input_channel + xin + i;
-        int index3 = (yin + 3) * input_channel + xin + i;
-        int index4 = (yin + 4) * input_channel + xin + i;
-        int index5 = (yin + 5) * input_channel + xin + i;
-        int index6 = (yin + 6) * input_channel + xin + i;
-        int index7 = (yin + 7) * input_channel + xin + i;
-        uchar s0 = input_ptr[index0/2];
-        uchar s1 = input_ptr[index1/2];
-        uchar s2 = input_ptr[index2/2];
-        uchar s3 = input_ptr[index3/2];
-        uchar s4 = input_ptr[index4/2];
-        uchar s5 = input_ptr[index5/2];
-        uchar s6 = input_ptr[index6/2];
-        uchar s7 = input_ptr[index7/2];
-        out_ptr[i * 4] = ((index0 % 2) == 0 ? (s0 & 0xf0) : (s0 << 4)) | ((index1 % 2) == 0 ? (s1 >> 4) : (s1 & 0x0f));
-        out_ptr[i * 4 + 1] = ((index2 % 2) == 0 ? (s2 & 0xf0) : (s2 << 4)) | ((index3 % 2) == 0 ? (s3 >> 4) : (s3 & 0x0f));
-        out_ptr[i * 4 + 2] = ((index4 % 2) == 0 ? (s4 & 0xf0) : (s4 << 4)) | ((index5 % 2) == 0 ? (s5 >> 4) : (s5 & 0x0f));
-        out_ptr[i * 4 + 3] = ((index6 % 2) == 0 ? (s6 & 0xf0) : (s6 << 4)) | ((index7 % 2) == 0 ? (s7 >> 4) : (s7 & 0x0f));
-    }
+    INT4_2_UCHAR16(out.s0123, 0);
+    INT4_2_UCHAR16(out.s4567, 1);
+    INT4_2_UCHAR16(out.s89ab, 2);
+    INT4_2_UCHAR16(out.scdef, 3);
     write_imagei(output, (int2)(x, y), as_int4(out));
 #else
     const int inputOffset = yin * input_channel + xin;
@@ -163,7 +168,7 @@ __kernel void conv2d_1x1_weight_quant_image(GLOBAL_SIZE_2_DIMS
 }
 
 __kernel void conv2d_1x1_weight_quant_buffer(GLOBAL_SIZE_2_DIMS
-#ifdef USE_LOW_BIT_WEIGHT_INT4
+#if defined(USE_LOW_BIT_WEIGHT_INT4)
                                             __global const uchar *input_ptr,
 #else
                                             __global const char *input_ptr,
@@ -179,31 +184,56 @@ __kernel void conv2d_1x1_weight_quant_buffer(GLOBAL_SIZE_2_DIMS
     const int yin = y << 3;
     const int outputChannelC8 = (output_channel + 7) >> 3;
     const int inputChannelC4 = (input_channel + 3) >> 2;
-#ifdef USE_LOW_BIT_WEIGHT_INT4
-    uchar16 out = 0;
-    uchar *out_ptr = (uchar*)&out;
-    for(int i = 0; i < 4; ++i){
-        int index0 = yin * input_channel + xin + i;
-        int index1 = (yin + 1) * input_channel + xin + i;
-        int index2 = (yin + 2) * input_channel + xin + i;
-        int index3 = (yin + 3) * input_channel + xin + i;
-        int index4 = (yin + 4) * input_channel + xin + i;
-        int index5 = (yin + 5) * input_channel + xin + i;
-        int index6 = (yin + 6) * input_channel + xin + i;
-        int index7 = (yin + 7) * input_channel + xin + i;
-        uchar s0 = input_ptr[index0/2];
-        uchar s1 = input_ptr[index1/2];
-        uchar s2 = input_ptr[index2/2];
-        uchar s3 = input_ptr[index3/2];
-        uchar s4 = input_ptr[index4/2];
-        uchar s5 = input_ptr[index5/2];
-        uchar s6 = input_ptr[index6/2];
-        uchar s7 = input_ptr[index7/2];
-        out_ptr[i * 4] = ((index0 % 2) == 0 ? (s0 & 0xf0) : (s0 << 4)) | ((index1 % 2) == 0 ? (s1 >> 4) : (s1 & 0x0f));
-        out_ptr[i * 4 + 1] = ((index2 % 2) == 0 ? (s2 & 0xf0) : (s2 << 4)) | ((index3 % 2) == 0 ? (s3 >> 4) : (s3 & 0x0f));
-        out_ptr[i * 4 + 2] = ((index4 % 2) == 0 ? (s4 & 0xf0) : (s4 << 4)) | ((index5 % 2) == 0 ? (s5 >> 4) : (s5 & 0x0f));
-        out_ptr[i * 4 + 3] = ((index6 % 2) == 0 ? (s6 & 0xf0) : (s6 << 4)) | ((index7 % 2) == 0 ? (s7 >> 4) : (s7 & 0x0f));
+#if defined(USE_LOW_BIT_WEIGHT_INT2)
+    // 2bit packed: 8 bytes per (4IC, 8OC) tile.
+    // For each IC i in 0..3, byte 2*i covers OC[0..3] (bits [7:6]=OC0, [5:4]=OC1, [3:2]=OC2, [1:0]=OC3),
+    // byte 2*i+1 covers OC[4..7]. Stored value = signed_weight + 2 in [0,3].
+    __global uchar* outU = (__global uchar*)output_ptr + (y * inputChannelC4 + x) * 8;
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 2; ++k) {
+            uchar packed = 0;
+            for (int j = 0; j < 4; ++j) {
+                int oc = yin + k * 4 + j;
+                int ic = xin + i;
+                int v = 0;
+                if (oc < output_channel && ic < input_channel) {
+                    v = (int)input_ptr[oc * input_channel + ic] + 2;
+                }
+                packed |= ((uchar)(v & 3)) << (6 - j * 2);
+            }
+            outU[i * 2 + k] = packed;
+        }
     }
+#elif defined(USE_LOW_BIT_WEIGHT_INT3)
+    // 3bit packed: 12 bytes per (4IC, 8OC) tile.
+    // Bytes 0..7  = low 2 bits (same layout as w2 above).
+    // Bytes 8..11 = high 1 bit, byte i covers IC i with bit position (7-(k*4+j)) for OC (k*4+j).
+    // Stored value = signed_weight + 4 in [0,7].
+    __global uchar* outU = (__global uchar*)output_ptr + (y * inputChannelC4 + x) * 12;
+    for (int i = 0; i < 4; ++i) {
+        uchar hi = 0;
+        for (int k = 0; k < 2; ++k) {
+            uchar packed_lo = 0;
+            for (int j = 0; j < 4; ++j) {
+                int oc = yin + k * 4 + j;
+                int ic = xin + i;
+                int v = 0;
+                if (oc < output_channel && ic < input_channel) {
+                    v = (int)input_ptr[oc * input_channel + ic] + 4;
+                }
+                packed_lo |= ((uchar)(v & 3)) << (6 - j * 2);
+                hi |= ((uchar)((v >> 2) & 1)) << (7 - (k * 4 + j));
+            }
+            outU[i * 2 + k] = packed_lo;
+        }
+        outU[8 + i] = hi;
+    }
+#elif defined(USE_LOW_BIT_WEIGHT_INT4)
+    uchar16 out = 0;
+    INT4_2_UCHAR16(out.s0123, 0);
+    INT4_2_UCHAR16(out.s4567, 1);
+    INT4_2_UCHAR16(out.s89ab, 2);
+    INT4_2_UCHAR16(out.scdef, 3);
     const int outputOffset = (y * inputChannelC4 + x) * 16;
     vstore16(as_char16(out),0,output_ptr+outputOffset);
 #else

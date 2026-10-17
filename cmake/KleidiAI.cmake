@@ -15,6 +15,13 @@
 #   download_kleidiai_and_collect_sources()
 #   Use MNN_SOURCES_KLEIDIAI and KLEIDIAI_FILES_SME2 in subsequent build steps.
 # ------------------------------------------------------------------------------
+
+# Capture the MNN cmake/ directory at include time. Inside a CMake function,
+# CMAKE_CURRENT_LIST_DIR resolves to the *caller's* directory, so we must
+# snapshot it here (file scope) to always get the MNN repo root regardless of
+# whether MNN is the top-level project or an embedded dependency.
+set(_MNN_KLEIDIAI_CMAKE_LIST_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
 function (download_kleidiai_and_collect_sources)
     set(MNN_SOURCES_KLEIDIAI "" PARENT_SCOPE)
     set(KLEIDIAI_FILES_SME2 "" PARENT_SCOPE)
@@ -22,15 +29,19 @@ function (download_kleidiai_and_collect_sources)
     # Disable the KleidiAI tests
     set(KLEIDIAI_BUILD_TESTS OFF)
 
-    set(KLEIDIAI_COMMIT_SHA "1.14.0")
+    set(KLEIDIAI_COMMIT_SHA "1.16.0")
     set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/archive/refs/tags/v${KLEIDIAI_COMMIT_SHA}.tar.gz")
-    set(KLEIDIAI_ARCHIVE_MD5 "45e110675d93f99f82c23a1afcca76bc")
+    set(KLEIDIAI_ARCHIVE_MD5 "0a9e9008adb6031f9e8cf70dff4a3321")
 
     set(_kleidiai_src_dir "")
     if(DEFINED KLEIDIAI_SRC_DIR AND EXISTS "${KLEIDIAI_SRC_DIR}")
         set(_kleidiai_src_dir "${KLEIDIAI_SRC_DIR}")
     else()
-        set(_deps_dir "${CMAKE_BINARY_DIR}/_deps")
+        # Anchor downloads to MNN's own binary dir. CMAKE_BINARY_DIR points at the
+        # top-level project's build tree, which is wrong (and pollutes the parent)
+        # when MNN is consumed as a subproject. CMAKE_CURRENT_BINARY_DIR follows the
+        # include() chain and always resolves to MNN's build directory.
+        set(_deps_dir "${CMAKE_CURRENT_BINARY_DIR}/_deps")
         file(MAKE_DIRECTORY "${_deps_dir}")
 
         set(_tar_path "${_deps_dir}/v${KLEIDIAI_COMMIT_SHA}.tar.gz")
@@ -73,13 +84,22 @@ function (download_kleidiai_and_collect_sources)
             CACHE PATH "Path to KleidiAI source (downloaded or provided)" FORCE)
     endif()
 
-    set(MNN_KLEIDIAI_DIR "${CMAKE_SOURCE_DIR}/source/backend/cpu/kleidiai")
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/mnn_kleidiai.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/mnn_kleidiai_util.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvolution.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvolutionDepthwise.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIDenseConvolution.cpp)
+    set(MNN_KLEIDIAI_DIR "${_MNN_KLEIDIAI_CMAKE_LIST_DIR}/../source/backend/cpu/kleidiai")
+    if(NOT EXISTS "${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp")
+        # These sources live inside the MNN repo itself (committed alongside this
+        # file), so a correctly-resolved path always finds them. Reaching here means
+        # the MNN checkout is incomplete/corrupted, not an external dependency issue
+        # -- fail loudly instead of silently disabling a feature the user enabled.
+        message(FATAL_ERROR "KleidiAI MNN source files not found at ${MNN_KLEIDIAI_DIR}. "
+                            "Your MNN checkout looks incomplete; update it to a version that "
+                            "includes source/backend/cpu/kleidiai, or pass -DMNN_KLEIDIAI=OFF.")
+    endif()
+    set(MNN_KLEIDIAI_INTEGRATION_SOURCES
+        ${MNN_KLEIDIAI_DIR}/KleidiAIConvolution.cpp
+        ${MNN_KLEIDIAI_DIR}/KleidiAIConvolutionDepthwise.cpp
+        ${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp
+        ${MNN_KLEIDIAI_DIR}/KleidiAIDenseConvolution.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_INTEGRATION_SOURCES})
 
     include_directories(${MNN_KLEIDIAI_DIR})
 
@@ -90,6 +110,7 @@ function (download_kleidiai_and_collect_sources)
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/
+        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/
@@ -109,7 +130,7 @@ function (download_kleidiai_and_collect_sources)
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.c"
     )
-    list(APPEND MNN_SOURCES_KLEIDIAI ${kleidiai_pack_sources})
+    list(APPEND KLEIDIAI_FILES_NEON ${kleidiai_pack_sources})
 
     file(GLOB matmul_clamp_f32_qai8dxp_qsi4cxp_sources
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*dotprod.c"
@@ -117,7 +138,7 @@ function (download_kleidiai_and_collect_sources)
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*dotprod_asm.S"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*i8mm_asm.S"
     )
-    list(APPEND MNN_SOURCES_KLEIDIAI ${matmul_clamp_f32_qai8dxp_qsi4cxp_sources})
+    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f32_qai8dxp_qsi4cxp_sources})
 
     file(GLOB matmul_clamp_f16_qsi8d32p_qai4c32p_sources
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dotprod.c"
@@ -125,7 +146,7 @@ function (download_kleidiai_and_collect_sources)
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dotprod_asm.S"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*i8mm_asm.S"
     )
-    list(APPEND MNN_SOURCES_KLEIDIAI ${matmul_clamp_f16_qsi8d32p_qai4c32p_sources})
+    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f16_qsi8d32p_qai4c32p_sources})
 
     file(GLOB matmul_clamp_f32_qsi8d32p_qai4c32p_sources
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dotprod.c"
@@ -133,7 +154,8 @@ function (download_kleidiai_and_collect_sources)
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dotprod_asm.S"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*i8mm_asm.S"
     )
-    list(APPEND MNN_SOURCES_KLEIDIAI ${matmul_clamp_f32_qsi8d32p_qai4c32p_sources})
+    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f32_qsi8d32p_qai4c32p_sources})
+    list(APPEND MNN_SOURCES_KLEIDIAI ${KLEIDIAI_FILES_NEON})
 
     file(GLOB sme_pack_sources
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/*_sme.c
@@ -205,6 +227,20 @@ function (download_kleidiai_and_collect_sources)
     )
     list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_qsi8d32p_qai4c32p_sme2_sources})
 
+    # The direct FP32 -> packed FP16 int4 path is not in the pinned 1.16.0
+    # release. Enable it only for a supplied source tree containing the complete
+    # extension; stock releases retain the supported dynamic-quant SME path.
+    set(_direct_pack "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_pack_f16pmrx4_f32_neon")
+    set(_direct_matmul "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/kai_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa")
+    if(EXISTS "${_direct_pack}.h" AND EXISTS "${_direct_pack}.c"
+       AND EXISTS "${_direct_matmul}.h" AND EXISTS "${_direct_matmul}.c"
+       AND EXISTS "${_direct_matmul}_asm.S")
+        list(APPEND MNN_SOURCES_KLEIDIAI "${_direct_pack}.c")
+        list(APPEND KLEIDIAI_FILES_SME2 "${_direct_matmul}.c" "${_direct_matmul}_asm.S")
+        set_property(SOURCE "${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp" APPEND PROPERTY
+            COMPILE_DEFINITIONS MNN_KLEIDIAI_F16_PACKED_INT4=1)
+    endif()
+
     file(GLOB dwconv_pack_sources
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/pack/*.c"
     )
@@ -217,9 +253,13 @@ function (download_kleidiai_and_collect_sources)
     list(APPEND KLEIDIAI_FILES_SME2 ${dwconv_f32_f32_f32p_sme2_sources})
 
     set_source_files_properties(
-        ${MNN_SOURCES_KLEIDIAI}
+        ${MNN_KLEIDIAI_INTEGRATION_SOURCES}
         PROPERTIES COMPILE_OPTIONS
-            "-fno-tree-vectorize;-march=armv8.2-a+i8mm+dotprod+sve+sve2+fp16")
+            "-fno-tree-vectorize;-march=armv8.2-a+fp16")
+    set_source_files_properties(
+        ${KLEIDIAI_FILES_NEON}
+        PROPERTIES COMPILE_OPTIONS
+            "-fno-tree-vectorize;-march=armv8.2-a+i8mm+dotprod+fp16")
     set_source_files_properties(
         ${KLEIDIAI_FILES_SME2}
         PROPERTIES COMPILE_OPTIONS

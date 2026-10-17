@@ -209,17 +209,28 @@ template <typename FType, typename TType>
     backend->commit();
 }
 
-template<typename DType>
-static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const float* scale, int size, MetalBackend *backend, bool asymmetric, int oc) {
+static inline float readDequantScale(float value) {
+    return value;
+}
+
+static inline float readDequantScale(int16_t bits) {
+    __fp16 value;
+    ::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+template<typename DType, typename SType>
+static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const SType* scale, int size, MetalBackend* backend,
+                                                                  bool asymmetric, int oc) {
     int totalCount = 0;
     if (asymmetric) {
         totalCount = size / 2;
     } else {
         totalCount = size;
     }
-    int blockSize = totalCount / oc;
+    int blockCount = totalCount / oc;
     int alignOutputCount = ALIGN_UP4(oc);
-    std::shared_ptr<MNN::Tensor> dequantScale(MNN::Tensor::createDevice<uint8_t>({alignOutputCount * blockSize * (int)(sizeof(DType) * 2) + (int)sizeof(float)}));
+    std::shared_ptr<MNN::Tensor> dequantScale(MNN::Tensor::createDevice<uint8_t>({alignOutputCount * blockCount * (int)(sizeof(DType) * 2) + (int)sizeof(float)}));
     bool res = backend->onAcquireBuffer(dequantScale.get(), Backend::STATIC);
     if (!res) {
         MNN_ERROR("Buffer allocated error!\n");
@@ -227,7 +238,7 @@ static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const floa
     }
     auto buffer0 = MetalBackend::getBuffer(dequantScale.get());
     DType* dst_scale = (DType*)((uint8_t*)[buffer0.first contents] + buffer0.second);
-    auto coefPtr = (float*)((uint8_t*)dst_scale + alignOutputCount * blockSize * (int)(sizeof(DType) * 2));
+    auto coefPtr = (float*)((uint8_t*)dst_scale + alignOutputCount * blockCount * (int)(sizeof(DType) * 2));
     if (backend->getRuntime()->hint().useCachedMmap > 1) {
         return std::make_pair(dequantScale, *coefPtr);
     }
@@ -238,10 +249,10 @@ static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const floa
         float max_data = 0.0;
         if(asymmetric) {
             for (int z=0; z<oc; ++z) {
-                auto srcZ = scale + z * blockSize * 2;
-                for (int bi=0; bi<blockSize; ++bi) {
-                    float s = fabs(srcZ[2*bi+1]);
-                    float b = fabs(srcZ[2*bi+0]);
+                auto srcZ = scale + z * blockCount * 2;
+                for (int bi=0; bi<blockCount; ++bi) {
+                    float s = fabs(readDequantScale(srcZ[2*bi+1]));
+                    float b = fabs(readDequantScale(srcZ[2*bi+0]));
                     float temp = ALIMAX(s, b);
                     if(temp > max_data) {
                         max_data = temp;
@@ -250,9 +261,9 @@ static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const floa
             }
         } else {
             for (int z=0; z<oc; ++z) {
-                auto srcZ = scale + z * blockSize;
-                for (int bi=0; bi<blockSize; ++bi) {
-                    float s = srcZ[bi];
+                auto srcZ = scale + z * blockCount;
+                for (int bi=0; bi<blockCount; ++bi) {
+                    float s = readDequantScale(srcZ[bi]);
                     if(s > max_data) {
                         max_data = s;
                     }
@@ -266,12 +277,12 @@ static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const floa
         for (int z=0; z<oc; ++z) {
             int zo = z / 4;
             int zi = z % 4;
-            auto srcZ = scale + z * blockSize * 2;
-            auto dstSZ = dst_scale + zo * blockSize * 8 + zi;
-            auto dstBZ = dst_scale + zo * blockSize * 8 + zi + 4;
-            for (int bi=0; bi<blockSize; ++bi) {
-                float s = srcZ[2*bi+1];
-                float b = srcZ[2*bi+0];
+            auto srcZ = scale + z * blockCount * 2;
+            auto dstSZ = dst_scale + zo * blockCount * 8 + zi;
+            auto dstBZ = dst_scale + zo * blockCount * 8 + zi + 4;
+            for (int bi=0; bi<blockCount; ++bi) {
+                float s = readDequantScale(srcZ[2*bi+1]);
+                float b = readDequantScale(srcZ[2*bi+0]);
                 dstSZ[bi * 8] = (DType)(s * coef);
                 dstBZ[bi * 8] = (DType)(b * coef);
             }
@@ -280,11 +291,11 @@ static std::pair<std::shared_ptr<MNN::Tensor>, float> getDequantScale(const floa
         for (int z=0; z<oc; ++z) {
             int zo = z / 4;
             int zi = z % 4;
-            auto srcZ = scale + z * blockSize;
-            auto dstSZ = dst_scale + zo * blockSize * 8 + zi;
-            auto dstBZ = dst_scale + zo * blockSize * 8 + zi + 4;
-            for (int bi=0; bi<blockSize; ++bi) {
-                float s = srcZ[bi];
+            auto srcZ = scale + z * blockCount;
+            auto dstSZ = dst_scale + zo * blockCount * 8 + zi;
+            auto dstBZ = dst_scale + zo * blockCount * 8 + zi + 4;
+            for (int bi=0; bi<blockCount; ++bi) {
+                float s = readDequantScale(srcZ[bi]);
                 float b = 0.0f;
                 dstSZ[bi * 8] = (DType)(s * coef);
                 dstBZ[bi * 8] = b;
@@ -308,7 +319,7 @@ void MetalConvolutionCommon::loadWeight(const MNN::Op *op, bool loadWeightInt8) 
     auto useOriginMmap = backend()->getRuntime()->hint().useCachedMmap > 1;
     bool preAllocGpuMem = ic != 0 && conv->quanParameter();
     int quantBit;
-    // only for weight int4/int8 now.
+    // GPU pre-allocation for quantized weights (int2/3/4/8).
     if(loadWeightInt8) {
         quantBit = conv->quanParameter()->aMaxOrBits();
         // 3.1.2 and after has aMaxOrBits for quant bits
@@ -316,7 +327,7 @@ void MetalConvolutionCommon::loadWeight(const MNN::Op *op, bool loadWeightInt8) 
             // support old model for external weight file with int4/int8 quant
             quantBit = ConvolutionCommon::getQuantBitFromExternalFile(op);
         }
-        if(quantBit != 4 && quantBit != 8) {
+        if(quantBit != 2 && quantBit != 3 && quantBit != 4 && quantBit != 8) {
             preAllocGpuMem = false;
         }
     }
@@ -339,7 +350,7 @@ void MetalConvolutionCommon::loadWeight(const MNN::Op *op, bool loadWeightInt8) 
 
     std::shared_ptr<ConvolutionCommon::Int8Common> qnt = NULL;
     if (loadWeightInt8) {
-        qnt = ConvolutionCommon::load(op, backend(), false, true, (void *)srcGpuBuffer.contents);
+        qnt = ConvolutionCommon::load(op, backend(), false, true, (void *)srcGpuBuffer.contents, true);
     } else if (conv->quanParameter()) {
         qnt = ConvolutionCommon::load(op, backend(), true, false, (void *)srcGpuBuffer.contents);
     }
@@ -354,18 +365,27 @@ void MetalConvolutionCommon::loadWeight(const MNN::Op *op, bool loadWeightInt8) 
     // convert
     if (loadWeightInt8) {
         auto backend = static_cast<MetalBackend *>(this->backend());
-        mWeight = weightTransform(group, oc, ic, kh, kw, (float*)qnt->weight.get(), !qnt->canUseInt4, qnt->canUseInt4, srcGpuBuffer);
-        if(backend->useFp16InsteadFp32()) {
-            auto dequantParams = getDequantScale<__fp16>(qnt->alpha.get(), qnt->alphaSize, backend, qnt->asymmetric, oc);
-            mDequantScaleBias = dequantParams.first;
-            mScaleCoef = dequantParams.second;
+        bool useInt2 = qnt->canUseInt2;
+        bool useInt3 = qnt->canUseInt3;
+        bool int4Path = qnt->canUseInt4 && !useInt2 && !useInt3;
+        bool int8Path = !int4Path && !useInt2 && !useInt3;
+        int subBits = useInt2 ? 2 : (useInt3 ? 3 : 0);
+        mWeight = weightTransform(group, oc, ic, kh, kw, (float*)qnt->weight.get(), int8Path, int4Path, srcGpuBuffer, subBits);
+        const bool directHalf = qnt->alpha.get() == nullptr && qnt->alphaHalf.get() != nullptr;
+        std::pair<std::shared_ptr<MNN::Tensor>, float> dequantParams;
+        if (backend->useFp16InsteadFp32()) {
+            dequantParams = directHalf
+                ? getDequantScale<__fp16>(qnt->alphaHalf.get(), qnt->alphaSize, backend, qnt->asymmetric, oc)
+                : getDequantScale<__fp16>(qnt->alpha.get(), qnt->alphaSize, backend, qnt->asymmetric, oc);
         } else {
-            auto dequantParams = getDequantScale<float>(qnt->alpha.get(), qnt->alphaSize, backend, qnt->asymmetric, oc);
-            mDequantScaleBias = dequantParams.first;
-            mScaleCoef = dequantParams.second;
+            dequantParams = directHalf
+                ? getDequantScale<float>(qnt->alphaHalf.get(), qnt->alphaSize, backend, qnt->asymmetric, oc)
+                : getDequantScale<float>(qnt->alpha.get(), qnt->alphaSize, backend, qnt->asymmetric, oc);
         }
+        mDequantScaleBias = dequantParams.first;
+        mScaleCoef = dequantParams.second;
 
-        mDequantBits = qnt->canUseInt4 ? 4:8;
+        mDequantBits = useInt2 ? 2 : (useInt3 ? 3 : (int4Path ? 4 : 8));
     } else if (qnt && qnt->weightFloat.get()) {
         mWeight = weightTransform(group, oc, ic, kh, kw, qnt->weightFloat.get(), false, false, srcGpuBuffer);
     } else {
@@ -394,7 +414,7 @@ void MetalConvolutionCommon::loadWeight(const MNN::Op *op, bool loadWeightInt8) 
     }
 }
 
-std::shared_ptr<MNN::Tensor> MetalConvolutionCommon::weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight, bool int4Weight, id<MTLBuffer> srcGpuBuffer) {
+std::shared_ptr<MNN::Tensor> MetalConvolutionCommon::weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight, bool int4Weight, id<MTLBuffer> srcGpuBuffer, int subBits) {
     if(srcGpuBuffer != nil) {
         MNN_ASSERT((void*)src == (void*)srcGpuBuffer.contents);
     }
@@ -408,6 +428,75 @@ std::shared_ptr<MNN::Tensor> MetalConvolutionCommon::weightTransform(int group, 
     auto ori_len = group * goc * gic * kh * kw;
     bool needMemset = (goc % 4 != 0 || gic % 4 != 0);
 #ifdef MNN_LOW_MEMORY
+    if (subBits == 3) {
+        // 3-bit packed: 6 bytes / (4 OC, 4 IC) tile.
+        size_t weight_bytes = (size_t)group * goc_4 * gic_4 * kh * kw * 6;
+        std::shared_ptr<MNN::Tensor> weightLow(MNN::Tensor::createDevice<int8_t>({(int)weight_bytes}));
+        if (!backend->onAcquireBuffer(weightLow.get(), Backend::STATIC)) {
+            MNN_ERROR("Memory alloc error!\n");
+            return nullptr;
+        }
+        if (nil == src) {
+            return weightLow;
+        }
+        auto buf = MetalBackend::getBuffer(weightLow.get());
+        auto dstPtr = (uint8_t*)[buf.first contents] + buf.second;
+        ::memset(dstPtr, 0, weight_bytes);
+        auto srcPtr = (const int8_t*)src;
+        for (int g = 0; g < group; g++) {
+            for (int o = 0; o < goc; o++) {
+                int zo = o / 4, ro = o % 4;
+                for (int i = 0; i < gic; i++) {
+                    int zi = i / 4, ri = i % 4;
+                    for (int h = 0; h < kh; h++) {
+                        for (int w = 0; w < kw; w++) {
+                            int srcIdx = ((g * goc + o) * gic + i) * kh * kw + h * kw + w;
+                            int sv = (int)srcPtr[srcIdx] + 4;
+                            int tileBase = (((g * goc_4 + zo) * gic_4 + zi) * kh + h) * kw * 6 + w * 6;
+                            dstPtr[tileBase + ro] |= (uint8_t)((sv & 3) << (6 - ri * 2));
+                            int hiByte = tileBase + 4 + (ro / 2);
+                            int hiShift = (ro % 2 == 0 ? 4 : 0) + (3 - ri);
+                            dstPtr[hiByte] |= (uint8_t)(((sv >> 2) & 1) << hiShift);
+                        }
+                    }
+                }
+            }
+        }
+        return weightLow;
+    }
+    if (subBits == 2) {
+        // 2-bit packed: 4 bytes / (4 OC, 4 IC) tile.
+        size_t weight_bytes = (size_t)group * goc_4 * gic_4 * kh * kw * 4;
+        std::shared_ptr<MNN::Tensor> weightLow(MNN::Tensor::createDevice<int8_t>({(int)weight_bytes}));
+        if (!backend->onAcquireBuffer(weightLow.get(), Backend::STATIC)) {
+            MNN_ERROR("Memory alloc error!\n");
+            return nullptr;
+        }
+        if (nil == src) {
+            return weightLow;
+        }
+        auto buf = MetalBackend::getBuffer(weightLow.get());
+        auto dstPtr = (uint8_t*)[buf.first contents] + buf.second;
+        ::memset(dstPtr, 0, weight_bytes);
+        auto srcPtr = (const int8_t*)src;
+        for (int g = 0; g < group; g++) {
+            for (int o = 0; o < goc; o++) {
+                int zo = o / 4, ro = o % 4;
+                for (int i = 0; i < gic; i++) {
+                    int zi = i / 4, ri = i % 4;
+                    for (int h = 0; h < kh; h++) {
+                        for (int w = 0; w < kw; w++) {
+                            int srcIdx = ((g * goc + o) * gic + i) * kh * kw + h * kw + w;
+                            int sv = (int)srcPtr[srcIdx] + 2;
+                            int tileBase = (((g * goc_4 + zo) * gic_4 + zi) * kh + h) * kw * 4 + w * 4;
+                            dstPtr[tileBase + ro] |= (uint8_t)((sv & 3) << (6 - ri * 2));
+                        }
+                    }
+                }
+            }
+        }
+        return weightLow;
+    }
     if (int4Weight) {
         weight_len = UP_DIV(weight_len, 2);
         std::shared_ptr<MNN::Tensor> weightLow(MNN::Tensor::createDevice<int8_t>({weight_len}));

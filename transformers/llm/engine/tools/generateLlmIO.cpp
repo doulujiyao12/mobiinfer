@@ -1,3 +1,4 @@
+#include "core/FileLoader.hpp"
 #include <fstream>
 #include <string>
 #include <vector>
@@ -120,18 +121,52 @@ static void createInputsForEmbedding(int seqLen, int hiddenSize, const std::stri
     inputs.push_back(positionIds);
 }
 
-static bool isEmbeddingModel(const rapidjson::Document& doc) {
-    if (doc.HasMember("output_names") && doc["output_names"].IsArray()) {
-        for (auto iter = doc["output_names"].Begin(); iter != doc["output_names"].End(); ++iter) {
-            if (iter->IsString() && std::string(iter->GetString()) == "sentence_embeddings") {
-                return true;
-            }
+static bool hasStringValue(const rapidjson::Document& doc, const char* key, const std::string& value) {
+    if (!doc.HasMember(key)) {
+        return false;
+    }
+    auto& member = doc[key];
+    if (member.IsString()) {
+        return member.GetString() == value;
+    }
+    if (!member.IsArray()) {
+        return false;
+    }
+    for (auto iter = member.Begin(); iter != member.End(); ++iter) {
+        if (iter->IsString() && iter->GetString() == value) {
+            return true;
         }
     }
+    return false;
+}
+
+static bool isEmbeddingModel(const rapidjson::Document& doc, const std::string& modelDir) {
+    if (doc.HasMember("is_embedding") && doc["is_embedding"].IsBool() && doc["is_embedding"].GetBool()) {
+        return true;
+    }
+    if (hasStringValue(doc, "output_names", "sentence_embeddings")) {
+        return true;
+    }
+    if (doc.HasMember("llm_model") && doc["llm_model"].IsString()) {
+        auto modelName = std::string(doc["llm_model"].GetString());
+        if (modelName.find("embedding.mnn") != std::string::npos) {
+            return true;
+        }
+    }
+    if (doc.HasMember("embedding_model") && doc["embedding_model"].IsString()) {
+        auto modelName = std::string(doc["embedding_model"].GetString());
+        if (modelName.find("embedding.mnn") != std::string::npos) {
+            return true;
+        }
+    }
+    if (MNNFileExist(MNNFilePathConcat(modelDir, "embedding.mnn").c_str())) {
+        return true;
+    }
     auto modelType = std::string(doc.HasMember("model_type") && doc["model_type"].IsString() ? doc["model_type"].GetString() : "");
-    // NB: bare "qwen3" was originally listed here but it collides with the
-    // generative qwen3 backbone. Restrict to embedding-only variants.
     if (modelType == "bert" || modelType == "new" || modelType == "qwen3_embedding") {
+        return true;
+    }
+    if (modelType == "qwen3" && !doc.HasMember("layer_nums") && !doc.HasMember("attention_type") && !doc.HasMember("is_mrope")) {
         return true;
     }
     return false;
@@ -272,7 +307,7 @@ static bool generateForModel(const std::string& modelPath, const std::string& ou
         }
         attentionMaskType = doc["attention_mask"].GetString();
 
-        isEmbedding = isEmbeddingModel(doc);
+        isEmbedding = isEmbeddingModel(doc, modelPath.substr(0, modelPath.find_last_of("/\\")));
         if (doc.HasMember("is_mrope") && doc["is_mrope"].IsBool()) {
             isMrope = doc["is_mrope"].GetBool();
         }

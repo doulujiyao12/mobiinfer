@@ -6,6 +6,7 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <MNN/expr/ExprCreator.hpp>
 namespace fs=std::filesystem;
 template<class T> void save(const fs::path& p,const T* v,size_t n) {
@@ -33,7 +34,14 @@ struct Reference final:KirinFullNpu::Backend {
     }
 };
 int main(int argc,char** argv) {
-    if(argc!=4) return 2;
+    if(argc!=4 && argc!=5) return 2;
+    int decodeSteps = 1;
+    if(argc==5) {
+        char* end=nullptr;
+        long value=std::strtol(argv[4],&end,10);
+        if(!end || *end || value<1 || value>64) return 2;
+        decodeSteps=static_cast<int>(value);
+    }
     fs::path root=argv[2]; auto backend=new Reference(root);
     auto state=std::make_shared<OfflineNpu2::State>();
     auto llm=OfflineNpu2::create(argv[1],std::unique_ptr<KirinFullNpu::Backend>(backend),
@@ -80,8 +88,17 @@ int main(int argc,char** argv) {
     auto logits=llm->getOutputs()[0];
     save(root/"logits.bin",logits->readMap<float>(),logits->getInfo()->size);
     // MNN's generation loop computes the following decode forward as well;
-    // capture prefill logits before entering it, then compare the first token.
-    llm->generate(1);
+    // capture prefill logits before entering it, then retain decode snapshots.
+    std::vector<float> decodeLogits;
+    for(int i=0;i<decodeSteps;++i) {
+        auto before=llm->getContext()->output_tokens.size();
+        llm->generate(1);
+        if(llm->getContext()->output_tokens.size()==before) break;
+        auto next=llm->getOutputs()[0];
+        const float* data=next->readMap<float>();
+        decodeLogits.insert(decodeLogits.end(),data,data+next->getInfo()->size);
+    }
+    save(root/"decode_logits.bin",decodeLogits.data(),decodeLogits.size());
     save(root/"generated.bin",llm->getContext()->output_tokens.data(),llm->getContext()->output_tokens.size());
     // Subsequent independent text request must have no stale visual features.
     llm->reset(); OfflineNpu2::prepareRequest(llm.get(),state);

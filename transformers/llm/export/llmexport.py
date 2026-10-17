@@ -22,6 +22,7 @@ from utils.smooth_quantizer import SmoothQuantizer
 from utils.omni_quantizer import OmniQuantizer
 from utils.torch_utils import onnx_export
 
+
 class LlmExporter(torch.nn.Module):
     '''
     Base class for all llm model export. Inherits from [`torch.nn.Module`].
@@ -32,9 +33,12 @@ class LlmExporter(torch.nn.Module):
         self.load_model(args.path)
 
     def init_from_args(self, args):
+        if args.smooth and args.omni:
+            raise ValueError('--smooth and --omni cannot be used together; choose one quantization calibration method.')
         self.args = args
         self.max_new_tokens = 1024
         self.dst_name = 'llm'
+        self.exported_tokenizer_file = 'tokenizer.mtok'
         # load config from args
         self.onnx_path = os.path.join(self.args.dst_path, 'onnx')
         if self.args.tokenizer_path is None:
@@ -43,12 +47,42 @@ class LlmExporter(torch.nn.Module):
             self.args.lm_quant_bit = self.args.quant_bit
         if args.lm_quant_block is None:
             self.args.lm_quant_block = self.args.quant_block
+        if getattr(args, 'gptq_path', None) or getattr(args, 'visual_gptq_path', None):
+            # GPTQ import addresses each original projection's packed payload.
+            # C4/FusedLinear combines those projections before import, so the
+            # Convolution-only importer would silently leave some RTN weights.
+            # Keep the original boundaries until fused GPTQ payloads are supported.
+            if getattr(self.args, 'transformer_c4', True):
+                print('GPTQ import: disabling Transformer C4 projection fusion to preserve checkpoint weights.')
+            self.args.transformer_c4 = False
+        if getattr(args, 'gptq_path', None):
+            # The GPTQ importer writes FP32 scale/(zero, scale) arrays. The
+            # upstream FP16 default changes both their size and interpretation.
+            self.args.scale_bit = 32
+        if not getattr(self.args, 'transformer_c4', True):
+            # C4 fusion disabled for older runtimes: none of the ops that need
+            # MNN_SUPPORT_TRANSFORMER_FUSE (FusedLinear, gate_fold) may be emitted.
+            self.args.fuse_qkv_proj = False
+            self.args.fuse_gate_up_proj = False
+            self.args.fuse_ln_proj = False
+            self.args.fuse_linear_attn_gate = False
         self.args.tie_word_embeddings = False
         # init export dst dir
         if not os.path.exists(self.args.dst_path):
             os.makedirs(self.args.dst_path)
         if not os.path.exists(self.onnx_path):
             os.makedirs(self.onnx_path)
+
+    @staticmethod
+    def qwen3_asr_chat_template():
+        return (
+            "{%- set content = messages[-1].content -%}"
+            "<|im_start|>system<|im_end|>"
+            "<|im_start|>user{{ content }}<|im_end|>"
+            "{%- if add_generation_prompt and content is string and '<audio>' in content and '</audio>' in content -%}"
+            "<|im_start|>assistantlanguage {{ asr_language }}<asr_text>"
+            "{%- endif -%}"
+        )
 
     @spinner_run(f'load pretrained model ', True)
     def load_model(self, model_path):
@@ -86,12 +120,22 @@ class LlmExporter(torch.nn.Module):
             'attention_type': self.config.attention_type,
             'is_mrope': self.model.rotary.is_mrope
         }
+        if self.model.rotary.is_mrope:
+            self.llm_config['mrope_axes'] = self.model.rotary.mrope_axes
         self.llm_config.update(self.model.get_config())
+        max_pos = getattr(self.config, 'max_position_embeddings', None)
+        if max_pos:
+            self.llm_config['max_position_embeddings'] = max_pos
         # Attention scaling (gemma4 uses 1.0 instead of 1/sqrt(head_dim))
         if hasattr(self.model, 'blocks') and len(self.model.blocks) > 0:
             attn = self.model.blocks[0].self_attn
             if hasattr(attn, 'attn_scaling') and attn.attn_scaling != 1.0 / (self.config.head_dim ** 0.5):
                 self.llm_config['attn_scale'] = attn.attn_scaling
+            num_kv_shared = sum(1 for b in self.model.blocks
+                                if getattr(b.self_attn, 'is_kv_shared_layer', False)
+                                and getattr(b.self_attn, 'kv_shared_layer_index', None) is not None)
+            if num_kv_shared > 0:
+                self.llm_config['num_kv_shared_layers'] = num_kv_shared
         if self.config.sliding_window > 0:
             self.llm_config['sliding_window'] = self.config.sliding_window
         if hasattr(self.tokenizer, 'get_chat_template'):
@@ -117,6 +161,24 @@ class LlmExporter(torch.nn.Module):
                 'chat_template': "[gMASK]<sop>{% for message in messages %}{% if message.role == \"user\" %}<|user|>\n{{ message.content }}{% elif message.role == \"assistant\" %}<|assistant|>\n{{ message.content }}{% elif message.role == \"system\" %}<|system|>\n{{ message.content }}{% endif %}{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}",
                 'eos': '<|endoftext|>'
             }
+        if self.model_type == 'qwen3_asr':
+            self.llm_config['asr_language'] = self.llm_config.get('asr_language', 'Chinese')
+            self.llm_config['jinja'] = {
+                'chat_template': self.qwen3_asr_chat_template(),
+                'context': {
+                    'asr_language': self.llm_config['asr_language']
+                }
+            }
+            if self.tokenizer.eos_token:
+                self.llm_config['jinja']['eos'] = self.tokenizer.eos_token
+
+        # HunyuanVL's HF template uses syntax unsupported by the C++ minja parser.
+        if self.model_type == 'hunyuan_vl':
+            self.llm_config['jinja'] = {
+                'chat_template': "<｜hy_begin▁of▁sentence｜>{% for message in messages %}{% if message.role == \"system\" %}{{ message.content }}<｜hy_place▁holder▁no▁3｜>{% elif message.role == \"user\" %}{{ message.content }}<｜hy_User｜>{% elif message.role == \"assistant\" %}{{ message.content }}<｜hy_Assistant｜>{% endif %}{% endfor %}",
+                'bos': '<｜hy_begin▁of▁sentence｜>',
+                'eos': '<｜hy_Assistant｜>'
+            }
 
         # tie word embeddings
         self.args.tie_word_embeddings = not self.args.seperate_embed and self.model.lm.lm.weight.equal(self.model.embed.embed.weight)
@@ -133,11 +195,18 @@ class LlmExporter(torch.nn.Module):
     @torch.no_grad()
     def response(self, query):
         # self.imitate_quant()
-        self.model.decode_buffer = []
+        self.tokenizer.decode_buffer.clear()
         messages = [
             {"role": "user", "content": query}
         ]
-        prompt = self.tokenizer.apply_chat_template(messages)
+        if self.model_type == 'qwen3_asr':
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                chat_template=self.qwen3_asr_chat_template(),
+                asr_language=self.llm_config.get('asr_language', 'Chinese')
+            )
+        else:
+            prompt = self.tokenizer.apply_chat_template(messages)
         if query not in prompt:
             prompt = query
 
@@ -196,7 +265,7 @@ class LlmExporter(torch.nn.Module):
             seq_len += 1
             new_tokens += 1
             if token_id in self.tokenizer.stop_ids:
-                print("", end='\n')
+                print(self.tokenizer.flush_decode_buffer(), end='\n')
                 break
 
             # Use tokenizer's method for decoding
@@ -204,6 +273,8 @@ class LlmExporter(torch.nn.Module):
             print(word, end="", flush=True)
             input_ids = token_id
         print("seq_len: ", seq_len)
+
+        print(self.tokenizer.flush_decode_buffer(), end="", flush=True)
 
         if hasattr(self.model, 'talker') and self.model.talker is not None:
             self.model.talker.generate()
@@ -225,6 +296,26 @@ class LlmExporter(torch.nn.Module):
         if self.mnn_converter:
             MNNConverter(self, None).export(eagle_onnx)
             MNNConverter(self, None).export(eagle_fc_onnx)
+
+    def export_dflash(self):
+        if not hasattr(self.args, 'dflash_path') or self.args.dflash_path is None:
+            return
+        from utils.dflash import DFlash
+        self.dflash = DFlash(self.args.dflash_path, self.model)
+        # Set target layer ids on args so model.forward() can use them
+        self.args.dflash_target_layer_ids = self.dflash.target_layer_ids
+        # The draft reuses the target's lm_head at runtime (shared-from-target).
+        dflash_onnx, dflash_fc_onnx, dflash_kvmat_onnx = self.dflash.export(self.onnx_path)
+        if self.mnn_converter:
+            # Disable transformerFuse for dflash model: dflash uses non-causal (bidirectional) attention,
+            # but MNN's fused attention assumes causal masking which breaks dflash's attention pattern.
+            # No quant_bit: rebuild_linear already quantizes the draft linears with args.quant_bit/quant_block.
+            MNNConverter(self, self.dflash.unloaded_ops).export(dflash_onnx, transformer_fuse=False)
+            # FC model must NOT be quantized: the input (concatenated hidden states from
+            # multiple target layers) has very large value ranges during prefill, which
+            # causes int8 quantization overflow and produces all-zero outputs.
+            MNNConverter(self, None).export(dflash_fc_onnx, quant_bit=0, transformer_fuse=False)
+            MNNConverter(self, self.dflash.unloaded_ops).export(dflash_kvmat_onnx, transformer_fuse=False)
 
 
     @spinner_run(f'export embedding to ')
@@ -255,7 +346,14 @@ class LlmExporter(torch.nn.Module):
                 q_weight_size = (oc * ic * format_bit + 7) // 8
                 alpha_size = oc * block_num * (1 if symmetric else 2) * 4
                 file_size = q_weight_size + alpha_size
-                self.llm_config['tie_embeddings'] = [0, q_weight_size, alpha_size, format_bit, quant_block]
+                self.llm_config['tie_embeddings'] = {
+                    "weight_offset": 0,
+                    "alpha_offset": q_weight_size,
+                    "alpha_size": alpha_size,
+                    "quant_bit": format_bit,
+                    "quant_block": quant_block,
+                    "alpha_dtype": "fp32",
+                }
 
             with open(embedding_file, 'wb') as f:
                 if file_size > 0:
@@ -286,7 +384,14 @@ class LlmExporter(torch.nn.Module):
             with open(embedding_file, 'wb') as f:
                 weight_size = f.write(q_weight.numpy().tobytes())
                 alpha_size = f.write(alpha.numpy().tobytes())
-            self.llm_config['tie_embeddings'] = [0, weight_size, alpha_size, quant_bit, quant_block]
+            self.llm_config['tie_embeddings'] = {
+                "weight_offset": 0,
+                "alpha_offset": weight_size,
+                "alpha_size": alpha_size,
+                "quant_bit": quant_bit,
+                "quant_block": quant_block,
+                "alpha_dtype": "fp32",
+            }
         else:
             raise ValueError(f"Unsupported embedding bit precision: {format_bit}")
 
@@ -324,7 +429,7 @@ class LlmExporter(torch.nn.Module):
                 "n_gram": 8,
                 "ngram_factor": 1.0
             }
-            config['tokenizer_file'] = 'tokenizer.mtok'
+            config['tokenizer_file'] = self.exported_tokenizer_file
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
             if hasattr(self, 'talker') and self.talker is not None:
@@ -386,6 +491,18 @@ class LlmExporter(torch.nn.Module):
             if self.args.eagle_path is not None:
                 config['speculative_type'] = 'eagle'
                 config['hidden_states'] = True
+            if hasattr(self.args, 'dflash_path') and self.args.dflash_path is not None:
+                config['speculative_type'] = 'dflash'
+                config['hidden_states'] = True
+                config['dflash_model'] = 'dflash.mnn'
+                config['dflash_fc'] = 'dflash_fc.mnn'
+                config['dflash_kvmat'] = 'dflash_kvmat.mnn'
+                # Reuse the target's lm_head via the shared subgraph.
+                config['dflash_shared_lmhead_input'] = '/final_layernorm/Mul_1_output_0'
+                config['dflash_block_size'] = self.dflash.block_size
+                config['dflash_mask_token_id'] = self.dflash.mask_token_id
+                config['dflash_target_layer_ids'] = self.dflash.target_layer_ids
+                config['dflash_shift_label'] = self.dflash.shift_label
             json.dump(config, f, ensure_ascii=False, indent=4)
         return config_json
 
@@ -434,6 +551,8 @@ class LlmExporter(torch.nn.Module):
             for i in range(len(self.model.blocks)):
                 # different kv cache shape in different layers
                 # if isinstance(self.config.num_attention_heads, list):
+                # Keep custom Attention in the exported LLM graph so runtime decode uses KV cache.
+                # HunyuanVL still disables MNNConvert transformerFuse separately.
                 self.model.blocks[i].self_attn.export_fused_attn = True
                 is_moe = hasattr(self.model.blocks[i].mlp, 'is_moe') and self.model.blocks[i].mlp.is_moe
                 if is_moe:
@@ -1070,12 +1189,30 @@ class LlmExporter(torch.nn.Module):
         if self.talker is None:
             return
         talker_onnx = self.talker.export(self.onnx_path)
-        predit_onnx, dit_onnx, bigvgan_onnx = self.talker.token2wav.export(self.onnx_path)
+        talker_onnx_list = talker_onnx if isinstance(talker_onnx, list) else [talker_onnx]
         if self.mnn_converter:
-            self.mnn_converter.export(talker_onnx, self.talker.quant_bit)
-            self.mnn_converter.export(predit_onnx, self.talker.token2wav.quant_bit)
-            self.mnn_converter.export(dit_onnx, self.talker.token2wav.quant_bit)
-            self.mnn_converter.export(bigvgan_onnx, self.talker.token2wav.quant_bit)
+            for onnx_path in talker_onnx_list:
+                weight_ops = None
+                if self.model_type == 'qwen3_tts':
+                    onnx_name = os.path.basename(onnx_path)
+                    if onnx_name == 'talker.onnx':
+                        weight_ops = getattr(self.talker, 'unloaded_ops', None)
+                    elif onnx_name == 'code_predictor.onnx' and hasattr(self.talker, 'audio_code_predictor'):
+                        weight_ops = getattr(self.talker.audio_code_predictor, 'unloaded_ops', None)
+                converter = MNNConverter(self, weight_ops) if weight_ops is not None else self.mnn_converter
+                converter.export(onnx_path, self.talker.quant_bit)
+                if weight_ops is not None:
+                    mnn_json = os.path.join(
+                        self.args.dst_path, os.path.basename(onnx_path).replace('.onnx', '.mnn.json'))
+                    if os.path.exists(mnn_json):
+                        os.remove(mnn_json)
+        if self.talker.token2wav is None:
+            return
+        token2wav_onnx = self.talker.token2wav.export(self.onnx_path)
+        token2wav_onnx_list = token2wav_onnx if isinstance(token2wav_onnx, (list, tuple)) else [token2wav_onnx]
+        if self.mnn_converter:
+            for onnx_path in token2wav_onnx_list:
+                self.mnn_converter.export(onnx_path, self.talker.token2wav.quant_bit)
 
     def export_ple_embed(self):
         """Export Per-Layer Embedding weights for gemma4."""
@@ -1112,6 +1249,8 @@ class LlmExporter(torch.nn.Module):
         self.llm_config['ple_embed_dim'] = embed.embedding_dim
 
     def export_language(self):
+        if self.model_type == 'qwen3_tts':
+            return # qwen3_tts is talker-only and do not need export language model
         # export_embedding
         if self.mnn_converter and self.args.tie_word_embeddings:
             print("tie_word_embeddings")
@@ -1126,7 +1265,8 @@ class LlmExporter(torch.nn.Module):
         if self.args.onnx_slim:
             self.slim_onnx(onnx_model)
         if self.mnn_converter:
-            tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model)
+            fuse_transformer = self.model_type != 'hunyuan_vl'
+            tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=fuse_transformer)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
         else:
@@ -1146,6 +1286,7 @@ class LlmExporter(torch.nn.Module):
         self.export_vision()
         self.export_audio()
         self.export_eagle()
+        self.export_dflash()
         self.export_language()
         self.export_mtp()
         self.export_tokenizer()
@@ -1161,22 +1302,50 @@ class LlmExporter(torch.nn.Module):
 
     @spinner_run(f'export tokenizer to ')
     def export_tokenizer(self):
-        return self.tokenizer.export(self.args.dst_path)
+        tokenizer_path = self.tokenizer.export(self.args.dst_path)
+        self.exported_tokenizer_file = os.path.basename(tokenizer_path)
+        return tokenizer_path
 
 class EmbeddingExporter(LlmExporter):
     def __init__(self, args):
         super().__init__(args)
+        self.dst_name = 'embedding'
+
+    def unload_embedding_param(self):
+        self.unloaded_ops = {}
+        def build_faker(real, name):
+            faker = FakeLinear(real.in_features, real.out_features, real.bias is not None, name)
+            self.unloaded_ops[name] = real.cpu()
+            return faker
+        with torch.no_grad():
+            for i in range(len(self.model.blocks)):
+                self.model.blocks[i].self_attn.export_fused_attn = True
+                for name, child in self.model.blocks[i].self_attn.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.model.blocks[i].self_attn, name, build_faker(child, f'/layers.{i}/self_attn/{name}/Linear'))
+                for name, child in self.model.blocks[i].mlp.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.model.blocks[i].mlp, name, build_faker(child, f'/layers.{i}/mlp/{name}/Linear'))
 
     def response(self, query):
         self.model.eval()
         prompt = self.build_prompt(query)
-        input_ids = self.tokenizer(prompt)['input_ids']
-        seq_len = len(input_ids)
-        input_ids = torch.tensor(input_ids)
-        position_ids = self.model.get_position_ids(seq_len)
-        attention_mask = self.model.get_attention_mask(seq_len)
-        inputs_embeds = self.model.word_embed(input_ids)
-        res = self.model.forward(inputs_embeds, attention_mask, position_ids)
+        deepstack_embeds = None
+        if self.model.visual is not None and '<img>' in prompt:
+            input_ids = self.model.visual.str_to_ids(prompt)
+            seq_len = input_ids.numel()
+            position_ids = self.model.get_position_ids(seq_len, input_ids=input_ids)
+            attention_mask = self.model.get_attention_mask(seq_len)
+            inputs_embeds = self.model.embedding(input_ids)
+            deepstack_embeds = self.model.visual.deepstacks()
+        else:
+            input_ids = self.tokenizer(prompt)['input_ids']
+            seq_len = len(input_ids)
+            input_ids = torch.tensor(input_ids)
+            position_ids = self.model.get_position_ids(seq_len, input_ids=input_ids)
+            attention_mask = self.model.get_attention_mask(seq_len)
+            inputs_embeds = self.model.word_embed(input_ids)
+        res = self.model.forward(inputs_embeds, attention_mask, position_ids, deepstack_embeds=deepstack_embeds)
         print(res, res.shape)
         return res
 
@@ -1187,6 +1356,15 @@ class EmbeddingExporter(LlmExporter):
             return f'<s> {content}</s>'
         if self.config.model_type == 'qwen3':
             return f'{content}<|endoftext|>'
+        if self.config.model_type == 'qwen3_vl':
+            messages = [
+                {"role": "system", "content": "Represent the user's input."},
+                {"role": "user", "content": content},
+            ]
+            prompt = self.tokenizer.apply_chat_template(messages)
+            if prompt is not None and content in prompt:
+                return prompt
+        return content
 
     @spinner_run(f'load pretrained model ', True)
     def load_model(self, model_path):
@@ -1194,15 +1372,25 @@ class EmbeddingExporter(LlmExporter):
         self.config = self.model.config
         self.model_type = self.config.model_type
         self.tokenizer = LlmTokenizer(model_path, self.model_type)
+        self.model.tokenizer = self.tokenizer
+        self.visual = self.model.visual
+        self.audio = self.model.audio
         self.llm_config = {
             'model_type': self.config.model_type,
             'hidden_size' : self.config.hidden_size,
-            'attention_mask': 'int',
+            # qwen3 embedding is a causal decoder (last-token pooling) and needs a
+            # causal mask; bert/gte encoders are bidirectional and use the all-ones
+            # ('int') mask. Using 'int' for qwen3 makes attention bidirectional and
+            # degrades the embeddings (see issue: identical/low-quality vectors).
+            # qwen3_vl embedding follows the same decoder-style masking behavior.
+            'attention_mask': 'float' if self.config.model_type in ('qwen3', 'qwen3_vl') else 'int',
             "jinja": {
                 "chat_template": self.build_prompt("{{ messages | map(attribute='content') | join('') }}")
             },
-            'is_visual': False
+            'is_visual': self.visual is not None,
+            'is_embedding': True
         }
+        self.llm_config.update(self.model.get_config())
         return model_path
 
     def export_reranker(self):
@@ -1232,7 +1420,9 @@ class EmbeddingExporter(LlmExporter):
 
     @spinner_run(f'export onnx model to ')
     def export_onnx(self):
-        if self.model_type == 'qwen3':
+        if self.model_type == 'qwen3_vl':
+            self.unload_embedding_param()
+        elif self.model_type == 'qwen3':
             self.unload_param()
         else:
             self.unloaded_ops = None
@@ -1240,10 +1430,30 @@ class EmbeddingExporter(LlmExporter):
             return self.export_reranker()
         seq_len = 3
         input_ids = torch.arange(seq_len, dtype=torch.long)
-        position_ids = self.model.get_position_ids(seq_len)
+        position_ids = self.model.get_position_ids(seq_len, input_ids=input_ids)
         attention_mask = self.model.get_attention_mask(seq_len)
         inputs_embeds = self.model.word_embed(input_ids)
         onnx_model = f'{self.onnx_path}/{self.dst_name}.onnx'
+        dynamic_axes = {
+            "input_ids" : { 1: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" }
+        }
+        if self.model_type == 'qwen3_vl' and self.visual is not None and hasattr(self.visual, 'deepstack_visual_indexes'):
+            deepstack_embeds = torch.randn(3, seq_len, self.config.hidden_size)
+            dynamic_axes['deepstack_embeds'] = {1: "seq_len"}
+            onnx_export(
+                self.model, (inputs_embeds, attention_mask, position_ids, deepstack_embeds),
+                onnx_model,
+                input_names=[
+                    'input_ids',
+                    'attention_mask',
+                    'position_ids',
+                    'deepstack_embeds'
+                ],
+                output_names=['sentence_embeddings'],
+                dynamic_axes=dynamic_axes)
+            return onnx_model
         onnx_export(
             self.model, (inputs_embeds, attention_mask, position_ids),
             onnx_model,
@@ -1253,18 +1463,15 @@ class EmbeddingExporter(LlmExporter):
                 'position_ids'
             ],
             output_names=['sentence_embeddings'],
-            dynamic_axes={
-                "input_ids" : { 1: "seq_len" },
-                "position_ids" : { 1: "seq_len" },
-                "attention_mask" : { 2: "seq_len", 3: "seq_len" }
-            })
+            dynamic_axes=dynamic_axes)
         return onnx_model
 
     def export(self, export_type):
-        export_mnn = 'mnn' in export_type
+        export_mnn = export_type == 'mnn'
+        self.mnn_converter = MNNConverter(self) if export_mnn else None
+        self.export_vision()
         self.export_tokenizer()
         self.export_embed()
-        self.export_config(export_mnn)
         onnx_model = self.export_onnx()
         if self.args.onnx_slim:
             self.slim_onnx(onnx_model)
@@ -1273,6 +1480,24 @@ class EmbeddingExporter(LlmExporter):
             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
+            # Fix MNN JSON: MNNConvert may swap batch and seq_len dims for input_ids,
+            # producing e.g. [3, -1, 2048] instead of [1, -1, 2048]. With shapeMutable=true
+            # the static dim 0 must be the batch dimension (1), not the traced seq_len (3).
+            llm_json = f'{self.args.dst_path}/llm.mnn.json'
+            if os.path.exists(llm_json):
+                import json as _json
+                with open(llm_json) as f:
+                    _data = _json.load(f)
+                for op in _data['oplists']:
+                    if op.get('name') == 'input_ids' and op['main']['dims'][0] > 1:
+                        op['main']['dims'][0] = 1
+                        with open(llm_json, 'w') as f:
+                            _json.dump(_data, f)
+                        break
+        else:
+            self.onnx_load_param(onnx_model)
+        self.export_config(export_mnn)
+        if export_mnn:
             if self.args.cleanup_onnx:
                 # delete onnx file
                 try:
@@ -1293,6 +1518,7 @@ def build_args(parser):
                         )
     parser.add_argument('--tokenizer_path', type=str, default=None, help='tokenizer path, default is `None` mean using `--path` value.')
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
+    parser.add_argument('--dflash_path', type=str, default=None, help='dflash draft model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
     parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
@@ -1309,24 +1535,40 @@ def build_args(parser):
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
     parser.add_argument('--cleanup_onnx', action='store_true', help='Delete intermediate onnx files after export.')
-    parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
+    parser.add_argument('--quant_bit', type=int, default=4, help='mnn weight bit, 2/3/4/8/16 (16 exports FP16 weights; 2 and 3 require ARMV86 i8mm + FP16), default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
-    parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual quant bit, 4 or 8, default is setting in utils/vision.py by different vit model.')
+    parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual weight bit, 4/8/16 (16 exports FP16 weights), default is setting in utils/vision.py by different vit model.')
     parser.add_argument('--visual_quant_block', type=int, default=None, help='mnn quant block, default is setting in utils/vision.py by different vit model.')
-    parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
+    parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head weight bit, 4/8/16 (16 exports FP16 weights), default is `quant_bit`.')
     parser.add_argument('--lm_quant_block', type=int, default=None, help='mnn lm_head quant block, 0 mean channle-wise, default is `quant_block`.')
     parser.add_argument('--mnnconvert', type=str, default='../../../build/MNNConvert', help='local mnnconvert path, if invalid, using pymnn.')
     parser.add_argument('--ppl', action='store_true', help='Whether or not to get all logits of input tokens.')
     parser.add_argument('--awq', action='store_true', help='Whether or not to use awq quant.')
     parser.add_argument('--hqq', action='store_true', help='Whether or not to use hqq quant.')
-    parser.add_argument('--omni', action='store_true', help='Whether or not to use omni quant.')
+    calibration_group = parser.add_mutually_exclusive_group()
+    calibration_group.add_argument('--omni', action='store_true', help='Whether or not to use omni quant.')
+    calibration_group.add_argument('--smooth', action='store_true', help='Whether or not to use smooth quant.')
     parser.add_argument('--transformer_fuse', action='store_true', help='Whether or not to fuse vision transformer op.')
+    parser.add_argument('--disable_transformer_c4', dest='transformer_c4', action='store_false', default=True,
+                        help='Disable LLM C4 graph fusion for compatibility with older runtimes. '
+                        'Also turns off every fused-op export that requires MNN_SUPPORT_TRANSFORMER_FUSE '
+                        '(fuse_qkv_proj / fuse_gate_up_proj / fuse_ln_proj / fuse_linear_attn_gate).')
     parser.add_argument('--group_conv_native', action='store_true', help='Whether or not to keep native group_conv.')
-    parser.add_argument('--smooth', action='store_true', help='Whether or not to use smooth quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), default is False.')
+    parser.add_argument('--scale_bit', type=int, default=16, choices=[16, 32], help='Bit-width for quant scale/zero-point storage. Currently supports 16 (fp16, default) and 32 (fp32); 8/4 reserved for future.')
     parser.add_argument('--visual_sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint) for visual model, default is False.')
     parser.add_argument('--seperate_embed', action='store_true', help='For lm and embed shared model, whether or not to sepearte embed to avoid quant, default is False, if True, embed weight will be seperate to embedding bf16.bin.')
     parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, default is False.')
+    parser.add_argument('--fuse_linear_attn_gate', dest='fuse_linear_attn_gate', action='store_true', default=True,
+                        help='Fold linear-attention gate/beta constants into LinearAttentionParam, removing the exported softplus/sigmoid chain. On by default; implemented by CPU, Metal, CUDA and the buffer-mode OpenCL / Vulkan backends (image-mode OpenCL / Vulkan have no LinearAttention execution at all and already run it on CPU).')
+    parser.add_argument('--disable_fuse_linear_attn_gate', dest='fuse_linear_attn_gate', action='store_false',
+                        help='Disable the linear-attention gate fold. Needed for engines predating gate_fold support: they ignore the flag and consume the raw `a` projection as the decay gate, which is wrong output rather than a load error.')
+    parser.add_argument('--disable_fuse_qkv_proj', dest='fuse_qkv_proj', action='store_false', default=True,
+                        help='Do not let MNNConvert group shared-input q/k/v projections of regular Attention into one FusedLinear op. (Linear-attention in_proj projections are always fused regardless of this flag, since the LinearAttention op requires C4-fused inputs.)')
+    parser.add_argument('--disable_fuse_gate_up_proj', dest='fuse_gate_up_proj', action='store_false', default=True,
+                        help='Do not let MNNConvert group dense SwiGLU gate/up projections into one FusedLinear op.')
+    parser.add_argument('--disable_fuse_ln_proj', dest='fuse_ln_proj', action='store_false', default=True,
+                        help='Do not fold the block-input binary RMSNorm into fused projection ops (has_ln variant).')
     parser.add_argument('--calib_data', type=str, default=None, help='calibration data path, default is `None` mean not use calib data.')
     parser.add_argument('--act_bit', type=int, default=16, help='smooth quant act bit, 8 or 16, default is 16.')
     parser.add_argument('--embed_bit', type=int, default=16, choices=[16, 8, 4], help='embedding export bit precision, choices are 16 (bf16), 8 (int8), 4 (int4), default is 16.')
@@ -1345,7 +1587,10 @@ def export(path, **kwargs):
     args = parser.parse_args(['--path', path])
     for k, v in kwargs.items():
         setattr(args, k, v)
-    if 'bge' in path:
+    if args.generate_for_npu:
+        args.transformer_c4 = False
+    embedding_models = ['bge', 'gte', 'Qwen3-Embedding', 'Qwen3-VL-Embedding']
+    if any(model in path for model in embedding_models):
         llm_exporter = EmbeddingExporter(args)
     else:
         llm_exporter = LlmExporter(args)
@@ -1356,10 +1601,12 @@ def main():
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     build_args(parser)
     args = parser.parse_args()
+    if args.generate_for_npu:
+        args.transformer_c4 = False
 
     model_path = args.path
 
-    embedding_models = ['bge', 'gte', 'Qwen3-Embedding']
+    embedding_models = ['bge', 'gte', 'Qwen3-Embedding', 'Qwen3-VL-Embedding']
     if any(model in model_path for model in embedding_models):
         llm_exporter = EmbeddingExporter(args)
     else:

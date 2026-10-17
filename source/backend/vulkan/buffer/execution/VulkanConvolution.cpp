@@ -10,7 +10,8 @@
 #include "core/Macro.h"
 #include "VulkanConvolutionImpl.hpp"
 #include "core/ConvolutionCommon.hpp"
-#include "VulkanConv1x1Coop.hpp"
+#include "VulkanConv1x1CoopAFP16.hpp"
+#include "VulkanConv1x1CoopA8.hpp"
 #include "VulkanConv1x1General.hpp"
 namespace MNN {
 int VulkanConvolutionCommon::gImage2ColLocal = 256;
@@ -575,15 +576,38 @@ public:
                              common->strideX() == 1 && common->strideY() == 1 &&
                              inputs[0]->width() == outputs[0]->width() && inputs[0]->height() == outputs[0]->height();
                 bool singleInput = (inputs.size() == 1);
+                const char* disableCoopMatEnv = getenv("MNN_VULKAN_DISABLE_COOPMAT");
+                const bool disableCoopMat = disableCoopMatEnv != nullptr &&
+                    std::string(disableCoopMatEnv) == "1";
+                const bool useCoopMat = !disableCoopMat &&
+                    coopMatInfo.supportCoopMat && supportSubgroupArithmetic &&
+                    extra->gpuType() == VulkanRuntime::ADRENO;
                 if (useInt8Conv && is1x1 && singleInput) {
-                    if (coopMatInfo.supportCoopMat && supportSubgroupArithmetic && extra->gpuType() == VulkanRuntime::ADRENO) {
+                    // CoopMat path only supports int4/int8 weight. For 2/3-bit, go to
+                    // VulkanConv1x1General which has the native int2/int3 packed path.
+                    const bool isLowBit23 = (quanWeight != nullptr)
+                        && (quanWeight->canUseInt2 || quanWeight->canUseInt3);
+                    if (!isLowBit23 && useCoopMat) {
+                        // W8A8 path: per-channel asym int8 OR int4 (decode + prefill share
+                        // body; INT4 inserts a runtime nibble unpack stage) + S8S8->S32
+                        // cooperative matrix on Adreno. alpha layout for asym is (offset,
+                        // scale) per channel-block; per-channel == alpha.size() ==
+                        // outputCount * 2 (block-quant has size outputCount * blockCount * 2,
+                        // which excludes it from this branch).
+                        const bool perChannelAsym = (quanWeight != nullptr)
+                            && quanWeight->asymmetric
+                            && (int)quanWeight->alpha.size() == outputCount * 2
+                            && extra->getDevice().getInt8Support();
+                        if (perChannelAsym && coopMatInfo.supportS8S8S32) {
+                            return new VulkanConv1x1CoopA8(extra, convCommonParam, biasPtr,
+                                                           srcCount, outputCount, coopMatInfo, quanWeight);
+                        }
                         return new VulkanConv1x1Coop(extra, convCommonParam, nullptr, biasPtr, srcCount, outputCount, coopMatInfo,
                                                      quanWeight);
                     }
                     return new VulkanConv1x1General(extra, convCommonParam, biasPtr, srcCount, outputCount, quanWeight);
                 }
-                if (coopMatInfo.supportCoopMat && supportSubgroupArithmetic && is1x1 && singleInput &&
-                    extra->gpuType() == VulkanRuntime::ADRENO) {
+                if (useCoopMat && is1x1 && singleInput) {
                     return new VulkanConv1x1Coop(extra, convCommonParam, source, biasPtr, srcCount, outputCount, coopMatInfo);
                 }
                 if (useInt8Conv) {

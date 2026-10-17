@@ -1725,7 +1725,7 @@ VARP _HybridInt8Conv(std::vector<float>&& weightFloat, std::vector<float>&& bias
     conv2D->quanParameter = IDSTEncoder::encode(
         weightFloat.data(), alpha, kSize, kNum,
         /*asymmetricQuantFlag=*/false, /*quantWeightPtr=*/nullptr,
-        /*clampMin=*/qmin, /*bits=*/nbits, /*detectSparse=*/false);
+        /*clampMin=*/qmin, IDSTEncoder::EncodeOptions(nbits, false));
     conv2D->weight.clear();
     conv2D->bias = std::move(bias);
 

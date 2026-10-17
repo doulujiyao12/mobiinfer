@@ -1,6 +1,6 @@
 import os
 import json
-from transformers import PretrainedConfig, AutoConfig
+from transformers import PretrainedConfig, AutoConfig, AutoModel
 from utils.model_mapper import ModelMapper
 from typing import Optional, List, Dict, Any, Union
 from dataclasses import dataclass, field, asdict
@@ -23,8 +23,10 @@ class LlmConfig(PretrainedConfig):
         self.layer_types = kwargs.pop("layer_types", [])
         self.attention_type = kwargs.pop("attention_type", 'full')
         self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
+        self.scale_emb = kwargs.pop("scale_emb", None)
         self.conv_L_cache = kwargs.pop("conv_L_cache", 0)
         self.rope_parameters = kwargs.pop("rope_parameters", None)
+        self.qk_norm_after_rope = kwargs.pop("qk_norm_after_rope", False)
         self.model_map = kwargs.pop("model_map", {})
         super().__init__(**kwargs)
 
@@ -32,21 +34,38 @@ class LlmConfig(PretrainedConfig):
     def _register_external_model(model_type: str):
         EXTERNAL_MODEL_REGISTRY = {
             'funaudiochat': ('funaudiochat.register', 'register_funaudiochat'),
+            'qwen3_asr': ('qwen_asr.inference.qwen3_asr', None),
+            'qwen3_tts': ('qwen_tts.core.models', None),
         }
         if model_type in EXTERNAL_MODEL_REGISTRY:
             module_path, func_name = EXTERNAL_MODEL_REGISTRY[model_type]
             try:
                 import importlib
                 module = importlib.import_module(module_path)
-                getattr(module, func_name)()
+                if model_type == 'qwen3_tts':
+                    # qwen_tts imports model classes but does not register AutoModel by itself.
+                    AutoConfig.register('qwen3_tts', module.Qwen3TTSConfig)
+                    AutoModel.register(module.Qwen3TTSConfig, module.Qwen3TTSForConditionalGeneration)
+                if func_name is not None:
+                    getattr(module, func_name)()
             except ImportError:
                 raise ImportError(
                     f"{model_type} requires external package. "
                     f"Please clone it from GitHub and set PYTHONPATH accordingly."
                 )
 
+    @staticmethod
+    def _namespace_to_dict(value):
+        if hasattr(value, '__dict__'):
+            return {k: LlmConfig._namespace_to_dict(v) for k, v in vars(value).items()}
+        if isinstance(value, list):
+            return [LlmConfig._namespace_to_dict(v) for v in value]
+        return value
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        model_type = None
+        raw_config = {}
         config_path = os.path.join(pretrained_model_name_or_path, 'config.json')
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
@@ -76,9 +95,30 @@ class LlmConfig(PretrainedConfig):
         # rename attribute for different models
         ModelMapper.do_map(llm_config, config, model_map['config'])
 
+        rope_scaling = getattr(llm_config, 'rope_scaling', None)
+        if rope_scaling is not None and hasattr(rope_scaling, '__dict__'):
+            llm_config.rope_scaling = cls._namespace_to_dict(rope_scaling)
+        rope_parameters = getattr(llm_config, 'rope_parameters', None)
+        if rope_parameters is not None and hasattr(rope_parameters, '__dict__'):
+            llm_config.rope_parameters = cls._namespace_to_dict(rope_parameters)
+
         # Post-processing and setting defaults
         if llm_config.num_key_value_heads is None:
             llm_config.num_key_value_heads = llm_config.num_attention_heads
+
+        # Compatibility: transformers>=5.x moved rope_theta into rope_parameters dict
+        if llm_config.rope_theta is None or llm_config.rope_theta == 10000.0:
+            # Try rope_parameters (transformers 5.x style)
+            rp = getattr(config, 'rope_parameters', None) or getattr(config, 'rope_scaling', None)
+            if not isinstance(rp, dict):
+                rp = getattr(llm_config, 'rope_parameters', None)
+            if isinstance(rp, dict) and 'rope_theta' in rp:
+                llm_config.rope_theta = rp['rope_theta']
+            # Fallback to raw config JSON (top-level or nested text_config)
+            elif 'rope_theta' in raw_config:
+                llm_config.rope_theta = raw_config['rope_theta']
+            elif 'text_config' in raw_config and 'rope_theta' in raw_config.get('text_config', {}):
+                llm_config.rope_theta = raw_config['text_config']['rope_theta']
 
         if llm_config.rope_theta is None:
             llm_config.rope_theta = 10000.0
@@ -93,12 +133,13 @@ class LlmConfig(PretrainedConfig):
                 llm_config.head_dim = llm_config.hidden_size // llm_config.num_attention_heads
 
         # Determine attention type.
-        # Qwen3.5 mixed-attention models mark non-full layers as
-        # `linear_attention`; reuse the existing mix path for them.
+        # Only `sliding_attention` layers need a sliding-window mask and
+        # therefore the "mix" path.  `linear_attention` layers (e.g. Qwen3.5)
+        # do not use the attention mask at all, so they are treated as full.
         sliding_attn_layers = []
         if hasattr(llm_config, 'layer_types') and llm_config.layer_types:
             for i in range(len(llm_config.layer_types)):
-                if llm_config.layer_types[i] in ('sliding_attention', 'linear_attention'):
+                if llm_config.layer_types[i] == 'sliding_attention':
                     sliding_attn_layers.append(i)
 
         if llm_config.num_hidden_layers and len(sliding_attn_layers) >= llm_config.num_hidden_layers:
@@ -108,7 +149,6 @@ class LlmConfig(PretrainedConfig):
             llm_config.sliding_attn_layers = sliding_attn_layers
         else:
             llm_config.attention_type = 'full'
-
         return llm_config
 
 # export config
@@ -141,7 +181,7 @@ class LLMExportConfig:
     attention_mask: str = 'float'
     attention_type: str = 'full'
     sliding_window: int = 0
-    tie_embeddings: Optional[List[Union[int]]] = field(default_factory=list)
+    tie_embeddings: Optional[Union[List[int], Dict[str, Any]]] = field(default_factory=list)
     jinja: Dict[str, Any] = field(default_factory=dict)
     vision: Optional[VisionExportConfig] = None
 

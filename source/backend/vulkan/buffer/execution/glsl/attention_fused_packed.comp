@@ -29,13 +29,15 @@ layout(set=0, binding=6) readonly buffer s6 {
 layout(set=0, binding=7) readonly uniform constBuffer {
     ivec4 s0; // qLen, kLen, headNum, kvHeadNum
     ivec4 s1; // headDim, group, pastLen, totalLen
-    ivec4 s2; // maskQlen, maskKvlen, hasMask, cacheMaxLen
-    vec4 f0;  // scale, 0, 0, 0
+    ivec4 s2; // maskQlen, maskKvlen, maskMode, cacheMaxLen
+    vec4 f0;  // scale, 0, valueC4, outputC4
 } uConst;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const int MAX_D4 = 64; // headDim <= 256
+const int MAX_D4 = 64;   // per invocation z
+const int MAX_Q_D4 = 128; // headDim <= 512
+const float NEG_INF = -3.402823466e38;
 
 void main() {
     const int h = int(gl_GlobalInvocationID.x);
@@ -55,19 +57,22 @@ void main() {
     const int pastLen = uConst.s1.z;
     const int totalLen = uConst.s1.w;
 
-    const int hasMask = uConst.s2.z;
+    const int maskMode = uConst.s2.z;
     const int maskQlen = uConst.s2.x;
     const int maskKvlen = uConst.s2.y;
     const int maxLen = uConst.s2.w;
 
     const float scale = uConst.f0.x;
+    const bool outputC4 = uConst.f0.w > 0.5;
 
     const int kvh = h / group;
     if (kvh >= kvHeadNum) {
         return;
     }
     const int d4Size = headDim / 4;
-    if (d4Size > MAX_D4) {
+    const int d4Begin = int(gl_GlobalInvocationID.z) * MAX_D4;
+    const int d4Count = min(MAX_D4, d4Size - d4Begin);
+    if (d4Size > MAX_Q_D4 || d4Count <= 0) {
         return;
     }
     if (maxLen <= 0) {
@@ -77,14 +82,14 @@ void main() {
     // query: [1, qLen, headNum, headDim]
     const int qBase = (q * headNum + h) * headDim;
     vec4 outVec[MAX_D4];
-    for (int i = 0; i < d4Size; ++i) {
+    for (int i = 0; i < d4Count; ++i) {
         outVec[i] = vec4(0.0);
     }
 
     float m = -3.402823466e38;
     float s = 0.0;
 
-    const int kStart = (hasMask != 0 && maskKvlen > 0 && totalLen > maskKvlen) ? (totalLen - maskKvlen) : 0;
+    const int kStart = (maskMode == 1 && maskKvlen > 0 && totalLen > maskKvlen) ? (totalLen - maskKvlen) : 0;
 
     for (int k = 0; k < totalLen; ++k) {
         float dotSum = 0.0;
@@ -99,19 +104,21 @@ void main() {
             dotSum += dot(qv, kv);
         }
         float score = dotSum * scale;
-        if (hasMask != 0) {
+        if (maskMode == 1) {
             if (q < maskQlen && maskKvlen > 0 && k >= kStart) {
                 const int mk = k - kStart;
                 if (mk >= 0 && mk < maskKvlen) {
                     score += float(uMask.data[q * maskKvlen + mk]);
                 }
             }
+        } else if (maskMode == 2 && k > (pastLen + q)) {
+            score = NEG_INF;
         }
 
         float w = 0.0;
         if (score > m) {
             float factor = exp(m - score);
-            for (int i = 0; i < d4Size; ++i) {
+            for (int i = 0; i < d4Count; ++i) {
                 outVec[i] *= factor;
             }
             s = s * factor + 1.0;
@@ -123,8 +130,8 @@ void main() {
         }
 
         // cacheV (kvh-major, packed-D): [kvHeadNum, maxLen, headDim/4, 4]
-        const int vOff4Base = ((kvh * maxLen + k) * d4Size);
-        for (int i = 0; i < d4Size; ++i) {
+        const int vOff4Base = ((kvh * maxLen + k) * d4Size) + d4Begin;
+        for (int i = 0; i < d4Count; ++i) {
             vec4 vv = vec4(uCacheValue.data[vOff4Base + i]);
             outVec[i] += w * vv;
         }
@@ -132,13 +139,15 @@ void main() {
 
     float invS = 1.0 / s;
     // output: [1, qLen, headNum * headDim]
-    const int outBase = (q * headNum + h) * headDim;
-    for (int i = 0; i < d4Size; ++i) {
+    for (int i = 0; i < d4Count; ++i) {
         vec4 v = outVec[i] * invS;
-        const int d = i * 4;
-        uOutput.data[outBase + d + 0] = FLOAT(v.x);
-        uOutput.data[outBase + d + 1] = FLOAT(v.y);
-        uOutput.data[outBase + d + 2] = FLOAT(v.z);
-        uOutput.data[outBase + d + 3] = FLOAT(v.w);
+        const int d4 = d4Begin + i;
+        const int d = d4 * 4;
+        const int outBase = outputC4 ? ((h * d4Size + d4) * qLen + q) * 4
+                                     : (q * headNum + h) * headDim + d;
+        uOutput.data[outBase + 0] = FLOAT(v.x);
+        uOutput.data[outBase + 1] = FLOAT(v.y);
+        uOutput.data[outBase + 2] = FLOAT(v.z);
+        uOutput.data[outBase + 3] = FLOAT(v.w);
     }
 }

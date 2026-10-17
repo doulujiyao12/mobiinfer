@@ -40,13 +40,13 @@ kernel void layernorm_in_all_sg(const device ftype *in       [[buffer(0)]],
     float mean;
     float sum = 0.0f;
     float square_sum = 0.0f;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         sum += in_data[i];
     }
     sum = simd_sum(sum);
     mean = sum / cst.inside;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         float dis = (in_data[i] - mean);
         square_sum += dis * dis;
@@ -79,17 +79,17 @@ kernel void layernorm_in_all_rms_sg(const device ftype *in       [[buffer(0)]],
     auto out_data = out + gid.y * cst.inside;
 
     float square_sum = 0.0f;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         float dis = in_data[i];
         square_sum += dis * dis;
     }
-    
+
     square_sum = simd_sum(square_sum);
     float var = 1.0 / sqrt(square_sum / cst.inside + cst.eps);
 
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
-        
+
         float norm = var * ((float)in_data[i]);
         if(cst.has_gamma_beta) {
             out_data[i] = (ftype)(norm * gamma[i] + beta[i]);
@@ -116,13 +116,13 @@ kernel void layernorm_x1_sg(const device ftype *in       [[buffer(0)]],
     float mean;
     float sum = 0.0f;
     float square_sum = 0.0f;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         sum += in_data[i];
     }
     sum = simd_sum(sum);
     mean = sum / cst.inside;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         float dis = (in_data[i] - mean);
         square_sum += dis * dis;
@@ -131,7 +131,7 @@ kernel void layernorm_x1_sg(const device ftype *in       [[buffer(0)]],
 
     if(tiisg == 0) {
         float var = 1.0 / sqrt(square_sum / cst.inside + cst.eps);
-        
+
         float norm = var * ((float)in_data[gid.x] - mean);
         if(cst.has_gamma_beta) {
             out_data[gid.x] = (ftype)(norm * gamma[gid.x] + beta[gid.x]);
@@ -158,7 +158,7 @@ kernel void layernorm_x4_sg(const device ftype4 *in       [[buffer(0)]],
     float mean;
     float sum = 0.0f;
     float square_sum = 0.0f;
-    
+
     for(int i = tiisg; i < cst.inside/4; i+=SIMD_GROUP_WIDTH) {
         sum += in_data[i].x;
         sum += in_data[i].y;
@@ -167,7 +167,7 @@ kernel void layernorm_x4_sg(const device ftype4 *in       [[buffer(0)]],
     }
     sum = simd_sum(sum);
     mean = sum / cst.inside;
-    
+
     for(int i = tiisg; i < cst.inside/4; i+=SIMD_GROUP_WIDTH) {
         float dis = (in_data[i].x - mean);
         square_sum += dis * dis;
@@ -182,7 +182,7 @@ kernel void layernorm_x4_sg(const device ftype4 *in       [[buffer(0)]],
 
     if(tiisg == 0) {
         float var = 1.0 / sqrt(square_sum / cst.inside + cst.eps);
-        
+
         float4 norm = var * ((float4)in_data[gid.x] - mean);
         if(cst.has_gamma_beta) {
             out_data[gid.x] = (ftype4)(norm * gamma[gid.x] + beta[gid.x]);
@@ -208,17 +208,17 @@ kernel void layernorm_x1_rms_sg(const device ftype *in       [[buffer(0)]],
     auto out_data = out + gid.y * cst.inside;
 
     float square_sum = 0.0f;
-    
+
     for(int i = tiisg; i < cst.inside; i+=SIMD_GROUP_WIDTH) {
         float dis = in_data[i];
         square_sum += dis * dis;
     }
-    
+
     square_sum = simd_sum(square_sum);
-    
+
     if(tiisg == 0) {
         float var = 1.0 / sqrt(square_sum / cst.inside + cst.eps);
-        
+
         float norm = var * ((float)in_data[gid.x]);
         if(cst.has_gamma_beta) {
             out_data[gid.x] = (ftype)(norm * gamma[gid.x] + beta[gid.x]);
@@ -254,15 +254,127 @@ kernel void layernorm_x4_rms_sg(const device ftype4 *in       [[buffer(0)]],
     }
     square_sum_all += (square_sum[0] + square_sum[1] + square_sum[2] + square_sum[3]);
     square_sum_all = simd_sum(square_sum_all);
-    
+
     if(tiisg == 0) {
         float var = 1.0 / sqrt(square_sum_all / cst.inside + cst.eps);
-        
+
         float4 norm = var * ((float4)in_data[in_idx]);
         if(cst.has_gamma_beta) {
             out_data[in_idx] = (ftype4)(norm * gamma[in_idx] + beta[in_idx]);
         } else {
             out_data[in_idx] = (ftype4)(norm);
+        }
+    }
+}
+
+kernel void binary_layernorm_x4_sg(const device ftype4 *in0       [[buffer(0)]],
+                         const device ftype4 *in1            [[buffer(1)]],
+                         device ftype4 *out0            [[buffer(2)]],
+                         device ftype4 *out1            [[buffer(3)]],
+                         constant layernorm_constants& cst  [[buffer(4)]],
+                         const device float4 *gamma    [[buffer(5)]],
+                         const device float4 *beta     [[buffer(6)]],
+                         uint3  gid  [[threadgroup_position_in_grid]],
+                         uint  tiisg[[thread_index_in_simdgroup]],
+                         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if ((int)gid.y >= cst.outside) {
+        return;
+    }
+    int channelUnit = cst.inside / 4;
+    auto in0_data = in0 + gid.y * channelUnit;
+    auto in1_data = in1 + gid.y * channelUnit;
+    auto out0_data = out0 + gid.y * channelUnit;
+    auto out1_data = out1 + gid.y * channelUnit;
+
+    float4 sum4 = 0.0f;
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += 64) {
+        sum4 += float4(in0_data[c]) + float4(in1_data[c]);
+    }
+    sum4 = simd_sum(sum4);
+
+    threadgroup float4 sg_sum[2];
+    if(tiisg == 0) {
+        sg_sum[sgitg] = sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 total_sum4 = sg_sum[0] + sg_sum[1];
+    float mean = (total_sum4.x + total_sum4.y + total_sum4.z + total_sum4.w) / cst.inside;
+    float4 mean4 = mean;
+
+    float4 square_sum4 = 0.0f;
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += 64) {
+        float4 data = float4(in0_data[c]) + float4(in1_data[c]);
+        float4 diff = data - mean4;
+        square_sum4 += diff * diff;
+    }
+    square_sum4 = simd_sum(square_sum4);
+
+    threadgroup float4 sg_square_sum[2];
+    if(tiisg == 0) {
+        sg_square_sum[sgitg] = square_sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 total_square_sum4 = sg_square_sum[0] + sg_square_sum[1];
+    float square_sum = total_square_sum4.x + total_square_sum4.y + total_square_sum4.z + total_square_sum4.w;
+    float var = 1.0f / sqrt(square_sum / cst.inside + cst.eps);
+    float4 var4 = var;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += 64) {
+        float4 data = float4(in0_data[c]) + float4(in1_data[c]);
+        out0_data[c] = (ftype4)data;
+        float4 norm = var4 * (data - mean4);
+        if(cst.has_gamma_beta) {
+            out1_data[c] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1_data[c] = (ftype4)norm;
+        }
+    }
+}
+
+kernel void binary_layernorm_x4_rms_sg(const device ftype4 *in0       [[buffer(0)]],
+                            const device ftype4 *in1            [[buffer(1)]],
+                            device ftype4 *out0            [[buffer(2)]],
+                            device ftype4 *out1            [[buffer(3)]],
+                            constant layernorm_constants& cst  [[buffer(4)]],
+                            const device float4 *gamma    [[buffer(5)]],
+                            const device float4 *beta     [[buffer(6)]],
+                            uint3  gid  [[threadgroup_position_in_grid]],
+                            uint  tiisg[[thread_index_in_simdgroup]],
+                            uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if ((int)gid.y >= cst.outside) {
+        return;
+    }
+    int channelUnit = cst.inside / 4;
+    auto in0_data = in0 + gid.y * channelUnit;
+    auto in1_data = in1 + gid.y * channelUnit;
+    auto out0_data = out0 + gid.y * channelUnit;
+    auto out1_data = out1 + gid.y * channelUnit;
+
+    float4 square_sum4 = 0.0f;
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += 64) {
+        float4 data = float4(in0_data[c]) + float4(in1_data[c]);
+        square_sum4 += data * data;
+    }
+    square_sum4 = simd_sum(square_sum4);
+
+    threadgroup float4 sg_square_sum[2];
+    if(tiisg == 0) {
+        sg_square_sum[sgitg] = square_sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 total_square_sum4 = sg_square_sum[0] + sg_square_sum[1];
+    float square_sum = total_square_sum4.x + total_square_sum4.y + total_square_sum4.z + total_square_sum4.w;
+    float var = 1.0f / sqrt(square_sum / cst.inside + cst.eps);
+    float4 var4 = var;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += 64) {
+        float4 data = float4(in0_data[c]) + float4(in1_data[c]);
+        out0_data[c] = (ftype4)data;
+        float4 norm = var4 * data;
+        if(cst.has_gamma_beta) {
+            out1_data[c] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1_data[c] = (ftype4)norm;
         }
     }
 }
@@ -325,7 +437,426 @@ kernel void layernorm_x16_rms_sg(const device ftype4 *in       [[buffer(0)]],
     }
 }
 
+kernel void layernorm_c4_sg(const device ftype4 *in       [[buffer(0)]],
+                         device ftype4 *out            [[buffer(1)]],
+                         constant layernorm_constants& cst  [[buffer(2)]],
+                         const device float4 *gamma    [[buffer(3)]],
+                         const device float4 *beta     [[buffer(4)]],
+                         uint3  gid  [[threadgroup_position_in_grid]],
+                         uint  tiisg[[thread_index_in_simdgroup]],
+                         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    int batch = cst.outside;
+    int channelUnit = cst.inside / 4;
+
+    if ((int)gid.y >= batch) {
+        return;
+    }
+
+    float mean1 = 0.0f;
+    float4 sum4 = 0.0f;
+
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        sum4 += float4(in[idx]);
+    }
+
+    sum4 = simd_sum(sum4);
+    float sum = sum4[0] + sum4[1] + sum4[2] + sum4[3];
+    mean1 = sum / (channelUnit * 4);
+    float4 mean4 = mean1;
+
+    float4 square_sum4 = 0.0f;
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        float4 diff = float4(in[idx]) - mean4;
+        square_sum4 += diff * diff;
+    }
+
+    square_sum4 = simd_sum(square_sum4);
+    float square_sum = square_sum4[0] + square_sum4[1] + square_sum4[2] + square_sum4[3];
+    float var = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+    float4 var4 = var;
+
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        float4 norm = var4 * (float4(in[idx]) - mean4);
+        if(cst.has_gamma_beta) {
+            out[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+kernel void binary_layernorm_c4_sg(const device ftype4 *in0       [[buffer(0)]],
+                         const device ftype4 *in1            [[buffer(1)]],
+                         device ftype4 *out0            [[buffer(2)]],
+                         device ftype4 *out1            [[buffer(3)]],
+                         constant layernorm_constants& cst  [[buffer(4)]],
+                         const device float4 *gamma    [[buffer(5)]],
+                         const device float4 *beta     [[buffer(6)]],
+                         uint3  gid  [[threadgroup_position_in_grid]],
+                         uint  tiisg[[thread_index_in_simdgroup]],
+                         uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    int batch = cst.outside;
+    int channelUnit = cst.inside / 4;
+
+    if ((int)gid.y >= batch) {
+        return;
+    }
+
+    float mean1 = 0.0f;
+    float4 sum4 = 0.0f;
+
+    for(int c = sgitg * 32 + tiisg; c < channelUnit; c += 64) {
+        int idx = c * batch + gid.y;
+        float4 data = float4(in0[idx]) + float4(in1[idx]);
+        sum4 += data;
+    }
+
+    sum4 = simd_sum(sum4);
+
+    // cross simd group communication for threadgroup size 64
+    threadgroup float4 sg_sum[2];
+    if(tiisg == 0) {
+        sg_sum[sgitg] = sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 total_sum4 = sg_sum[0] + sg_sum[1];
+
+    float sum = total_sum4[0] + total_sum4[1] + total_sum4[2] + total_sum4[3];
+    mean1 = sum / (channelUnit * 4);
+    float4 mean4 = mean1;
+
+    float4 square_sum4 = 0.0f;
+    for(int c = sgitg * 32 + tiisg; c < channelUnit; c += 64) {
+        int idx = c * batch + gid.y;
+        float4 data = float4(in0[idx]) + float4(in1[idx]);
+        float4 diff = data - mean4;
+        square_sum4 += diff * diff;
+    }
+
+    square_sum4 = simd_sum(square_sum4);
+
+    threadgroup float4 sg_square_sum[2];
+    if(tiisg == 0) {
+        sg_square_sum[sgitg] = square_sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 total_square_sum4 = sg_square_sum[0] + sg_square_sum[1];
+
+    float square_sum = total_square_sum4[0] + total_square_sum4[1] + total_square_sum4[2] + total_square_sum4[3];
+    float var = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+    float4 var4 = var;
+
+    for(int c = sgitg * 32 + tiisg; c < channelUnit; c += 64) {
+        int idx = c * batch + gid.y;
+        float4 my_data = float4(in0[idx]) + float4(in1[idx]);
+        out0[idx] = (ftype4)my_data;
+        float4 norm = var4 * (my_data - mean4);
+        if(cst.has_gamma_beta) {
+            out1[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+// LN_SIMDS = simdgroups per threadgroup for the two RMS reduction kernels below.
+// One row is one threadgroup, so at decode (outside == 1) the whole dispatch is a
+// single threadgroup and the GPU is mostly idle; widening the threadgroup is the
+// only way to add parallelism there. The host always passes this macro explicitly
+// for the pipelines it owns (see MetalLayerNorm::rmsSimdGroups), so the default
+// here only guards a stray compile. LN_SIMDS == the legacy value (1 single-input,
+// 2 binary) reproduces the previous reduction order bit-for-bit.
+#ifndef LN_SIMDS
+#define LN_SIMDS 1
+#endif
+
+kernel void layernorm_c4_rms_sg(const device ftype4 *in       [[buffer(0)]],
+                            device ftype4 *out            [[buffer(1)]],
+                            constant layernorm_constants& cst  [[buffer(2)]],
+                            const device float4 *gamma    [[buffer(3)]],
+                            const device float4 *beta     [[buffer(4)]],
+                            uint3  gid  [[threadgroup_position_in_grid]],
+                            uint  tiisg[[thread_index_in_simdgroup]],
+                            uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    int batch = cst.outside;
+    int channelUnit = cst.inside / 4;
+
+    if ((int)gid.y >= batch) {
+        return;
+    }
+
+    float4 square_sum4 = 0.0f;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += LN_SIMDS * SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        float4 data = float4(in[idx]);
+        square_sum4 += data * data;
+    }
+
+    square_sum4 = simd_sum(square_sum4);
+
+#if LN_SIMDS > 1
+    threadgroup float4 sg_square_sum[LN_SIMDS];
+    if(tiisg == 0) {
+        sg_square_sum[sgitg] = square_sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    square_sum4 = sg_square_sum[0];
+    for(int s = 1; s < LN_SIMDS; s++) {
+        square_sum4 += sg_square_sum[s];
+    }
+#endif
+
+    float square_sum = square_sum4[0] + square_sum4[1] + square_sum4[2] + square_sum4[3];
+    float var = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+    float4 var4 = var;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += LN_SIMDS * SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        float4 norm = var4 * float4(in[idx]);
+        if(cst.has_gamma_beta) {
+            out[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+kernel void binary_layernorm_c4_rms_sg(const device ftype4 *in0       [[buffer(0)]],
+                            const device ftype4 *in1            [[buffer(1)]],
+                            device ftype4 *out0            [[buffer(2)]],
+                            device ftype4 *out1            [[buffer(3)]],
+                            constant layernorm_constants& cst  [[buffer(4)]],
+                            const device float4 *gamma    [[buffer(5)]],
+                            const device float4 *beta     [[buffer(6)]],
+                            uint3  gid  [[threadgroup_position_in_grid]],
+                            uint  tiisg[[thread_index_in_simdgroup]],
+                            uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    int batch = cst.outside;
+    int channelUnit = cst.inside / 4;
+
+    if ((int)gid.y >= batch) {
+        return;
+    }
+
+    float4 square_sum4 = 0.0f;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += LN_SIMDS * SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+        float4 data = float4(in0[idx]) + float4(in1[idx]);
+#if LN_SUM_REREAD
+        out0[idx] = (ftype4)data;
+#endif
+        square_sum4 += data * data;
+    }
+
+    square_sum4 = simd_sum(square_sum4);
+
+    float4 total_square_sum4 = square_sum4;
+#if LN_SIMDS > 1
+    threadgroup float4 sg_square_sum[LN_SIMDS];
+    if(tiisg == 0) {
+        sg_square_sum[sgitg] = square_sum4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total_square_sum4 = sg_square_sum[0];
+    for(int s = 1; s < LN_SIMDS; s++) {
+        total_square_sum4 += sg_square_sum[s];
+    }
+#endif
+
+    float square_sum = total_square_sum4[0] + total_square_sum4[1] + total_square_sum4[2] + total_square_sum4[3];
+    float var = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+    float4 var4 = var;
+
+    for(int c = sgitg * SIMD_GROUP_WIDTH + tiisg; c < channelUnit; c += LN_SIMDS * SIMD_GROUP_WIDTH) {
+        int idx = c * batch + gid.y;
+#if LN_SUM_REREAD
+        float4 my_data = float4(out0[idx]);
+#else
+        float4 my_data = float4(in0[idx]) + float4(in1[idx]);
+        out0[idx] = (ftype4)my_data;
+#endif
+        float4 norm = var4 * my_data;
+        if(cst.has_gamma_beta) {
+            out1[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+// Multi-token RMSNorm, for prefill where `outside` is the token count.
+//
+// Same per-lane work as the channel-parallel kernels above — one simdgroup
+// reduces one token, reduction stays inside simd_sum — but LN_SIMDS tokens
+// share a threadgroup instead of each getting one of its own. At a 2048-token
+// prefill that turns 2048 threadgroups of 32 threads into 512 of 128, which
+// costs nothing (the simdgroups never talk, so there is still no barrier) and
+// stops the dispatch from burning a threadgroup slot per token.
+//
+// Needs enough tokens to fill the wider threadgroups; decode (outside == 1)
+// still takes the one-threadgroup-per-token form.
+kernel void layernorm_c4_rms_row_sg(const device ftype4 *in      [[buffer(0)]],
+                                    device ftype4 *out            [[buffer(1)]],
+                                    constant layernorm_constants& cst  [[buffer(2)]],
+                                    const device float4 *gamma    [[buffer(3)]],
+                                    const device float4 *beta     [[buffer(4)]],
+                                    uint3  gid  [[threadgroup_position_in_grid]],
+                                    uint   tiisg[[thread_index_in_simdgroup]],
+                                    uint   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int batch = cst.outside;
+    const int channelUnit = cst.inside / 4;
+    const int row = int(gid.y) * LN_SIMDS + int(sgitg);
+
+    if (row >= batch) {
+        return;
+    }
+
+    float4 square_sum4 = 0.0f;
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        float4 data = float4(in[c * batch + row]);
+        square_sum4 += data * data;
+    }
+    square_sum4 = simd_sum(square_sum4);
+
+    float square_sum = square_sum4[0] + square_sum4[1] + square_sum4[2] + square_sum4[3];
+    float4 var4 = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + row;
+        float4 norm = var4 * float4(in[idx]);
+        if(cst.has_gamma_beta) {
+            out[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+kernel void binary_layernorm_c4_rms_row_sg(const device ftype4 *in0  [[buffer(0)]],
+                                           const device ftype4 *in1  [[buffer(1)]],
+                                           device ftype4 *out0       [[buffer(2)]],
+                                           device ftype4 *out1       [[buffer(3)]],
+                                           constant layernorm_constants& cst  [[buffer(4)]],
+                                           const device float4 *gamma    [[buffer(5)]],
+                                           const device float4 *beta     [[buffer(6)]],
+                                           uint3  gid  [[threadgroup_position_in_grid]],
+                                           uint   tiisg[[thread_index_in_simdgroup]],
+                                           uint   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int batch = cst.outside;
+    const int channelUnit = cst.inside / 4;
+    const int row = int(gid.y) * LN_SIMDS + int(sgitg);
+
+    if (row >= batch) {
+        return;
+    }
+
+    float4 square_sum4 = 0.0f;
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + row;
+        float4 data = float4(in0[idx]) + float4(in1[idx]);
+#if LN_SUM_REREAD
+        out0[idx] = (ftype4)data;
+#endif
+        square_sum4 += data * data;
+    }
+    square_sum4 = simd_sum(square_sum4);
+
+    float square_sum = square_sum4[0] + square_sum4[1] + square_sum4[2] + square_sum4[3];
+    float4 var4 = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+
+    for(int c = tiisg; c < channelUnit; c += SIMD_GROUP_WIDTH) {
+        int idx = c * batch + row;
+#if LN_SUM_REREAD
+        float4 my_data = float4(out0[idx]);
+#else
+        float4 my_data = float4(in0[idx]) + float4(in1[idx]);
+        out0[idx] = (ftype4)my_data;
+#endif
+        float4 norm = var4 * my_data;
+        if(cst.has_gamma_beta) {
+            out1[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1[idx] = (ftype4)(norm);
+        }
+    }
+}
+
+// Token-parallel binary RMSNorm. The C4 activation is channel-major
+// (idx = c * batch + token), so mapping the lane index to the channel — what
+// every kernel above does — makes a 32-lane load touch 32 addresses batch*16
+// bytes apart. Mapping the lane to the *token* instead makes one load 32
+// contiguous float4 = 512 bytes, and the row reduction becomes private to the
+// lane, so simd_sum and the threadgroup barrier both disappear. gamma/beta turn
+// into a broadcast because every lane is on the same channel.
+//
+// Needs batch >= SIMD_GROUP_WIDTH to fill a simdgroup, so this is a prefill-only
+// form; decode keeps the channel-parallel kernels.
+kernel void binary_layernorm_c4_rms_tok_sg(const device ftype4 *in0  [[buffer(0)]],
+                                           const device ftype4 *in1  [[buffer(1)]],
+                                           device ftype4 *out0       [[buffer(2)]],
+                                           device ftype4 *out1       [[buffer(3)]],
+                                           constant layernorm_constants& cst  [[buffer(4)]],
+                                           const device float4 *gamma    [[buffer(5)]],
+                                           const device float4 *beta     [[buffer(6)]],
+                                           uint3  gid  [[threadgroup_position_in_grid]],
+                                           uint   tiisg[[thread_index_in_simdgroup]],
+                                           uint   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int batch = cst.outside;
+    const int channelUnit = cst.inside / 4;
+    const int token = (int(gid.y) * LN_SIMDS + int(sgitg)) * SIMD_GROUP_WIDTH + int(tiisg);
+
+    if (token >= batch) {
+        return;
+    }
+
+    // One lane owns the whole row, so a single accumulator would build a
+    // channelUnit-long dependent FMA chain -- the channel-parallel kernels never
+    // hit this because each lane only does a couple of iterations before
+    // simd_sum. Four independent partials let the loads and FMAs overlap.
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    int c = 0;
+    for(; c + 4 <= channelUnit; c += 4) {
+        int idx = c * batch + token;
+        float4 d0 = float4(in0[idx])             + float4(in1[idx]);
+        float4 d1 = float4(in0[idx + batch])     + float4(in1[idx + batch]);
+        float4 d2 = float4(in0[idx + 2 * batch]) + float4(in1[idx + 2 * batch]);
+        float4 d3 = float4(in0[idx + 3 * batch]) + float4(in1[idx + 3 * batch]);
+        out0[idx]             = (ftype4)d0;
+        out0[idx + batch]     = (ftype4)d1;
+        out0[idx + 2 * batch] = (ftype4)d2;
+        out0[idx + 3 * batch] = (ftype4)d3;
+        acc0 += d0 * d0;
+        acc1 += d1 * d1;
+        acc2 += d2 * d2;
+        acc3 += d3 * d3;
+    }
+    for(; c < channelUnit; ++c) {
+        int idx = c * batch + token;
+        float4 data = float4(in0[idx]) + float4(in1[idx]);
+        out0[idx] = (ftype4)data;
+        acc0 += data * data;
+    }
+    float4 square_sum4 = (acc0 + acc1) + (acc2 + acc3);
+
+    float square_sum = square_sum4[0] + square_sum4[1] + square_sum4[2] + square_sum4[3];
+    float4 var4 = 1.0f / sqrt(square_sum / (channelUnit * 4) + cst.eps);
+
+    for(int c = 0; c < channelUnit; ++c) {
+        int idx = c * batch + token;
+        float4 norm = var4 * float4(out0[idx]);
+        if(cst.has_gamma_beta) {
+            out1[idx] = (ftype4)(norm * gamma[c] + beta[c]);
+        } else {
+            out1[idx] = (ftype4)(norm);
+        }
+    }
+}
+
 )metal";
 
 #endif
-
