@@ -23,6 +23,7 @@
 #include <limits>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+#include "core/BackendCacheLog.hpp"
 #include "omni.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
@@ -49,7 +50,7 @@ using namespace Express;
 namespace Transformer {
 
 #ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
-#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 1
 #endif
 #ifndef VISUAL_CHUNK_DUMP_OUTPUT
 #define VISUAL_CHUNK_DUMP_OUTPUT 0
@@ -1113,8 +1114,18 @@ bool Omni::initProcessorRuntime() {
                 // Load MNN Modules for chunks that do NOT use OM.
                 mVisionBlocksChunkModules.resize(chunkPaths.size());
                 const auto npuCacheBaseDir = mConfig->npu_model_dir();
+                int actualBackend = -1;
+                mVisionBlocksRuntimeManager->getInfo(Interpreter::BACKENDS, &actualBackend);
+                logBackendCache("[NPU_CACHE] visual_runtime requested=%s actual=%d hiai=%d enabled=%d root=%s\n",
+                                mConfig->visual_blocks_backend_type().c_str(), actualBackend,
+                                (int)MNN_FORWARD_USER_0, MNN_HIAI_CACHE_OM_BY_CHUNK, npuCacheBaseDir.c_str());
                 for (size_t i = 0; i < chunkPaths.size(); i++) {
                     if (mChunkUseOm[i]) continue;   // OM handles this chunk
+                    if (chunkRunOnNpu[i] && actualBackend == MNN_FORWARD_CPU) {
+                        logBackendCache("[NPU_CACHE] chunk[%zu] CPU fallback: HiAI runtime unavailable; no OM will be compiled\n", i);
+                    } else if (!chunkRunOnNpu[i]) {
+                        logBackendCache("[NPU_CACHE] chunk[%zu] configured for CPU; no OM will be compiled\n", i);
+                    }
                     auto targetRuntime = chunkRunOnNpu[i] ? mVisionBlocksRuntimeManager : mProcessorRuntimeManager;
                     auto targetModuleCfg = chunkRunOnNpu[i] ? &npuModuleCfg : &module_config;
 #if MNN_HIAI_CACHE_OM_BY_CHUNK
@@ -1122,6 +1133,11 @@ bool Omni::initProcessorRuntime() {
                         auto chunkNpuDir = npuCacheBaseDir + "/chunk_" + std::to_string(i);
                         mVisionBlocksRuntimeManager->setExternalPath(
                             chunkNpuDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                        logBackendCache("[NPU_CACHE] chunk[%zu] directory: %s\n", i, chunkNpuDir.c_str());
+                    }
+#else
+                    if (chunkRunOnNpu[i]) {
+                        logBackendCache("[NPU_CACHE] disabled for chunk[%zu]: rebuild with MNN_HIAI_CACHE_OM_BY_CHUNK=ON\n", i);
                     }
 #endif
                     std::shared_ptr<Module> mod(Module::load(
@@ -1370,6 +1386,9 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     const bool dumpLog = shouldDumpX86Log(mConfig);
     MNN::Express::ExecutorScope s(mExecutor);
     const bool isSplit = mConfig->visual_split();
+    if (isSplit && !mNpuChunkExecutor) {
+        logBackendCache("[NPU_CACHE] vision_begin chunks=%zu\n", mVisionBlocksChunkModules.size());
+    }
     const auto& probeModule = isSplit ? mVisionPreModule : mVisionModule;
     const auto inputNames = probeModule->getInfo()->inputNames;
     // In split mode pre-module drops the "attention_mask" input (mask goes to

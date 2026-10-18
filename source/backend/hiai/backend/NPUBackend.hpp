@@ -19,7 +19,7 @@
 //     passes per-chunk EXTERNAL_NPU_FILE_DIR.
 //   - Set to 0 to keep legacy behavior.
 #ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
-#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 1
 #endif
 
 // Enable freeing the host-side memory of CONSTANT input tensors (weights / biases)
@@ -52,6 +52,8 @@
 #include <core/Execution.hpp>
 #include "HiAiModelManagerService.h"
 #include "HiaiHclV600Runtime.hpp"
+#include "HiaiResizeCache.hpp"
+#include "HiaiModuleCache.hpp"
 #include "MNN_generated.h"
 
 #include <stdio.h>
@@ -383,6 +385,14 @@ namespace MNN {
 
         virtual void onResizeBegin() override;
         virtual ErrorCode onResizeEnd() override;
+        bool onLoadCachedGraph(const std::vector<ResizeCacheEntry>& commands) override;
+        std::string onGetGraphCacheContext() const override;
+        bool onExportCachedModel(const std::vector<int>& inputIndexes, const std::vector<Tensor*>& inputs,
+                                 const std::vector<Tensor*>& outputs, std::string& data) const override;
+        bool onLoadCachedModel(const std::string& data, const std::vector<Tensor*>& inputs,
+                               const std::vector<Tensor*>& outputs) override;
+        ErrorCode onExecuteCachedModel(const std::vector<Tensor*>& inputs,
+                                       const std::vector<Tensor*>& outputs) const override;
 
     public:
         ErrorCode buildIRModelAndLoad();
@@ -408,6 +418,13 @@ namespace MNN {
         void resetLoadedTensorInfo();
 #if MNN_HIAI_CACHE_OM_BY_CHUNK
         std::string buildOmCacheShapeKey() const;
+        void saveResizeCache();
+        std::vector<ResizeCacheEntry> mResizeCacheCommands;
+        HiaiResizeCache mResizeCache;
+        std::string mResizeCachePath;
+        std::string mFastOmPath;
+        double mFastLoadMs = 0.0;
+        bool mFastGraphLoaded = false;
 #endif
         bool bindNativeHandleIo();
         bool releaseModelResources(bool finalRelease);
@@ -500,6 +517,7 @@ namespace MNN {
 #if HIAI_VERBOSE
         std::chrono::steady_clock::time_point mResizeTimerStart;
 #endif
+        HiaiModuleCache mModuleCache;
 
 #ifdef HIAI_DEBUG
         void *(*ATrace_beginSection) (const char* sectionName);

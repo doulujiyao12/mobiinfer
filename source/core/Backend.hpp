@@ -167,6 +167,16 @@ public:
     virtual void onResizeBegin() {
         // nothing to do
     }
+    struct ResizeCacheEntry {
+        const Op* op;
+        std::vector<Tensor*> inputs;
+        std::vector<Tensor*> outputs;
+    };
+    // A successful load replaces only this backend's non-Copy onResize calls.
+    // Tensor allocation, host copies and onResizeEnd still run normally.
+    virtual bool onLoadCachedGraph(const std::vector<ResizeCacheEntry>& commands) {
+        return false;
+    }
     /**
      * @brief callback after resize ops.
      */
@@ -274,6 +284,20 @@ public:
     }
     // path of the NPU model directory
     std::string pNPUModelDirPath = ".";
+    uint64_t pNPUModelCacheIdentity = 0;
+
+    // Optional whole-module compiled graph cache. Only backends providing an
+    // exact, self-contained I/O contract can bypass the original model loader.
+    virtual std::string onGetGraphCacheContext() const { return {}; }
+    virtual bool onExportCachedModel(const std::vector<int>& inputIndexes,
+                                    const std::vector<Tensor*>& inputs,
+                                    const std::vector<Tensor*>& outputs, std::string& data) const { return false; }
+    // Load during model preparation. Tensors may be temporary, shape-only
+    // descriptors without host buffers; do not retain the caller's pointers.
+    virtual bool onLoadCachedModel(const std::string& data, const std::vector<Tensor*>& inputs,
+                                  const std::vector<Tensor*>& outputs) { return false; }
+    virtual ErrorCode onExecuteCachedModel(const std::vector<Tensor*>& inputs,
+                                          const std::vector<Tensor*>& outputs) const { return NOT_SUPPORT; }
 
 private:
     const MNNForwardType mType;

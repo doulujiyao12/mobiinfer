@@ -27,6 +27,8 @@ public:
     virtual void onClearCache() override;
     virtual int onOptimize(Interpreter::SessionMode stage) override;
     const Session* getSession() const { return mSession.get(); }
+    bool exportCachedModel(std::string& data, const std::vector<int>& inputOrder = {},
+                           const std::vector<int>& outputOrder = {}) const;
 
 private:
     ErrorCode _resize(const std::vector<Express::VARP>& inputs);

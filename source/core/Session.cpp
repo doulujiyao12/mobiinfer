@@ -578,6 +578,12 @@ Session* Session::clone(RuntimeInfo&& runtime, std::shared_ptr<Schedule::Schedul
     createPipelineBackend(pipelineInfo, runtime, meta);
     auto first  = pipelineInfo.first.cache.first;
     auto second = pipelineInfo.first.cache.second;
+    // A shared RuntimeManager may already point at another chunk (or its base
+    // directory). Preserve this session's path before cloning executions.
+    first->pNPUModelDirPath = srcPipelineInfo.first.cache.first->pNPUModelDirPath;
+    second->pNPUModelDirPath = srcPipelineInfo.first.cache.second->pNPUModelDirPath;
+    first->pNPUModelCacheIdentity = srcPipelineInfo.first.cache.first->pNPUModelCacheIdentity;
+    second->pNPUModelCacheIdentity = srcPipelineInfo.first.cache.second->pNPUModelCacheIdentity;
     for (int i = 0; i < opCaches.size(); ++i) {
         auto& srcOpInfo = opCaches[i];
         auto& opInfo    = oplists[i];

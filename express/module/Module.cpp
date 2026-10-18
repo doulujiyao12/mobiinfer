@@ -12,6 +12,7 @@
 #include <MNN/ErrorCode.hpp>
 #include "core/OpCommonUtils.hpp"
 #include "PipelineModule.hpp"
+#include "CachedGraphModule.hpp"
 #include "core/FileLoader.hpp"
 #include "backend/cpu/CPUBackend.hpp"
 #include "MNN_generated.h"
@@ -290,6 +291,7 @@ public:
         *newInfo = *mInfo;
         newInfo->runTimeManager = ctx->pRuntimeManager;
         std::shared_ptr<Module> submodule(mModule->clone(ctx));
+        if (!submodule) return nullptr;
         NetModule* module(new NetModule(submodule, newInfo, nullptr, 0, 0.0f));
 #ifdef MNN_INTERNAL_ENABLED
         module->mLogInfo = mLogInfo;
@@ -354,6 +356,40 @@ static void _loadInputs(Module::Info* info, const std::vector<std::string>& inpu
 }
 
 Module* Module::load(const std::vector<std::string>& inputs, const std::vector<std::string>& outputs, const char* fileName, const std::shared_ptr<MNN::Express::Executor::RuntimeManager> _rtMgr, const Module::Config* config) {
+    auto rtMgr = _rtMgr;
+    if (nullptr == rtMgr.get()) rtMgr.reset(_createDefaultRuntimeManager(config));
+    if (!rtMgr) return nullptr;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+    // Only immutable, unrearranged HiAI modules are candidates. CPU modules,
+    // dynamic models and explicit HiAI sessions retain their original loader.
+    if (config && !config->dynamic && !config->shapeMutable && !config->rearrange && !config->base) {
+        const auto content = rtMgr->getInside()->mContent;
+        const std::string modelPath(fileName);
+        const std::string npuPath = content->mNpuDir;
+        const std::string externalPath = content->mExternalFile.empty() ? modelPath + ".weight" : content->mExternalFile;
+        const Config savedConfig = *config;
+        auto loader = [inputs, outputs, modelPath, npuPath, externalPath, rtMgr, savedConfig]() {
+            // The byte-buffer overload deliberately bypasses this file cache.
+            // Restore the captured paths: other chunks share this manager.
+            FileLoader source(modelPath.c_str(), true);
+            AutoStorage<uint8_t> bytes;
+            if (!source.valid() || !source.read() || !source.valid()) return std::shared_ptr<Module>();
+            source.merge(bytes);
+            if (!bytes.get()) return std::shared_ptr<Module>();
+            const auto current = rtMgr->getInside()->mContent;
+            const std::string oldExternal = current->mExternalFile, oldNpu = current->mNpuDir;
+            rtMgr->setExternalFile(externalPath);
+            rtMgr->setExternalPath(npuPath, Interpreter::EXTERNAL_NPU_FILE_DIR);
+            std::shared_ptr<Module> module(loadInternal(inputs, outputs, bytes.get(), bytes.size(), rtMgr, &savedConfig));
+            rtMgr->setExternalFile(oldExternal);
+            rtMgr->setExternalPath(oldNpu, Interpreter::EXTERNAL_NPU_FILE_DIR);
+            return module;
+        };
+        std::shared_ptr<Module::Info> info;
+        auto cached = createCachedGraphModule(modelPath, externalPath, npuPath, inputs, outputs, rtMgr, loader, info);
+        if (cached) return new NetModule(cached, info, nullptr, 0, 0.0f);
+    }
+#endif
     AutoStorage<uint8_t> buffer;
     {
         FileLoader loader(fileName, true);
@@ -369,10 +405,6 @@ Module* Module::load(const std::vector<std::string>& inputs, const std::vector<s
         if (buffer.get() == nullptr) {
             return nullptr;
         }
-    }
-    auto rtMgr = _rtMgr;
-    if (nullptr == rtMgr.get()) {
-        rtMgr.reset(_createDefaultRuntimeManager(config));
     }
     bool needReset = false;
     if (rtMgr->getInside()->mContent->mExternalFile.empty()) {

@@ -48,6 +48,9 @@ extern void registerNNAPIRuntimeCreator();
 #if MNN_QNN_ENABLED
 extern void registerQNNRuntimeCreator();
 #endif
+#if MNN_NPU_ENABLED
+extern bool registerHiAIRuntimeCreator();
+#endif
 #if MNN_RKNN_ENABLED
 namespace RKNN {
 void registerRKNNPlugin();
@@ -78,6 +81,13 @@ void registerBackend() {
 #endif
 #if MNN_QNN_ENABLED
         registerQNNRuntimeCreator();
+#endif
+#if MNN_NPU_ENABLED
+        // Integrated HiAI builds disable NPUBackend's static initializer.
+        // Install its creator before Schedule chooses the requested backend.
+        if (!registerHiAIRuntimeCreator()) {
+            MNN_ERROR("MNN_HIAI: failed to register the integrated HiAI runtime creator\n");
+        }
 #endif
 #if MNN_RKNN_ENABLED
         RKNN::registerRKNNPlugin();

@@ -19,6 +19,8 @@
 #include <iostream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <iostream>
@@ -27,6 +29,8 @@
 #include <sstream>
 
 #include <core/Macro.h>
+#include <core/BackendCacheLog.hpp>
+#include <core/BackendCacheIdentity.hpp>
 #include <core/TensorUtils.hpp>
 #include "HiAIBackendConfig.hpp"
 #include <stdlib.h>
@@ -70,7 +74,11 @@ namespace MNN {
         }
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) {
-            return S_ISDIR(st.st_mode);
+            if (S_ISDIR(st.st_mode)) {
+                return true;
+            }
+            errno = ENOTDIR;
+            return false;
         }
         size_t pos = path.find_last_of('/');
         if (pos != std::string::npos && pos > 0) {
@@ -79,7 +87,11 @@ namespace MNN {
                 return false;
             }
         }
-        return ::mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+        if (::mkdir(path.c_str(), 0755) == 0) {
+            return true;
+        }
+        // Another chunk may have created the directory concurrently.
+        return errno == EEXIST && ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
     }
 
     static bool readFileToVector(const std::string& path, std::vector<uint8_t>& out) {
@@ -102,6 +114,37 @@ namespace MNN {
     }
 
 namespace {
+
+class HiaiMappedOm {
+public:
+    HiaiMappedOm() = default;
+    HiaiMappedOm(const HiaiMappedOm&) = delete;
+    HiaiMappedOm& operator=(const HiaiMappedOm&) = delete;
+    ~HiaiMappedOm() { if (mMapping != MAP_FAILED) ::munmap(mMapping, mSize); }
+    bool load(const std::string& path, size_t expectedSize) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat info;
+        const bool valid = ::fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+                           info.st_size > 0 && static_cast<uint64_t>(info.st_size) == expectedSize;
+        if (valid) {
+            mSize = expectedSize;
+            // Private writable mapping permits SDK relocation without modifying
+            // the cache file, and avoids a second heap copy of the entire OM.
+            mMapping = ::mmap(nullptr, mSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+        }
+        ::close(fd);
+        if (!valid) return false;
+        if (mMapping != MAP_FAILED) return true;
+        return readFileToVector(path, mBytes) && mBytes.size() == expectedSize;
+    }
+    void* data() { return mMapping == MAP_FAILED ? mBytes.data() : mMapping; }
+
+private:
+    void* mMapping = MAP_FAILED;
+    size_t mSize = 0;
+    std::vector<uint8_t> mBytes;
+};
 
 constexpr std::uint64_t kMaximumHiaiCacheBytes = 256ull * 1024ull * 1024ull;
 constexpr char kHiaiCacheMarker[] = "MNN_HIAI_CACHE_PATH_V1\n";
@@ -394,25 +437,28 @@ bool HiaiForceV320(const Backend::Info& info,
 #endif
     bool WriteToOMFile(domi::ModelBufferData om_model_buff, std::string om_file_path)
     {
-        const std::string tempPath = om_file_path + ".tmp";
+        const std::string tempPath = HiaiTemporaryCacheFile(om_file_path);
         FILE *fp = fopen(tempPath.c_str(), "wb");
         if (fp == NULL) {
-            printf("%s open failed !!!", tempPath.c_str());
+            logBackendCache("[NPU_CACHE] cannot open %s: %s\n", tempPath.c_str(), strerror(errno));
             return false;
         }
 
         size_t write_size = fwrite(om_model_buff.data, 1, om_model_buff.length, fp);
         bool flushed = fflush(fp) == 0;
         bool synced = flushed && fsync(fileno(fp)) == 0;
+        const int writeError = errno;
         bool closed = fclose(fp) == 0;
         if (write_size != om_model_buff.length || !synced || !closed) {
+            logBackendCache("[NPU_CACHE] write failed: %s bytes=%zu/%u synced=%d closed=%d error=%s\n",
+                      tempPath.c_str(), write_size, (unsigned)om_model_buff.length, synced, closed,
+                      strerror(closed ? writeError : errno));
             ::remove(tempPath.c_str());
-            printf("write om file failed !!!");
             return false;
         }
         if (::rename(tempPath.c_str(), om_file_path.c_str()) != 0) {
+            logBackendCache("[NPU_CACHE] cannot replace %s: %s\n", om_file_path.c_str(), strerror(errno));
             ::remove(tempPath.c_str());
-            printf("replace om cache file failed !!!");
             return false;
         }
         return true;
@@ -1062,6 +1108,11 @@ bool HiaiForceV320(const Backend::Info& info,
     }
 
     void NPUBackend::onResizeBegin() {
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        mFastGraphLoaded = false;
+        mResizeCacheCommands.clear();
+        mResizeCachePath.clear();
+#endif
 #if HIAI_VERBOSE
         mResizeTimerStart = std::chrono::steady_clock::now();
 #endif
@@ -1101,12 +1152,331 @@ bool HiaiForceV320(const Backend::Info& info,
                 "session so the caller can recreate it with V320\n");
             return INVALID_VALUE;
         }
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        if (mFastGraphLoaded) {
+            const auto begin = std::chrono::steady_clock::now();
+            // Allocations now exist; use the same layout/copy code as the normal
+            // path, then restore exact slots (including DeepStack aliases).
+            for (const auto& b : mResizeCache.inputs) {
+                auto tensor = mResizeCacheCommands[b.command].inputs[b.tensor];
+                mInputOrder.push_back({static_cast<int>(b.index), reinterpret_cast<unsigned long>(tensor), static_cast<size_t>(b.bytes)});
+            }
+            MNNTensorList outputs;
+            for (const auto& b : mResizeCache.outputs) outputs.push_back(mResizeCacheCommands[b.command].outputs[b.tensor]);
+            mOutGEOpMap.push_back({nullptr, std::move(outputs)});
+            const std::string modelName = "v_" + mResizeCache.shape.substr(6);
+            if (getInOutTensorInfo(modelName) != 0) return INVALID_VALUE;
+            for (const auto& b : mResizeCache.inputs) {
+                auto tensor = mResizeCacheCommands[b.command].inputs[b.tensor];
+                mInputMap[reinterpret_cast<unsigned long>(tensor)] = b.slot;
+            }
+            for (const auto& b : mResizeCache.outputs) {
+                auto tensor = mResizeCacheCommands[b.command].outputs[b.tensor];
+                auto memory = TensorUtils::getDescribeOrigin(tensor)->mem.get();
+                if (memory) mOutputMemToIndex[memory] = b.slot;
+            }
+            mModelName = {modelName};
+            const double ioMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            logBackendCache("[NPU_CACHE] validated: %s fast=1 load_ms=%.3f io_ms=%.3f skipped_op_resize=%zu\n",
+                            mFastOmPath.c_str(), mFastLoadMs, ioMs, mResizeCacheCommands.size());
+            return NO_ERROR;
+        }
+#endif
         const auto code = buildIRModelAndLoad();
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+        if (code == NO_ERROR && !isExplicitHiAISession()) saveResizeCache();
+#endif
         if (mNPURuntime->mHiAIOptions) {
             if (code == NO_ERROR) mNPURuntime->mHiAIOptions->ready();
             else mNPURuntime->mHiAIOptions->report(MNN_HIAI_STAGE_RESIZE, code, "HiAI graph build/load failed");
         }
         return code;
+    }
+
+    bool NPUBackend::onLoadCachedGraph(const std::vector<ResizeCacheEntry>& commands) {
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        mFastGraphLoaded = false;
+        if (isExplicitHiAISession() || pNPUModelCacheIdentity == 0 ||
+            pNPUModelDirPath.empty() || pNPUModelDirPath == ".") return false;
+        mResizeCacheCommands = commands;
+        BackendCacheIdentity identity;
+        identity.addValue(pNPUModelCacheIdentity);
+        identity.addValue(mPrecision);
+        identity.add(mNPURuntime->mHiaiRuntimeVersion.data(), mNPURuntime->mHiaiRuntimeVersion.size());
+        const uint32_t version = 1;
+        identity.addValue(version);
+        for (const auto& command : commands) {
+            const auto type = command.op->type();
+            identity.addValue(type);
+            for (const auto* tensors : {&command.inputs, &command.outputs}) {
+                identity.addValue(tensors->size());
+                for (const auto tensor : *tensors) {
+                    if (!tensor) return false;
+                    const auto& b = tensor->buffer();
+                    identity.addValue(b.dimensions);
+                    for (int i = 0; i < b.dimensions; ++i) identity.addValue(b.dim[i].extent);
+                    identity.addValue(b.type.code);
+                    identity.addValue(b.type.bits);
+                    identity.addValue(b.type.lanes);
+                    identity.addValue(TensorUtils::getDescribe(tensor)->dimensionFormat);
+                }
+            }
+        }
+        std::ostringstream key;
+        key << std::hex << std::setw(16) << std::setfill('0') << identity.value();
+        mResizeCachePath = pNPUModelDirPath + "/om_cache_v3/fast_" + key.str() + ".meta";
+        struct stat info;
+        if (::stat(mResizeCachePath.c_str(), &info) != 0 || info.st_size <= 0 || info.st_size > 1024 * 1024) return false;
+        std::vector<uint8_t> bytes;
+        if (!readFileToVector(mResizeCachePath, bytes) ||
+            !HiaiResizeCache::parse(std::string(bytes.begin(), bytes.end()), mResizeCache)) {
+            logBackendCache("[NPU_CACHE] fast metadata invalid; normal resize required: %s\n", mResizeCachePath.c_str());
+            return false;
+        }
+        for (int direction = 0; direction < 2; ++direction) {
+            for (const auto& b : direction ? mResizeCache.outputs : mResizeCache.inputs) {
+                if (b.command >= commands.size()) return false;
+                const auto& tensors = direction ? commands[b.command].outputs : commands[b.command].inputs;
+                if (b.tensor >= tensors.size() || static_cast<uint64_t>(tensors[b.tensor]->size()) != b.bytes) return false;
+            }
+        }
+        mFastOmPath = pNPUModelDirPath + "/om_cache_v3/" + mResizeCache.shape + "/vision.om";
+        if (::stat(mFastOmPath.c_str(), &info) != 0 || static_cast<uint64_t>(info.st_size) != mResizeCache.omBytes) return false;
+        const auto begin = std::chrono::steady_clock::now();
+        HiaiMappedOm om;
+        if (!om.load(mFastOmPath, static_cast<size_t>(mResizeCache.omBytes))) return false;
+        domi::ModelBufferData buffer;
+        buffer.data = om.data();
+        buffer.length = static_cast<uint32_t>(mResizeCache.omBytes);
+        mMgrClient = LoadModelSync(buffer, "v_" + mResizeCache.shape.substr(6));
+        std::vector<hiai::TensorDimension> inputs, outputs;
+        bool valid = mMgrClient && mMgrClient->GetModelIOTensorDim("v_" + mResizeCache.shape.substr(6), inputs, outputs) == hiai::AI_SUCCESS;
+        for (int direction = 0; valid && direction < 2; ++direction) {
+            const auto& dims = direction ? outputs : inputs;
+            const auto& sizes = direction ? mResizeCache.outputBytes : mResizeCache.inputBytes;
+            valid = dims.size() == sizes.size();
+            for (size_t i = 0; valid && i < dims.size(); ++i) {
+                auto dim = dims[i];
+                valid = static_cast<uint64_t>(dim.GetNumber()) * dim.GetChannel() * dim.GetHeight() * dim.GetWidth() * sizeof(float) == sizes[i];
+            }
+        }
+        if (!valid) {
+            if (mMgrClient) { mMgrClient->UnLoadModel(); mMgrClient.reset(); }
+            logBackendCache("[NPU_CACHE] fast cache rejected; retrying normal resize: %s\n", mFastOmPath.c_str());
+            return false;
+        }
+        mFastLoadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        mFastGraphLoaded = true;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+    void NPUBackend::saveResizeCache() {
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        if (mResizeCachePath.empty() || mResizeCacheCommands.empty()) return;
+        HiaiResizeCache cache;
+        cache.shape = buildOmCacheShapeKey();
+        const std::string path = pNPUModelDirPath + "/om_cache_v3/" + cache.shape + "/vision.om";
+        struct stat info;
+        if (::stat(path.c_str(), &info) != 0) return;
+        cache.omBytes = info.st_size;
+        for (const auto& tensor : mInputTensors) cache.inputBytes.push_back(tensor->GetSize());
+        for (const auto& tensor : mOutputTensors) cache.outputBytes.push_back(tensor->GetSize());
+        auto bind = [&](const Tensor* tensor, bool output, uint32_t slot, uint32_t index) {
+            for (uint32_t c = 0; c < mResizeCacheCommands.size(); ++c) {
+                const auto& tensors = output ? mResizeCacheCommands[c].outputs : mResizeCacheCommands[c].inputs;
+                for (uint32_t t = 0; t < tensors.size(); ++t) {
+                    if (tensors[t] != tensor) continue;
+                    HiaiCacheBinding binding;
+                    binding.command = c; binding.tensor = t; binding.slot = slot; binding.index = index;
+                    binding.bytes = tensor->size();
+                    (output ? cache.outputs : cache.inputs).push_back(binding);
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (const auto& input : mInputOrder) {
+            auto slot = mInputMap.find(input.tensorPtr);
+            if (slot == mInputMap.end() || !bind(reinterpret_cast<const Tensor*>(input.tensorPtr), false, slot->second, input.inputIndex)) {
+                logBackendCache("[NPU_CACHE] fast metadata skipped: input binding unavailable index=%d\n", input.inputIndex);
+                return;
+            }
+        }
+        for (const auto tensor : mMNNOutTensors) {
+            auto slot = mOutputMemToIndex.find(TensorUtils::getDescribeOrigin(tensor)->mem.get());
+            if (slot == mOutputMemToIndex.end() || !bind(tensor, true, slot->second, 0)) {
+                logBackendCache("[NPU_CACHE] fast metadata skipped: output binding unavailable\n");
+                return;
+            }
+        }
+        if (!cache.valid()) {
+            logBackendCache("[NPU_CACHE] fast metadata skipped: incomplete IO mapping\n");
+            return;
+        }
+        const auto data = cache.serialize();
+        if (WriteHiaiCacheFileAtomic(mResizeCachePath, data.data(), data.size())) {
+            logBackendCache("[NPU_CACHE] fast metadata saved: %s\n", mResizeCachePath.c_str());
+        } else {
+            logBackendCache("[NPU_CACHE] fast metadata write failed: %s\n", mResizeCachePath.c_str());
+        }
+#endif
+    }
+#endif
+
+    std::string NPUBackend::onGetGraphCacheContext() const {
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        if (!isExplicitHiAISession() && !mNPURuntime->mHiaiRuntimeVersion.empty()) {
+            return "hiai-module-v1:" + mNPURuntime->mHiaiRuntimeVersion + ":" + std::to_string(mPrecision);
+        }
+#endif
+        return {};
+    }
+
+    bool NPUBackend::onExportCachedModel(const std::vector<int>& inputIndexes,
+                                        const std::vector<Tensor*>& inputs,
+                                        const std::vector<Tensor*>& outputs, std::string& data) const {
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        if (onGetGraphCacheContext().empty() || !mMgrClient || inputIndexes.size() != inputs.size() ||
+            inputs.size() != mInputOrder.size() || outputs.empty()) return false;
+        HiaiModuleCache cache;
+        cache.graph.shape = mFastGraphLoaded ? mResizeCache.shape : buildOmCacheShapeKey();
+        const std::string path = pNPUModelDirPath + "/om_cache_v3/" + cache.graph.shape + "/vision.om";
+        if (!cache.om.capture(path) || !cache.om.settled()) return false;
+        cache.graph.omBytes = cache.om.size;
+        for (const auto& tensor : mInputTensors) cache.graph.inputBytes.push_back(tensor->GetSize());
+        for (const auto& tensor : mOutputTensors) cache.graph.outputBytes.push_back(tensor->GetSize());
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            const auto found = std::find_if(mInputOrder.begin(), mInputOrder.end(), [&](const InputOrderEntry& entry) {
+                return entry.inputIndex == inputIndexes[i];
+            });
+            if (found == mInputOrder.end()) return false;
+            const auto slot = mInputMap.find(found->tensorPtr);
+            if (slot == mInputMap.end()) return false;
+            HiaiCacheTensor tensor;
+            if (!tensor.capture(reinterpret_cast<const Tensor*>(found->tensorPtr)) || !tensor.compatible(inputs[i])) return false;
+            cache.inputs.push_back(tensor);
+            HiaiCacheBinding binding;
+            binding.tensor = i; binding.slot = slot->second; binding.bytes = tensor.bytes;
+            cache.graph.inputs.push_back(binding);
+        }
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            auto memory = TensorUtils::getDescribeOrigin(outputs[i])->mem.get();
+            const auto slot = mOutputMemToIndex.find(memory);
+            if (!memory || slot == mOutputMemToIndex.end()) return false;
+            const Tensor* wire = nullptr;
+            for (auto tensor : mMNNOutTensors) {
+                if (TensorUtils::getDescribeOrigin(tensor)->mem.get() == memory) { wire = tensor; break; }
+            }
+            HiaiCacheTensor tensor;
+            if (!tensor.capture(wire) || !tensor.compatible(outputs[i])) return false;
+            cache.outputs.push_back(tensor);
+            HiaiCacheBinding binding;
+            binding.tensor = i; binding.slot = slot->second; binding.bytes = tensor.bytes;
+            cache.graph.outputs.push_back(binding);
+        }
+        if (!cache.graph.valid()) return false;
+        data = cache.serialize();
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool NPUBackend::onLoadCachedModel(const std::string& data, const std::vector<Tensor*>& inputs,
+                                      const std::vector<Tensor*>& outputs) {
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        // Import into local state. A rejected graph must not leave a loaded
+        // client or partial I/O buffers behind when the source loader retries.
+        HiaiModuleCache cache;
+        if (mMgrClient || onGetGraphCacheContext().empty() || !cache.parse(data) ||
+            inputs.size() != cache.inputs.size() || outputs.size() != cache.outputs.size()) return false;
+        for (size_t i = 0; i < inputs.size(); ++i) if (!cache.inputs[i].compatible(inputs[i])) return false;
+        for (size_t i = 0; i < outputs.size(); ++i) if (!cache.outputs[i].compatible(outputs[i])) return false;
+        const std::string path = pNPUModelDirPath + "/om_cache_v3/" + cache.graph.shape + "/vision.om";
+        GraphCacheFile current;
+        if (!current.capture(path) || !(current == cache.om)) return false;
+        HiaiMappedOm om;
+        if (!om.load(path, static_cast<size_t>(current.size))) return false;
+        const std::string modelName = "v_" + cache.graph.shape.substr(6);
+        domi::ModelBufferData buffer;
+        buffer.data = om.data(); buffer.length = current.size;
+        auto client = LoadModelSync(buffer, modelName);
+        if (!client) return false;
+        auto reject = [&client]() {
+            const auto status = client->UnLoadModel();
+            if (status != hiai::AI_SUCCESS) {
+                logBackendCache("[NPU_CACHE] rejected module cleanup failed status=%d\n", static_cast<int>(status));
+            }
+            return false;
+        };
+        std::vector<hiai::TensorDimension> inputDimensions, outputDimensions;
+        std::vector<std::shared_ptr<hiai::AiTensor>> inputTensors, outputTensors;
+        if (client->GetModelIOTensorDim(modelName, inputDimensions, outputDimensions) != hiai::AI_SUCCESS) return reject();
+        for (int direction = 0; direction < 2; ++direction) {
+            const auto& dimensions = direction ? outputDimensions : inputDimensions;
+            const auto& sizes = direction ? cache.graph.outputBytes : cache.graph.inputBytes;
+            auto& tensors = direction ? outputTensors : inputTensors;
+            if (dimensions.size() != sizes.size()) return reject();
+            for (size_t i = 0; i < dimensions.size(); ++i) {
+                auto dimension = dimensions[i];
+                uint64_t bytes = static_cast<uint64_t>(dimension.GetNumber()) * dimension.GetChannel() *
+                    dimension.GetHeight() * dimension.GetWidth() * sizeof(float);
+                if (bytes != sizes[i]) return reject();
+                auto tensor = std::make_shared<hiai::AiTensor>();
+                tensor->Init(&dimension);
+                if (!tensor->GetBuffer() || tensor->GetSize() != sizes[i]) return reject();
+                tensors.push_back(tensor);
+            }
+        }
+        // Detect replacement while the driver was importing the mapped file.
+        if (!current.capture(path) || !(current == cache.om)) return reject();
+        mMgrClient = std::move(client);
+        mInputDimension = std::move(inputDimensions);
+        mOutputDimension = std::move(outputDimensions);
+        mInputTensors = std::move(inputTensors);
+        mOutputTensors = std::move(outputTensors);
+        mModuleCache = std::move(cache);
+        mModelName = {modelName};
+        if (mNPURuntime->mHiAIOptions) mNPURuntime->mHiAIOptions->ready();
+        logBackendCache("[NPU_CACHE] validated: %s module=1 source_weights_loaded=0\n", path.c_str());
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    ErrorCode NPUBackend::onExecuteCachedModel(const std::vector<Tensor*>& inputs,
+                                              const std::vector<Tensor*>& outputs) const {
+        if (!mMgrClient || inputs.size() != mModuleCache.inputs.size() || outputs.size() != mModuleCache.outputs.size()) return INVALID_VALUE;
+        // Validate both boundaries before copying inputs or executing the graph.
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            if (!inputs[i] || !inputs[i]->host<void>() || !mModuleCache.inputs[i].compatible(inputs[i])) return INPUT_DATA_ERROR;
+        }
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            if (!outputs[i] || !outputs[i]->host<void>() || !mModuleCache.outputs[i].compatible(outputs[i])) return INPUT_DATA_ERROR;
+        }
+        onExecuteBegin();
+        auto finish = [this](ErrorCode status) { onExecuteEnd(); return status; };
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            auto view = mModuleCache.inputs[i].view(inputs[i]->host<void>());
+            Tensor destination(view.get(), Tensor::CAFFE, false);
+            destination.buffer().host = static_cast<uint8_t*>(mInputTensors[mModuleCache.graph.inputs[i].slot]->GetBuffer());
+            if (!MNNCPUCopyBuffer(view.get(), &destination)) return finish(INPUT_DATA_ERROR);
+        }
+        const auto status = runGraphOnce();
+        if (status == NO_ERROR) {
+            for (size_t i = 0; i < outputs.size(); ++i) {
+                auto view = mModuleCache.outputs[i].view(outputs[i]->host<void>());
+                Tensor source(view.get(), Tensor::CAFFE, false);
+                source.buffer().host = static_cast<uint8_t*>(mOutputTensors[mModuleCache.graph.outputs[i].slot]->GetBuffer());
+                if (!MNNCPUCopyBuffer(&source, view.get())) return finish(INPUT_DATA_ERROR);
+            }
+        }
+        return finish(status);
     }
 
     void NPUBackend::resetLoadedTensorInfo() {
@@ -1130,6 +1500,9 @@ bool HiaiForceV320(const Backend::Info& info,
         // input/output tensor layouts that affect HiAI online compilation.
         std::ostringstream signature;
         signature << "hiai_om_cache_v3|ops=" << mGrapMap.size();
+        signature << "|model=" << pNPUModelCacheIdentity
+                  << "|precision=" << static_cast<int>(mPrecision)
+                  << "|ddk=" << mNPURuntime->mHiaiRuntimeVersion;
         auto slashPos = pNPUModelDirPath.find_last_of('/');
         std::string chunkName = slashPos == std::string::npos
                                   ? pNPUModelDirPath
@@ -1519,13 +1892,18 @@ bool HiaiForceV320(const Backend::Info& info,
                     omCachePath = cacheDir + "/vision.om";
                     modelName = "v_" + shapeKey.substr(6);
                 } else {
-                    MNN_PRINT("[NPU_CACHE] cannot create cache directory: %s\n", cacheDir.c_str());
+                    logBackendCache("[NPU_CACHE] cannot create cache directory: %s (%s)\n",
+                              cacheDir.c_str(), strerror(errno));
                 }
             } else {
-                MNN_PRINT("[NPU_CACHE] cannot create chunk directory: %s\n",
-                          pNPUModelDirPath.c_str());
+                logBackendCache("[NPU_CACHE] cannot create chunk directory: %s (%s)\n",
+                          pNPUModelDirPath.c_str(), strerror(errno));
             }
+        } else {
+            logBackendCache("[NPU_CACHE] disabled: no chunk directory; set EXTERNAL_NPU_FILE_DIR before loading the module\n");
         }
+#else
+        logBackendCache("[NPU_CACHE] disabled: rebuild with MNN_HIAI_CACHE_OM_BY_CHUNK=ON\n");
 #endif
         // Do not publish a model name until its model and I/O metadata are both loaded.
         // This backend owns only one HiAI model, so a successful load becomes index 0.
@@ -1553,14 +1931,14 @@ bool HiaiForceV320(const Backend::Info& info,
                 domi::ModelBufferData cachedBuff;
                 cachedBuff.data = omBytes.data();
                 cachedBuff.length = (uint32_t)omBytes.size();
-                MNN_PRINT("[NPU_CACHE] hit: %s (%u bytes)\n",
+                logBackendCache("[NPU_CACHE] hit: %s (%u bytes)\n",
                           omCachePath.c_str(), (unsigned)cachedBuff.length);
                 mMgrClient = LoadModelSync(cachedBuff, modelName);
                 if (mMgrClient != nullptr) {
                     int result = getInOutTensorInfo(modelName);
                     if (result == 0) {
                         mModelName.push_back(modelName);
-                        MNN_PRINT("[NPU_CACHE] validated: %s\n", omCachePath.c_str());
+                        logBackendCache("[NPU_CACHE] validated: %s\n", omCachePath.c_str());
                         return NO_ERROR;
                     }
                     mMgrClient->UnLoadModel();
@@ -1568,15 +1946,15 @@ bool HiaiForceV320(const Backend::Info& info,
                     resetLoadedTensorInfo();
                 }
                 ::remove(omCachePath.c_str());
-                MNN_PRINT("[NPU_CACHE] invalid cache removed; recompiling: %s\n",
+                logBackendCache("[NPU_CACHE] invalid cache removed; recompiling: %s\n",
                           omCachePath.c_str());
             } else {
                 ::remove(omCachePath.c_str());
-                MNN_PRINT("[NPU_CACHE] unreadable cache removed; recompiling: %s\n",
+                logBackendCache("[NPU_CACHE] unreadable cache removed; recompiling: %s\n",
                           omCachePath.c_str());
             }
         } else if (!omCachePath.empty()) {
-            MNN_PRINT("[NPU_CACHE] miss; compiling: %s\n", omCachePath.c_str());
+            logBackendCache("[NPU_CACHE] miss; compiling: %s\n", omCachePath.c_str());
         }
 #endif
 
@@ -1600,6 +1978,10 @@ bool HiaiForceV320(const Backend::Info& info,
 #else
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 6] model.Save() SKIPPED (HIAI_DEBUG off — saves RAM)");
 #endif
+        struct CompileNotice {
+            CompileNotice() { logBackendCache("[NPU_CACHE] compile_begin: 首次加载，在线编译中，请等待\n"); }
+            ~CompileNotice() { logBackendCache("[NPU_CACHE] compile_end\n"); }
+        } compileNotice;
         MNN_HIAI_LOG("bulidIRModelAndLoad: [stage 7] CreateModelBuff() START ...");
         bool createBufferSuc = ir_build.CreateModelBuff(model, om_model_buff);
 
@@ -1637,10 +2019,10 @@ bool HiaiForceV320(const Backend::Info& info,
 #if MNN_HIAI_CACHE_OM_BY_CHUNK
             if (!omCachePath.empty()) {
                 if (WriteToOMFile(om_model_buff, omCachePath)) {
-                    MNN_PRINT("[NPU_CACHE] saved: %s (%u bytes)\n",
+                    logBackendCache("[NPU_CACHE] saved: %s (%u bytes)\n",
                               omCachePath.c_str(), (unsigned)om_model_buff.length);
                 } else {
-                    MNN_PRINT("[NPU_CACHE] save failed: %s\n", omCachePath.c_str());
+                    logBackendCache("[NPU_CACHE] save failed: %s\n", omCachePath.c_str());
                 }
             }
 #else

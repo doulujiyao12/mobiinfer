@@ -18,6 +18,8 @@
 #include "MNN_generated.h"
 #include "core/FileLoader.hpp"
 #include "core/OpCommonUtils.hpp"
+#include "core/BackendCacheIdentity.hpp"
+#include "core/BackendCacheLog.hpp"
 
 namespace MNN {
 namespace Express {
@@ -467,6 +469,23 @@ StaticModule::StaticModule(std::vector<int> inputs, std::vector<int> outputs,
     }
     bnCache.cache.first->pNPUModelDirPath = rtm->getInside()->mContent->mNpuDir;
     bnCache.cache.second->pNPUModelDirPath = rtm->getInside()->mContent->mNpuDir;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+    if (bnCache.cache.first->type() == MNN_FORWARD_USER_0) {
+        BackendCacheIdentity identity;
+        for (const auto& storage : buffer) {
+            const auto size = storage->size();
+            identity.addValue(size);
+            identity.add(storage->buffer(), size);
+        }
+        if (identity.addExternalFile(scheduleInfo.externalWeightPath)) {
+            bnCache.cache.first->pNPUModelCacheIdentity = identity.value();
+        } else {
+            bnCache.cache.first->pNPUModelDirPath.clear();
+            logBackendCache("[NPU_CACHE] disabled: cannot fingerprint external weights: %s\n",
+                            scheduleInfo.externalWeightPath.c_str());
+        }
+    }
+#endif
     if (config.rearrange) {
         mResource->mBuffer =
             preRearrangeWeights(scheduleInfo, bnCache.cache.first.get(), bnCache.cache.second.get(), config);
@@ -741,6 +760,40 @@ ErrorCode StaticModule::_execute() {
         code = mSession->run();
     }
     return code;
+}
+
+bool StaticModule::exportCachedModel(std::string& data, const std::vector<int>& inputOrder,
+                                     const std::vector<int>& outputOrder) const {
+    if (!mSession || mResource->mUseContentInputs || !mResource->mOutputFromInput.empty() ||
+        mOutputTensors.size() != static_cast<size_t>(mResource->mOutputNumbers)) return false;
+    for (size_t i = 0; i < mResource->mOutputFromTensor.size(); ++i) {
+        if (mResource->mOutputFromTensor[i] != static_cast<int>(i)) return false;
+    }
+    const auto& pipeline = mSession->getPipelineInfo(0);
+    auto backend = pipeline.first.cache.first.get();
+    if (!backend || backend->onGetGraphCacheContext().empty()) return false;
+    for (const auto& info : pipeline.second) {
+        if (info.type == Schedule::CONSTANT) continue;
+        for (const auto& command : info.executeBuffer.command) {
+            if (command->op->type() != OpType_Copy && command->execution->backend() != backend) return false;
+        }
+    }
+    std::vector<int> indexes;
+    std::vector<Tensor*> inputs, outputs;
+    if (inputOrder.empty()) {
+        indexes = mResource->mInputs; inputs = mInputTensors;
+    } else {
+        for (int index : inputOrder) {
+            if (index < 0 || static_cast<size_t>(index) >= mInputTensors.size()) return false;
+            indexes.push_back(mResource->mInputs[index]); inputs.push_back(mInputTensors[index]);
+        }
+    }
+    if (outputOrder.empty()) outputs = mOutputTensors;
+    else for (int index : outputOrder) {
+        if (index < 0 || static_cast<size_t>(index) >= mOutputTensors.size()) return false;
+        outputs.push_back(mOutputTensors[index]);
+    }
+    return backend->onExportCachedModel(indexes, inputs, outputs, data);
 }
 
 std::vector<Express::VARP> StaticModule::onForward(const std::vector<Express::VARP>& inputs) {

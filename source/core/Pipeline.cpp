@@ -1020,6 +1020,22 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
     auto& mBackupBackend = mInfo.first.cache.second;
     mBackend->onResizeBegin();
     mBackupBackend->onResizeBegin();
+    bool cachedGraph = false;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+    if (mBackend->type() == MNN_FORWARD_USER_0) {
+        std::vector<Backend::ResizeCacheEntry> commands;
+        bool completeResize = true;
+        for (const auto& info : mInfo.second) {
+            if (info.type == Schedule::CONSTANT) continue;
+            for (const auto& command : info.executeBuffer.command) {
+                if (command->op->type() == OpType_Copy || command->execution->backend() != mBackend.get()) continue;
+                completeResize = completeResize && command->group == index;
+                commands.push_back({command->op, command->workInputs, command->workOutputs});
+            }
+        }
+        if (completeResize && !commands.empty()) cachedGraph = mBackend->onLoadCachedGraph(commands);
+    }
+#endif
     for (auto& info : mInfo.second) {
         if (info.type == Schedule::CONSTANT) {
             continue;
@@ -1059,7 +1075,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
                 printf("before Resize 2, calling: %s - %d \n", iter.info->name().c_str(), cmdIndex);
             }
 #endif
-            if (iter.group == index) {
+            if (iter.group == index && !(cachedGraph && curBackend == mBackend.get() && iter.op->type() != OpType_Copy)) {
 #ifdef MNN_PIPELINE_DEBUG
                 resizeNumber++;
 #endif

@@ -208,6 +208,27 @@ int PipelineModule::onOptimize(Interpreter::SessionMode stage) {
     return 0;
 }
 
+bool PipelineModule::exportCachedModel(std::string& data) const {
+    // Don't silently omit CPU shape/layout operators around a compiled graph.
+    if (mSubModules.size() != 1) return false;
+    const auto& entry = mSubModules[0];
+    const auto& inputIndexes = std::get<1>(entry);
+    if (std::get<0>(entry)->type() != "StaticModule" || inputIndexes.size() != static_cast<size_t>(mInputSize)) return false;
+    std::vector<int> inputOrder(mInputSize, -1), outputOrder;
+    for (size_t i = 0; i < inputIndexes.size(); ++i) {
+        int index = inputIndexes[i];
+        if (index < 0 || index >= mInputSize || inputOrder[index] != -1) return false;
+        inputOrder[index] = i;
+    }
+    const auto& outputIndexes = std::get<2>(entry);
+    for (int index : mOutputIndex) {
+        const auto found = std::find(outputIndexes.begin(), outputIndexes.end(), index);
+        if (found == outputIndexes.end()) return false;
+        outputOrder.push_back(found - outputIndexes.begin());
+    }
+    return static_cast<StaticModule*>(std::get<0>(entry).get())->exportCachedModel(data, inputOrder, outputOrder);
+}
+
 std::vector<VARP> PipelineModule::onForward(const std::vector<VARP>& inputs) {
     if (mSeperate && inputs.empty()) {
         for (int index = 0; index < mSubModules.size(); ++index) {
