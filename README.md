@@ -8,18 +8,19 @@
 [![App](https://img.shields.io/badge/App-ClawMate-blue)](#app-体验)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE.txt)
 
-[项目介绍](#项目介绍) · [推理方案](#推理方案) · [性能参考](#性能参考) · [App 体验](#app-体验) · [模型下载](#模型下载) · [环境配置](#环境配置) · [编译与集成](#编译与集成) · [构建模型](#构建模型) · [文档](#文档)
+[项目介绍](#项目介绍) · [推理方案](#推理方案) · [性能参考](#性能参考) · [App 体验](#app-体验) · [模型下载](#模型下载) · [环境配置](#环境配置) · [编译与集成](#编译与集成) · [构建模型](#构建模型) · [NPU 开发教程](docs/developer/kirin-npu/README.md) · [文档](#文档)
 
 ## 项目介绍
 
 Mobiinfer-HarmonyOS 基于 [MNN](https://github.com/alibaba/MNN) 构建，面向 HarmonyOS 设备提供多模态大模型的端侧推理能力，支持文本对话、图像理解和图文交互。
 
-项目通过 HiAI / CANN Kit 调用麒麟 NPU，提供**在线 NPU 编译**和**离线 NPU 编译**两种部署方式。目前主要采用 **ViT 在 NPU、LLM 在 CPU** 的混合推理架构，并提供模型导出、量化、离线图编译及 HarmonyOS App 集成工具。
+项目通过 HiAI / CANN Kit 调用麒麟 NPU，提供**在线 NPU 编译**和**离线 NPU 编译**两种部署方式，支持全模型离线 NPU 编译与执行，并提供模型导出、量化、图权重分离及 HarmonyOS App 集成工具。全模型部署的图、权重与 KV 等工作集受设备可用内存约束；配套 App 的发布方案采用 **ViT 在 NPU、LLM 在 CPU** 的折中架构，以减少设备资源压力与反复加载开销。
 
-- **两种 NPU 编译方式**：在线版本在设备上编译视觉图；离线版本加载为目标芯片预编译的视觉图。
-- **单图视觉推理**：离线版本将完整 ViT、最终 merger 和三路 DeepStack merger 合并为一张图。
-- **图与权重分离**：离线视觉图与 W4A16 权重独立存储，通过 HiAI NNRT 加载并复用视觉 executor。
-- **CPU 语言推理**：基于 MNN 执行 LLM、文本 embedding、LM head、KV Cache 和采样，支持导入 GPTQ 格式权重。
+- **两种 NPU 编译方式**：在线方式在设备上编译模型图；离线方式加载为目标芯片预编译的模型图。
+- **单图视觉混合部署**：将完整 ViT、最终 merger 和三路 DeepStack merger 合并为一张 NPU 图，语言计算保留在 CPU。
+- **图与权重分离**：离线图与配套外置权重独立存储，通过 HiAI NNRT 初始化并复用执行器。
+- **全模型 NPU 支持**：可离线编译并执行 ViT、文本 embedding、语言 decoder 和 head，使用外置权重；目前仍需优化受内存约束的图驻留与解码性能。
+- **混合部署的 CPU 语言推理**：基于 MNN 执行 LLM、文本 embedding、LM head、KV Cache 和采样，支持导入 GPTQ 格式权重。
 - **完整应用示例**：配套 ClawMate App，可切换在线、离线 NPU 模式并体验本地多模态对话。
 
 ### 演示
@@ -34,18 +35,20 @@ Mobiinfer-HarmonyOS 基于 [MNN](https://github.com/alibaba/MNN) 构建，面向
 
 测试设备为 **Kirin9030**，模型为 **Mobi 2B（基于 Qwen3-VL-2B）**，每次输入一张图片。
 
-本次测试使用 App 的竖图目标尺寸 **270 × 600（宽 × 高）**，经模型预处理对齐后为 **256 × 608**。横图的目标尺寸为 600 × 270，对齐后为 608 × 256。
+参考测试使用 App 的竖图目标尺寸 **270 × 600（宽 × 高）**，经模型预处理对齐后为 **256 × 608**。横图的目标尺寸为 600 × 270，对齐后为 608 × 256。
 
 | 视觉执行方式 | 参考耗时 |
 | --- | --- |
 | CPU 视觉处理 | 约 **8 s** |
 | 在线 NPU 图执行（图已加载） | 约 **0.66 s** |
 
-NPU 耗时仅统计六段 ViT blocks 的累计设备计算时间，不含 CPU 视觉 pre/post、数据拷贝、模型加载及首次在线编译。实际耗时随图片尺寸和设备运行状态变化。
+NPU 耗时仅统计六段 ViT blocks 的累计 `Process` 调用时间，不含 CPU 视觉 pre/post、外部输入输出拷贝、模型加载及首次在线编译。CPU 视觉处理与 NPU 图执行的阶段口径不同，上表不用于计算端到端加速比；计时边界见[性能分析](docs/developer/kirin-npu/07-performance-and-troubleshooting.md#12-当前性能数据的正确含义)。实际耗时随图片尺寸和设备运行状态变化。
 
 ### 方案对比
 
 “在线”和“离线”指 **NPU 图的编译时机**。两种方式均在设备端执行模型推理。
+
+下表比较配套 App 当前发布的两种混合部署方案。仓库另提供[全模型 NPU 编译与执行](docs/inference/full-npu-kirin9030.md)，计算划分可覆盖 ViT 与 LLM。
 
 | 对比项 | 在线 NPU 编译版本 | 离线 NPU 编译版本 |
 | --- | --- | --- |
@@ -346,12 +349,13 @@ package/
 
 | 文档 | 内容 |
 | --- | --- |
-| [单图视觉离线 NPU](transformers/llm/export/kirin_hybrid_offline/README.md) | 当前主要离线方案、DeepStack 对接、模型打包与验证 |
-| [全图 NPU 构建与验证](docs/inference/full-npu-kirin9030.md) | 图与权重分离、W4 量化、CPU 精度检验及全模型 NPU 实验 |
+| [麒麟 NPU 开发教程](docs/developer/kirin-npu/README.md) | 面向开发者的七章教程：环境、在线编译、算子适配与 AscendC、离线部署、图权重分离、运行接口、量化精度与性能排错 |
+| [单图视觉离线 NPU](transformers/llm/export/kirin_hybrid_offline/README.md) | App 混合部署方案、DeepStack 对接、模型打包与验证 |
+| [全图 NPU 构建与验证](docs/inference/full-npu-kirin9030.md) | 全模型离线编译、图权重分离、W4 量化、CPU 精度检验与内存约束 |
 | [视觉 NPU 技术记录](docs/inference/visual-npu-notes.md) | 视觉分块方案、在线编译及历史问题排查 |
 | [MNN LLM](transformers/README.md) | MNN 大模型导出与推理工具 |
 
-当前主要方案为 **NPU ViT + CPU LLM**，精度、性能及兼容性仍在持续验证与优化。另行保留的**全模型 NPU 实验方案**已取得精度阶段性进展，但推理速度仍然很慢，需要后续优化，详见对应技术文档。
+仓库支持全模型 NPU 编译与执行，已取得精度阶段性进展；设备内存约束下的图驻留、权重初始化与解码性能仍需优化。配套 App 的发布方案采用 **NPU ViT + CPU LLM** 作为资源与性能折中，详见相应技术文档。
 
 ## 许可证
 
