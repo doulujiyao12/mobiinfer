@@ -27,7 +27,7 @@ Mobiinfer-HarmonyOS 基于 [MNN](https://github.com/alibaba/MNN) 构建，面向
 
 [![ClawMate 多模态推理演示](doc/demo.gif)](doc/demo.mp4)
 
-点击上图查看[演示视频](doc/demo.mp4)。
+观看演示：[视频一](doc/demo.mp4) · [视频二](doc/demo2.mp4)。
 
 ## 推理方案
 
