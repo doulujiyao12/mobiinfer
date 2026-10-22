@@ -55,24 +55,3 @@
 - [主线集成与缓存验证](../../inference/mnn-upstream-integration.md)：在线后端、缓存与验证边界。
 
 官方能力概览见 [CANN Kit 产品页](https://developer.huawei.com/consumer/cn/sdk/cann-kit/)，具体版本以目标设备、SDK 头文件和对应版本文档为准。本文将“官方提供的能力”“仓库实现的行为”和“需要设备验证的优化”分开说明。
-
-## 配图与重绘
-
-配图按教学内容分别采用分层剖面、时间轴、分块矩阵、资源时序和数值曲线，统一中文排版与配色。标题、标签和说明均为中文，保留 API 名称、文件名与必要的技术缩写。SVG 可在 GitHub 或浏览器中放大查看；图中的核数、内存面积和阶段长度均为示意，相应数值示例另有标注。
-
-| 配图 | 内容 |
-| --- | --- |
-| [图 1：软件栈剖面](figures/01-software-stack.svg) | 在线/离线路径在系统运行时汇合，以及软件与硬件边界 |
-| [图 2：缓存阶段对比](figures/02-online-cache-lifecycle.svg) | 用对齐时间轴辨认首次编译、磁盘命中与驻留分别省去哪类工作 |
-| [图 3：算子分块与流水](figures/03-operator-development.svg) | 框架适配、数据分片、局部缓冲与双缓冲排程 |
-| [图 4：文件与内存解剖](figures/04-offline-external-weights.svg) | 图权重分离前后的文件组织与设备工作集组成 |
-| [图 5：DeepStack 特征注入](figures/05-hybrid-vit-deepstack.svg) | 在 24 层视觉网络中定位抽取层，追踪三路特征进入语言层 |
-| [图 6：接口时序与资源存活](figures/06-nnrt-lifecycle.svg) | 将调用顺序与 compilation、executor、I/O 的持有区间对应 |
-| [图 7：误差示意与验证阶梯](figures/07-accuracy-validation.svg) | 取整/截断、相似度与幅值的区别，以及分层定位方法 |
-| [图 8：计时分区与 KV 切片](figures/08-performance-kv.svg) | 分离准备/执行计时，并直观看到 KV 全量与新增行的写入范围 |
-
-[重绘脚本](figures/generate_figures.py)使用 Matplotlib 和中文字体。安装中文字体后，在仓库根目录执行以下命令即可重新生成所有 SVG；也可用 `--font /path/to/chinese-font.otf` 指定字体文件，例如 [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk)。字体轮廓已写入 SVG，查看成品无需安装字体。
-
-```bash
-python3 docs/developer/kirin-npu/figures/generate_figures.py
-```
