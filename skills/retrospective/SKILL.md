@@ -3,6 +3,14 @@ name: retrospective
 description: 任务完成后的反思与经验沉淀。仅在任务非平凡且出现调试、失败修复、反复试错、明显误判或可复用教训时使用；简单执行、查询、常规 CI 通过等无新增经验的任务可跳过。
 ---
 
+# Native inference runtimes in one process
+
+- When adding a native inference runtime, inspect the final ELF DT_NEEDED entries and defined dynamic symbols of every existing engine. A statically linked C++ runtime must not export locale/facet IDs, exception ABI or unwinder symbols into other engines; hide only the runtime archives and compare the public inference API exports before and after relinking.
+- Capture profiling stacks while the reported task is actually running, and separate model loading from the first inference in progress messages. Passing SDK types, mock-interface tests or a desktop model run does not validate mixed-runtime behavior on the device.
+- Before treating symbol hiding as ABI-safe, audit actual cross-library arguments and ownership: STL strings/containers, streams, callbacks, exceptions and RTTI may cross the engine boundary. Preserving public symbol names is necessary but does not prove object or runtime compatibility; retain the old binary and require regression of existing inference/output paths as well as the new engine.
+- When restoring a missing native SDK, verify the official archive checksum and compare compiler identity, target API and build feature flags with the original library. Normalize scripts to LF bytes before sending them through Windows subprocess stdin to a POSIX shell.
+
+
 # 跨机器补丁安全
 
 - 从 Windows 向 Linux 传递补丁前，规范化为 LF 且移除 UTF-8 BOM，并先执行 `git apply --check`。
