@@ -163,9 +163,6 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
     float audio_e2e_input_s = 0.0f;
     // llm->warmup();
     auto context = llm->getContext();
-    if (max_token_number > 0) {
-        llm->set_config("{\"max_new_tokens\":1}");
-    }
 #ifdef LLM_SUPPORT_AUDIO
     std::vector<float> waveform;
     llm->setWavformCallback([&](const float* ptr, size_t size, bool last_chunk) {
@@ -196,23 +193,12 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
         }
         const float audio_input_s_before = context->audio_input_s;
         MNN::Timer audio_e2e_timer;
-        if (max_token_number >= 0) {
-            llm->response(prompt, &std::cout, nullptr, 0);
-            while (!llm->stoped() && context->gen_seq_len < max_token_number) {
-                llm->generate(1);
-                // Check for errors
-                if (context->status == LlmStatus::INTERNAL_ERROR) {
-                    MNN_ERROR("Error: Generation failed due to internal error\n");
-                    return -1;
-                }
-            }
-        } else {
-            llm->response(prompt);
-            // Check for errors after response
-            if (context->status == LlmStatus::INTERNAL_ERROR) {
-                MNN_ERROR("Error: Response generation failed due to internal error\n");
-                return -1;
-            }
+        // Give speculative strategies the complete budget; generate(1) prevents
+        // a draft block from being verified as one decoding step.
+        llm->response(prompt, &std::cout, nullptr, max_token_number);
+        if (context->status == LlmStatus::INTERNAL_ERROR) {
+            MNN_ERROR("Error: Response generation failed due to internal error\n");
+            return -1;
         }
         prompt_len += context->prompt_len;
         decode_len += context->gen_seq_len;

@@ -955,6 +955,11 @@ bool Omni::load() {
 }
 
 bool Omni::initProcessorRuntime() {
+    const bool fullVision = mNpuChunkExecutor && mNpuChunkExecutor->isFullVision();
+    if (mConfig->config_.value("visual_full_om", false) && !fullVision) {
+        MNN_ERROR("Offline full vision requires a matching external vision executor\n");
+        return false;
+    }
     ScheduleConfig config;
     if (mConfig->mllm_config_.is_null()) {
         mProcessorRuntimeManager = mRuntimeManager;
@@ -994,7 +999,20 @@ bool Omni::initProcessorRuntime() {
         module_config.rearrange = true;
     }
     if (mConfig->is_visual()) {
-        if (mConfig->visual_split()) {
+        if (fullVision) {
+            int height = 0, width = 0, hidden = 0, deepstack = 0;
+            if (mConfig->backend_type() != "cpu" || !mConfig->is_mrope() ||
+                mNpuChunkOmPaths.size() != 1 || !mNpuChunkExecutor->loadChunk(0, mNpuChunkOmPaths[0]) ||
+                !mNpuChunkExecutor->fullVisionInfo(height, width, hidden, deepstack) ||
+                height != 608 || width != 256 || hidden != mConfig->hidden_size() ||
+                deepstack != (mConfig->has_deepstack() ? 3 : 0)) {
+                MNN_ERROR("Offline full vision and CPU language contracts do not match\n");
+                return false;
+            }
+            // No CPU MNN visual weights or online HiAI chunks are loaded here.
+            mVisionHeight = height;
+            mVisionWidth = width;
+        } else if (mConfig->visual_split()) {
             // Split mode: pre/post on mProcessorRuntimeManager (usually CPU),
             // blocks on a dedicated runtime (typically NPU/HiAI).
             ScheduleConfig npuCfg;
@@ -2401,6 +2419,11 @@ std::vector<int> Omni::minicpmVisionProcess(VARP image) {
 // vision-agnostic path, so the no-vision build needs the #else fallback below
 // to link (it reports INTERNAL_ERROR at runtime instead).
 std::vector<int> Omni::qwenVideoProcess(const std::vector<VARP>& frames, const std::vector<float>& timestamps) {
+    if (mNpuChunkExecutor && mNpuChunkExecutor->isFullVision()) {
+        MNN_ERROR("Offline full vision currently supports still images, not video\n");
+        mContext->status = LlmStatus::INTERNAL_ERROR;
+        return {};
+    }
 #ifdef LLM_SUPPORT_VISION
     if (frames.empty()) {
         MNN_PRINT("Omni video has no decoded frames\n");
@@ -2601,6 +2624,56 @@ std::vector<int> Omni::qwenVideoProcess(const std::vector<VARP>& frames, const s
 
 
 std::vector<int> Omni::visionProcess(const std::string& file) {
+    if (mNpuChunkExecutor && mNpuChunkExecutor->isFullVision()) {
+        MNN::Express::ExecutorScope scope(mExecutor);
+        Timer timer;
+        int height = 0, width = 0, hidden = 0, deepstack = 0;
+        std::vector<std::vector<float>> outputs;
+        if (!mNpuChunkExecutor->fullVisionInfo(height, width, hidden, deepstack) ||
+            height != 608 || width != 256 || hidden != mConfig->hidden_size() ||
+            deepstack != (mConfig->has_deepstack() ? 3 : 0) ||
+            !mNpuChunkExecutor->runFullVision(file, outputs)) {
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return {};
+        }
+        const int tokens = (height / 32) * (width / 32);
+        if (outputs.size() != (deepstack ? 2 : 1) || outputs[0].size() != size_t(tokens) * hidden ||
+            (deepstack && outputs[1].size() != size_t(deepstack) * tokens * hidden)) {
+            MNN_ERROR("Offline full vision returned an invalid output shape\n");
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return {};
+        }
+        for (const auto& output : outputs) {
+            for (float value : output) {
+                if (!std::isfinite(value)) {
+                    MNN_ERROR("Offline full vision returned nonfinite features\n");
+                    mContext->status = LlmStatus::INTERNAL_ERROR;
+                    return {};
+                }
+            }
+        }
+        auto image = floatVectorToVarp(outputs[0], {tokens, 1, hidden});
+        auto deep = deepstack ? floatVectorToVarp(outputs[1], {deepstack, tokens, hidden}) : nullptr;
+        if (image.get() == nullptr || (deepstack && deep.get() == nullptr)) {
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return {};
+        }
+        mVisionEmbeddings.push_back(image);
+        if (deepstack) {
+            mDeepStackEmbeddings.push_back(deep);
+        }
+        addPositionIds(1, height / 32, width / 32);
+        mVisionHeight = height;
+        mVisionWidth = width;
+        mVisionSizeOverridden = false;
+        mVisionNum++;
+        mContext->vision_us += timer.durationInUs();
+        mContext->pixels_mp += float(height * width) / 1e6f;
+        std::vector<int> ids(tokens, mVisionPad);
+        ids.insert(ids.begin(), mVisionStart);
+        ids.push_back(mVisionEnd);
+        return ids;
+    }
 #if defined(LLM_SUPPORT_VISION) && defined(MNN_IMGCODECS)
     VARP image = MNN::CV::imread(file);
     return visionProcess(image);
@@ -2713,6 +2786,11 @@ std::vector<int> Omni::videoProcess(const std::string& file) {
 }
 
 std::vector<int> Omni::visionProcess(VARP image) {
+    if (mNpuChunkExecutor && mNpuChunkExecutor->isFullVision()) {
+        MNN_ERROR("Offline full vision currently requires image file paths\n");
+        mContext->status = LlmStatus::INTERNAL_ERROR;
+        return {};
+    }
 #ifdef LLM_SUPPORT_VISION
     if (image == nullptr) {
         MNN_PRINT("Omni Can't open image\n");
@@ -3053,11 +3131,11 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
             addPositionIds(postProcessorInfo.suffix_size);
         }
     }
-    // tokenizer_encode() runs before prefill advances all_seq_len, so this is
-    // the only unambiguous place to combine a retained prefix KV offset with
-    // the current response's compressed multimodal position timeline.
-    // Empty prompts keep the retained prefix endpoint unchanged.
-    mDecodePositionBase = mContext->all_seq_len + (ids.empty() ? -1 : mPositionIds.back());
+    // Tokenization precedes generate_init(), which clears all_seq_len when
+    // reuse_kv is disabled. Do not carry the previous response's offset into
+    // decode while the new prefill starts at zero.
+    const int prefixLength = mConfig->reuse_kv() ? mContext->all_seq_len : 0;
+    mDecodePositionBase = prefixLength + (ids.empty() ? -1 : mPositionIds.back());
     return ids;
 }
 

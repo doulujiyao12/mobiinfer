@@ -29,6 +29,15 @@ struct StateCache {
     // would drift past Full Attention layers and cause SIGBUS in hybrid models.
     // Sentinel -1 = not captured.
     int mPrefixLayerIndex = -1;
+    // A speculative block keeps the committed recurrent state untouched.
+    // Replay only its accepted prefix before the next forward. Store projected
+    // inputs, rather than a full recurrent-state snapshot for every draft token.
+    int mPendingLength = 0;
+    int mPendingBatch = 0;
+    int mPendingChannels = 0;
+    size_t mPendingEnd = 0;
+    std::vector<int8_t> mPendingQkv, mPendingGate, mPendingBeta;
+    std::vector<int8_t> mSpecConvBackup, mSpecRecurrentBackup;
 };
 
 class CPULinearAttention : public Execution {
@@ -73,6 +82,8 @@ private:
     std::shared_ptr<Tensor> mGateFoldBuf;        // Folded gate: [B*L*H]
     std::shared_ptr<Tensor> mBetaFoldBuf;        // Folded beta: [B*L*H]
     void applyGateFold(const std::vector<Tensor*>& inputs);
+    ErrorCode commitSpeculativePrefix(const std::vector<Tensor*>& inputs);
+    void saveSpeculativeInputs(const std::vector<Tensor*>& inputs, int batch, int channels, int length);
 };
 
 } // namespace MNN

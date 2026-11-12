@@ -78,7 +78,12 @@ public:
     virtual ~MtpGeneration() = default;
     virtual bool load(Module::Config module_config) override;
     virtual void generate(GenerationParams& param) override;
+    bool marksSpecBlock() const override { return mNativeQwen; }
 private:
+    void generateNativeQwen(GenerationParams& param);
+    std::vector<MNN::Express::VARP> nativeForward(MNN::Express::VARP embeddings,
+                                                 MNN::Express::VARP hidden,
+                                                 MNN::Express::VARP positions);
     std::vector<MNN::Express::VARP> mtpForward(const std::vector<int>& input_ids, MNN::Express::VARP hidden_states);
     std::vector<MNN::Express::VARP> mtpForward(MNN::Express::VARP input_embeds, MNN::Express::VARP hidden_states);
 
@@ -86,6 +91,7 @@ private:
     std::map<std::pair<int, bool>, std::shared_ptr<MNN::Express::Module>> mMtpModulePool;
     std::shared_ptr<KVMeta> mMtpMeta;
     int mHiddenStateIndex = -1;
+    bool mNativeQwen = false;
 };
 
 class EagleGeneration: public Generation {

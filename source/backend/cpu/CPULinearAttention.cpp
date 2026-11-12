@@ -504,20 +504,108 @@ void CPULinearAttention::applyGateFold(const std::vector<Tensor*>& inputs) {
     core->MNNSelectUnaryFunctionForFloat(UnaryOpOperation_SIGMOID, precision)(betaPtr, betaPtr, N);
 }
 
+ErrorCode CPULinearAttention::commitSpeculativePrefix(const std::vector<Tensor*>& inputs) {
+    auto& cache = *mStateCache;
+    if (mMeta == nullptr || mMeta->n_reserve != 0 || mMeta->previous != cache.mPendingEnd ||
+        mMeta->remove > static_cast<size_t>(cache.mPendingLength)) {
+        MNN_ERROR("CPULinearAttention: speculative rollback exceeds its pending block\n");
+        return NOT_SUPPORT;
+    }
+    const int accepted = cache.mPendingLength - static_cast<int>(mMeta->remove);
+    const int B = cache.mPendingBatch, D = cache.mPendingChannels, H = mNumVHeads;
+    std::vector<int8_t> outputStorage(B * H * mHeadVDim * mBytes);
+    std::unique_ptr<Tensor> output(Tensor::create<float>(
+        {B, 1, H, mHeadVDim}, reinterpret_cast<float*>(outputStorage.data())));
+    for (int token = 0; token < accepted; ++token) {
+        std::unique_ptr<Tensor> qkv(Tensor::create<float>(
+            {B, D, 1}, reinterpret_cast<float*>(cache.mPendingQkv.data() + token * B * D * mBytes)));
+        std::unique_ptr<Tensor> gate(Tensor::create<float>(
+            {B, 1, H}, reinterpret_cast<float*>(cache.mPendingGate.data() + token * B * H * mBytes)));
+        std::unique_ptr<Tensor> beta(Tensor::create<float>(
+            {B, 1, H}, reinterpret_cast<float*>(cache.mPendingBeta.data() + token * B * H * mBytes)));
+        gated_delta_rule_decode({qkv.get(), gate.get(), beta.get(), inputs[3]}, {output.get()});
+    }
+    cache.mPendingLength = 0;
+    return NO_ERROR;
+}
+
+void CPULinearAttention::saveSpeculativeInputs(const std::vector<Tensor*>& inputs, int B, int D, int L) {
+    auto& cache = *mStateCache;
+    const int H = mNumVHeads;
+    const int pack = static_cast<CPUBackend*>(backend())->functions()->pack;
+    cache.mPendingBatch = B;
+    cache.mPendingChannels = D;
+    cache.mPendingLength = L;
+    cache.mPendingEnd = mMeta->previous - mMeta->remove + L;
+    cache.mPendingQkv.resize(B * L * D * mBytes);
+    cache.mPendingGate.resize(B * L * H * mBytes);
+    cache.mPendingBeta.resize(B * L * H * mBytes);
+    // Freeze in token-major order so replaying one token is a contiguous view,
+    // independent of the original C4/NCHW layout and the next module's shape.
+    for (int t = 0; t < L; ++t) {
+        for (int b = 0; b < B; ++b) {
+            for (int d = 0; d < D; ++d) {
+                float value = _readQKV(inputs[0]->host<int8_t>(), _isC4(inputs[0]), b, d, t,
+                                       B, D, L, mBytes, pack);
+                _writeElement(cache.mPendingQkv.data(), (t * B + b) * D + d, value, mBytes);
+            }
+            for (int h = 0; h < H; ++h) {
+                int index = (t * B + b) * H + h;
+                _writeElement(cache.mPendingGate.data(), index,
+                    _readTokenChannel(inputs[1]->host<int8_t>(), _isC4(inputs[1]), b, t, h,
+                                      B, L, H, mBytes, pack), mBytes);
+                _writeElement(cache.mPendingBeta.data(), index,
+                    _readTokenChannel(inputs[2]->host<int8_t>(), _isC4(inputs[2]), b, t, h,
+                                      B, L, H, mBytes, pack), mBytes);
+            }
+        }
+    }
+    cache.mSpecConvBackup.resize(cache.mConvState->elementSize());
+    cache.mSpecRecurrentBackup.resize(cache.mRecurrentState->elementSize());
+    ::memcpy(cache.mSpecConvBackup.data(), cache.mConvState->host<int8_t>(), cache.mSpecConvBackup.size());
+    ::memcpy(cache.mSpecRecurrentBackup.data(), cache.mRecurrentState->host<int8_t>(),
+             cache.mSpecRecurrentBackup.size());
+}
+
 ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     int batch = 0, convDim = 0, seqLen = 0;
     _linearAttentionDims(inputs[0], batch, convDim, seqLen);
     const bool loadingFromDisk =
         mMeta != nullptr && mMeta->file_flag == KVMeta::PendingRead && mMeta->file_name.size() > 0;
-    // The recurrent state folds every past token, so it can only continue, reset, or be restored from disk.
+    const bool resetHistory = mMeta == nullptr ? seqLen > 1 : mMeta->previous == mMeta->remove;
+    const bool speculative = mMeta != nullptr && mMeta->spec_block > 0;
+    // Validate requests before committing or discarding any pending state.
+    if (speculative && (mAttentionType == "short_conv" || mMeta->spec_block != seqLen ||
+        mMeta->add != static_cast<size_t>(seqLen) || mMeta->n_reserve != 0 ||
+        mMeta->file_flag != KVMeta::NoChange)) {
+        MNN_ERROR("CPULinearAttention: invalid speculative block metadata\n");
+        return NOT_SUPPORT;
+    }
+    if (resetHistory && !loadingFromDisk && mMeta != nullptr && mMeta->n_reserve > 0) {
+        MNN_ERROR("CPULinearAttention: reserved history requires an explicit state snapshot\n");
+        return NOT_SUPPORT;
+    }
+    bool committedPending = false;
+    if (mStateCache->mPendingLength > 0) {
+        if (resetHistory || loadingFromDisk) {
+            mStateCache->mPendingLength = 0;
+        } else {
+            auto code = commitSpeculativePrefix(inputs);
+            if (code != NO_ERROR) {
+                return code;
+            }
+            committedPending = true;
+        }
+    }
+    // Only a tagged pending block can be partially rolled back. Ordinary
+    // prefix erasure still requires a reset or an explicit disk snapshot.
     if (mMeta != nullptr && mMeta->remove > 0 && (mMeta->previous != mMeta->remove || mMeta->n_reserve > 0) &&
-        !loadingFromDisk) {
+        !loadingFromDisk && !committedPending) {
         MNN_ERROR("CPULinearAttention: cannot erase part of the %zu-token history; reset all of it instead\n",
                   mMeta->previous);
         return NOT_SUPPORT;
     }
     // Checked here rather than in onResize, which is skipped when shapes are unchanged.
-    const bool resetHistory = mMeta == nullptr ? seqLen > 1 : mMeta->previous == mMeta->remove;
     if (resetHistory && !loadingFromDisk) {
         if (mStateCache->mConvState.get() != nullptr) {
             ::memset(mStateCache->mConvState->host<int8_t>(), 0, mStateCache->mConvState->elementSize());
@@ -595,14 +683,23 @@ ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, cons
     // Normal execution
     if (mAttentionType == "short_conv") {
         short_conv(inputs, outputs);
-    } else if (mGateFold) {
-        applyGateFold(inputs);
-        std::vector<Tensor*> foldedInputs = inputs;
-        foldedInputs[1] = mGateFoldBuf.get();
-        foldedInputs[2] = mBetaFoldBuf.get();
-        gated_delta_rule_mnn(foldedInputs, outputs);
     } else {
-        gated_delta_rule_mnn(inputs, outputs);
+        std::vector<Tensor*> effectiveInputs = inputs;
+        if (mGateFold) {
+            applyGateFold(inputs);
+            effectiveInputs[1] = mGateFoldBuf.get();
+            effectiveInputs[2] = mBetaFoldBuf.get();
+        }
+        if (speculative) {
+            saveSpeculativeInputs(effectiveInputs, batch, convDim, seqLen);
+        }
+        gated_delta_rule_mnn(effectiveInputs, outputs);
+        if (speculative) {
+            auto& cache = *mStateCache;
+            ::memcpy(cache.mConvState->host<int8_t>(), cache.mSpecConvBackup.data(), cache.mSpecConvBackup.size());
+            ::memcpy(cache.mRecurrentState->host<int8_t>(), cache.mSpecRecurrentBackup.data(),
+                     cache.mSpecRecurrentBackup.size());
+        }
     }
 
     // Save prefix cache to disk (PendingWrite)

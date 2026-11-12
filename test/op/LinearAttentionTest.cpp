@@ -1679,8 +1679,8 @@ class LinearAttentionSpecRejectionTest : public MNNTestCase {
             int backends[2] = {-1, -1};
             if (!module || !module->getInfo() || !module->getInfo()->runTimeManager ||
                 !module->getInfo()->runTimeManager->getInfo(MNN::Interpreter::BACKENDS, backends) ||
-                backends[0] != MNN_FORWARD_METAL) {
-                MNN_ERROR("SpecRejection: requires an available Metal runtime\n");
+                backends[0] != MNNTestSuite::get()->pStaus.forwardType) {
+                MNN_ERROR("SpecRejection: requested runtime is unavailable\n");
                 module.reset();
             }
             return module;
@@ -1837,8 +1837,9 @@ class LinearAttentionSpecRejectionTest : public MNNTestCase {
 
 public:
     bool run(int precision) override {
-        if (MNNTestSuite::get()->pStaus.forwardType != MNN_FORWARD_METAL) {
-            MNN_PRINT("LinearAttention SpecRejection SKIP: Metal-only test\n");
+        const auto backend = MNNTestSuite::get()->pStaus.forwardType;
+        if (backend != MNN_FORWARD_METAL && backend != MNN_FORWARD_CPU) {
+            MNN_PRINT("LinearAttention SpecRejection SKIP: CPU/Metal test\n");
             return true;
         }
         for (int accepted : {8, 3, 0}) {
@@ -2678,15 +2679,15 @@ public:
 
 MNNTestSuiteRegister(LinearAttentionShortConvTest, "op/linear_attention_short_conv");
 
-// ─── Speculative-decode verify path (Metal-only) ───
+// ─── Speculative-decode verify path (CPU / Metal) ───
 //
 // KVMeta::spec_block tags a verify forward. MetalLinearAttention defers the
 // recurrent-state update: the verify kernel replays the accepted prefix of the
 // previous pending block (meta.remove holds the rejected count), computes the
 // new block against that state, and saves the new block as pending without
 // persisting its effect. The next non-verify forward flushes the pending
-// block's accepted prefix before running normally. CPU has no spec_block
-// support (its recurrent state cannot roll back), so this test is Metal-only.
+// block's accepted prefix before running normally. CPU implements the same
+// committed/pending contract with projected-input replay.
 struct NaiveSpecVerify {
     NaiveLinearAttention core;
     int B, D, K, numK, H, dk, dv;
@@ -2867,8 +2868,9 @@ public:
     virtual ~LinearAttentionSpecVerifyTest() = default;
 
     virtual bool run(int precision) {
-        if ((MNNForwardType)MNNTestSuite::get()->pStaus.forwardType != MNN_FORWARD_METAL) {
-            MNN_PRINT("skip: LinearAttention spec-verify is Metal-only (CPU has no spec_block support)\n");
+        const auto backend = MNNTestSuite::get()->pStaus.forwardType;
+        if (backend != MNN_FORWARD_METAL && backend != MNN_FORWARD_CPU) {
+            MNN_PRINT("skip: LinearAttention spec-verify requires CPU or Metal\n");
             return true;
         }
         const int B = 1, numK = 4, numV = 8, dk = 64, dv = 64, K_conv = 4, specBlock = 8;
@@ -2908,6 +2910,7 @@ public:
         // specBlock tokens and compare against the naive lazy reference.
         auto verifyBlock = [&](const char* tag, int remove, int expectedCommit) -> bool {
             meta.spec_block = specBlock;
+            meta.add = specBlock;
             meta.remove = remove;
             auto in = makeInputs(specBlock);
             auto expected = naive.lazyForward(std::get<3>(in).data(), std::get<4>(in).data(), std::get<5>(in).data(),
@@ -2928,12 +2931,14 @@ public:
                     return false;
                 }
             }
+            meta.sync();
             return true;
         };
         // flush(tag, remove, expectedCommit): one ordinary decode forward that
         // must first flush the pending block's accepted prefix.
         auto flushBlock = [&](const char* tag, int remove, int expectedCommit) -> bool {
             meta.spec_block = 0;
+            meta.add = 1;
             meta.remove = remove;
             auto in = makeInputs(1);
             auto expected = naive.flushForward(std::get<3>(in).data(), std::get<4>(in).data(), std::get<5>(in).data(),
@@ -2963,16 +2968,13 @@ public:
         meta.previous = 0;
         meta.remove = 0;
         bool ok = verifyBlock("verify-A (no pending)", 0, 0);
-        meta.previous = 100;
         ok &= verifyBlock("verify-B (commit 3)", specBlock - 3, 3);
         ok &= flushBlock("flush-C (commit 3)", specBlock - 3, 3);
         // Cycle 2: full reject (remove == specBlock -> commit 0).
-        meta.previous = 100;
         ok &= verifyBlock("verify-D (no pending)", 0, 0);
         ok &= verifyBlock("verify-E (full reject)", specBlock, 0);
         ok &= flushBlock("flush-F (commit 0)", specBlock, 0);
         // Cycle 3: full accept (remove == 0 -> commit all specBlock tokens).
-        meta.previous = 100;
         ok &= verifyBlock("verify-G (no pending)", 0, 0);
         ok &= verifyBlock("verify-H (full accept)", 0, specBlock);
         ok &= flushBlock("flush-I (commit all)", 0, specBlock);

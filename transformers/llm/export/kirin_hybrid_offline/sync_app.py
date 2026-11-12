@@ -20,7 +20,13 @@ def sync(app, write=False):
         if previous.exists():
             for name, digest in json.loads(previous.read_text()).items():
                 local = dest / name
-                if not local.is_file() or hashlib.sha256(local.read_bytes()).hexdigest() != digest:
+                # The library/header sync can already have installed the exact
+                # current private header without refreshing this bridge manifest.
+                # Accept that verified content; still reject unrelated App edits.
+                expected = sources.get(name)
+                matches_source = (expected is not None and local.is_file() and
+                                  local.read_bytes() == expected.read_bytes())
+                if not matches_source and (not local.is_file() or hashlib.sha256(local.read_bytes()).hexdigest() != digest):
                     raise RuntimeError('App bridge was edited locally; merge before syncing: ' + name)
         dest.mkdir(parents=True, exist_ok=True)
     manifest = {}

@@ -175,6 +175,27 @@ class StaticKVTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly once"):
             StaticSession([(0, 2, None), (1, 2, None)], self.config, 16, 4)
 
+    def test_static_vision_without_deepstack_matches_qwen35(self):
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+        from transformers.vision_utils import get_vision_interpolation_indices_and_weights, get_vision_position_ids
+        config = Qwen3_5VisionConfig(depth=2, hidden_size=32, intermediate_size=64, num_heads=4,
+                                    out_hidden_size=32, patch_size=2, temporal_patch_size=2,
+                                    spatial_merge_size=2, num_position_embeddings=16)
+        config._attn_implementation = "eager"
+        visual = Qwen3_5VisionModel(config).eval()
+        patches, grid = torch.randn(16, 24), torch.tensor([[1, 4, 4]])
+        indices, weights = get_vision_interpolation_indices_and_weights(
+            grid, num_grid_per_side=4, mode="bilinear", align_corners=True, spatial_merge_size=2)
+        with torch.inference_mode():
+            reference = visual(patches, grid_thw=grid).pooler_output
+            rotary = visual.rotary_pos_emb(get_vision_position_ids(grid, 2)).reshape(16, -1)
+            rotary = torch.cat((rotary, rotary), -1)
+            outputs = StaticVisionFull(visual)(patches, indices.int(), weights,
+                rotary.cos()[None, None], rotary.sin()[None, None], torch.zeros(1, 1, 16, 16))
+        self.assertEqual(len(outputs), 1)
+        torch.testing.assert_close(outputs[0][0], reference, rtol=2e-5, atol=2e-5)
+
     def test_static_vision_pre_blocks_post_match_original_hf_vision(self):
         from transformers.vision_utils import get_vision_interpolation_indices_and_weights, get_vision_position_ids
         config = Qwen3VLVisionConfig(depth=3, hidden_size=32, intermediate_size=64, num_heads=4,

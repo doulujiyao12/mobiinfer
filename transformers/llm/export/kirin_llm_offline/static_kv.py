@@ -224,10 +224,12 @@ class StaticVisionPost(torch.nn.Module):
     def __init__(self, visual):
         super().__init__()
         self.merger = visual.merger
-        self.deepstack = visual.deepstack_merger_list
+        self.deepstack = getattr(visual, "deepstack_merger_list", torch.nn.ModuleList())
 
     def forward(self, hidden, *deepstack):
         image = self.merger(hidden).unsqueeze(0)
+        if not self.deepstack:
+            return (image,)
         features = torch.stack([merger(value).unsqueeze(0)
                                 for merger, value in zip(self.deepstack, deepstack)])
         return image, features
@@ -237,10 +239,10 @@ class StaticVisionFull(torch.nn.Module):
     """One visual graph, preserving post-block DeepStack order and mergers."""
     def __init__(self, visual):
         super().__init__()
-        indexes = list(visual.deepstack_visual_indexes)
-        if (not indexes or indexes != sorted(set(indexes)) or indexes[0] < 0
-                or indexes[-1] >= len(visual.blocks)
-                or len(indexes) != len(visual.deepstack_merger_list)):
+        indexes = list(getattr(visual, "deepstack_visual_indexes", []))
+        if (indexes != sorted(set(indexes)) or (indexes and (indexes[0] < 0
+                or indexes[-1] >= len(visual.blocks)))
+                or len(indexes) != len(getattr(visual, "deepstack_merger_list", []))):
             raise ValueError("Invalid visual DeepStack layer/merger mapping")
         self.pre = StaticVisionPre(visual)
         self.blocks = StaticVisionChunk(visual.blocks, 0, indexes)

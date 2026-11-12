@@ -1012,7 +1012,7 @@ int Llm::sample(VARP logits, int offset, int size) {
         fflush(stdout);
     }
 #endif
-    if (offset && size) {
+    if (size > 0) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
         auto logitsPtr = logits->readMap<float>();
         if (nullptr == logitsPtr) {
@@ -1070,6 +1070,10 @@ void Llm::generate_init(std::ostream* os, const char* end_with) {
     if (!mConfig->reuse_kv()) {
         mContext->all_seq_len = 0;
         mMeta->remove = mMeta->previous;
+        // Discard a speculative strategy's pending tree compaction as well.
+        // A full reset must not retain nodes from the previous response.
+        mMeta->reserve = nullptr;
+        mMeta->n_reserve = 0;
     }
     if (mGenerationStrategy) {
         mGenerationStrategy->reset();

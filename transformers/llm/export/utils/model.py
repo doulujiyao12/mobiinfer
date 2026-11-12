@@ -184,6 +184,12 @@ class LlmModel(PreTrainedModel):
             load_kwargs['dtype'] = 'auto'
         else:
             load_kwargs['torch_dtype'] = 'auto'
+        if model_type == 'qwen3_5':
+            # This checkpoint mixes BF16 matrices and FP32 gated-RMSNorm
+            # weights. Loading everything as BF16 destroys the latter before
+            # the exporter's later .float() can preserve them.
+            dtype_key = 'dtype' if 'dtype' in load_kwargs else 'torch_dtype'
+            load_kwargs[dtype_key] = torch.float32
 
         if model_type == 'internvl_chat':
             load_kwargs['use_flash_attn'] = False
@@ -364,9 +370,17 @@ class LlmModel(PreTrainedModel):
                 model.talker = None
         if model_type == 'poi_qwen2_mtp':
             model.mtp = [model.mtp1, model.mtp2]
+        if getattr(args, 'mtp', False):
+            if model_type != 'qwen3_5':
+                raise ValueError('--mtp currently supports native dense Qwen3.5 checkpoints')
+            from utils.mtp import load_qwen35_mtp_checkpoint
+            model.mtp = load_qwen35_mtp_checkpoint(pretrained_model_name_or_path, config.origin_config)
         if model.mtp is not None:
             from utils.mtp import Mtp
-            model.mtp = Mtp.get_mtp(model_type)(model.mtp, model)
+            mtp_class = Mtp.get_mtp(model_type)
+            if mtp_class is None:
+                raise ValueError('Unsupported MTP model type: ' + model_type)
+            model.mtp = mtp_class(model.mtp, model)
 
         return model
 
@@ -554,7 +568,7 @@ class LlmModel(PreTrainedModel):
             if self.config.model_type == 'mimo':
                 final_layernorm = hidden_states # mimo
             hidden_states = self.final_layernorm(hidden_states)
-            if self.config.model_type == 'poi_qwen2_mtp':
+            if self.config.model_type in ('poi_qwen2_mtp', 'qwen3_5'):
                 final_layernorm = hidden_states # poi
             hidden_states = hidden_states[:, logits_index_long:, :]
         logits = self.lm(hidden_states)

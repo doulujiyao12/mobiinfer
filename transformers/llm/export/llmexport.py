@@ -35,6 +35,8 @@ class LlmExporter(torch.nn.Module):
     def init_from_args(self, args):
         if args.smooth and args.omni:
             raise ValueError('--smooth and --omni cannot be used together; choose one quantization calibration method.')
+        if getattr(args, 'mtp', False) and (args.eagle_path or getattr(args, 'dflash_path', None)):
+            raise ValueError('--mtp cannot be combined with an EAGLE or DFlash draft')
         self.args = args
         self.max_new_tokens = 1024
         self.dst_name = 'llm'
@@ -491,6 +493,10 @@ class LlmExporter(torch.nn.Module):
             if self.args.eagle_path is not None:
                 config['speculative_type'] = 'eagle'
                 config['hidden_states'] = True
+            if getattr(self.args, 'mtp', False):
+                config.update(speculative_type='mtp', mtp_type='qwen3_5', hidden_states=True, precision='high',
+                              draft_predict_length=2, sampler_type='greedy', reuse_kv=False,
+                              attention_mode=8, dynamic_option=2)
             if hasattr(self.args, 'dflash_path') and self.args.dflash_path is not None:
                 config['speculative_type'] = 'dflash'
                 config['hidden_states'] = True
@@ -1518,6 +1524,7 @@ def build_args(parser):
                         )
     parser.add_argument('--tokenizer_path', type=str, default=None, help='tokenizer path, default is `None` mean using `--path` value.')
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
+    parser.add_argument('--mtp', action='store_true', help='Export the native dense Qwen3.5 MTP predictor')
     parser.add_argument('--dflash_path', type=str, default=None, help='dflash draft model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')

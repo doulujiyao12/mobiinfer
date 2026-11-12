@@ -1,5 +1,5 @@
 //
-//  mtp.cpp
+//  eagle.cpp
 //
 //  Created by MNN on 2025/05/09.
 //
@@ -225,18 +225,18 @@ EagleGeneration::DraftInfo EagleGeneration::topkGenerate(const std::vector<int>&
             info.attentionMask->writeMap<float>()[i * inputLen + j] = output.attentionMask[i][j] ? 0.0 : std::numeric_limits<float>::lowest();
         }
     }
-    if (mLlm->mConfig->is_mrope()) {
-        info.positionIds = _Input({3, inputLen}, NCHW, halide_type_of<int>());
+    // Vision tokens occupy a compressed mRoPE timeline. The draft's KV length
+    // is not the target's next position after an image (or a retained prefix).
+    // Ask the target runtime, which also handles legacy VL configs without an
+    // explicit is_mrope flag, and apply each tree node's relative depth.
+    auto nextPosition = mLlm->gen_position_ids(1);
+    int axes = nextPosition->getInfo()->size;
+    info.positionIds = _Input({axes, inputLen}, NCHW, halide_type_of<int>());
+    auto positions = info.positionIds->writeMap<int>();
+    auto basePositions = nextPosition->readMap<int>();
+    for (int axis = 0; axis < axes; axis++) {
         for (int i = 0; i < inputLen; i++) {
-            int pos = seqLen + output.positionIds[i];
-            info.positionIds->writeMap<int>()[i] = pos;
-            info.positionIds->writeMap<int>()[inputLen + i] = pos;
-            info.positionIds->writeMap<int>()[2 * inputLen + i] = pos;
-        }
-    } else {
-        info.positionIds = _Input({1, inputLen}, NCHW, halide_type_of<int>());
-        for (int i = 0; i < inputLen; i++) {
-            info.positionIds->writeMap<int>()[i] = seqLen + output.positionIds[i];
+            positions[axis * inputLen + i] = basePositions[axis] + output.positionIds[i];
         }
     }
     return info;
@@ -299,18 +299,6 @@ EagleGeneration::AcceptInfo EagleGeneration::evaluatePosterior(const EagleGenera
 
 EagleGeneration::DraftInfo EagleGeneration::updateDraft(const AcceptInfo& acceptInfo, VARP hiddenStates) {
     int acceptLen = static_cast<int>(acceptInfo.acceptTokens.size());
-    // update base model kv cache
-    {
-        mLlm->updateContext(acceptLen, acceptLen);
-        mLlm->mMeta->remove = acceptInfo.sampleTokens.size();
-        mLlm->mMeta->n_reserve = acceptLen;
-        mLlm->mMeta->reserveHost.resize(acceptLen * 2);
-        mLlm->mMeta->reserve = mLlm->mMeta->reserveHost.data();
-        for (size_t i = 0; i < acceptLen; i++) {
-            mLlm->mMeta->reserve[2 * i] = acceptInfo.acceptIndices[i];
-            mLlm->mMeta->reserve[2 * i + 1] = 1;
-        }
-    }
     auto acceptHiddenState = _GatherV2(hiddenStates, _var<int>(acceptInfo.acceptIndices, {acceptLen}), _Scalar<int>(1));
     return topkGenerate(acceptInfo.acceptTokens, acceptHiddenState);
 }
@@ -319,10 +307,17 @@ bool EagleGeneration::processTokens(const std::vector<int>& acceptTokens) {
     for (int i = 0; i < acceptTokens.size(); i++) {
         auto token = acceptTokens[i];
         if (mLlm->is_stop(token)) {
+            if (nullptr != mContext->os) {
+                *mContext->os << mContext->end_with << std::flush;
+            }
             return true;
         }
+        auto tokenStr = mLlm->tokenizer_decode(token);
+        {
+            std::lock_guard<std::mutex> lock(mContext->mutex);
+            mContext->generate_str += tokenStr;
+        }
         if (nullptr != mContext->os) {
-            auto tokenStr = mLlm->tokenizer_decode(token);
             *mContext->os << tokenStr << std::flush;
         }
     }
@@ -330,13 +325,28 @@ bool EagleGeneration::processTokens(const std::vector<int>& acceptTokens) {
 }
 
 void EagleGeneration::generate(GenerationParams& param) {
+    if (param.max_new_tokens <= 0) {
+        return;
+    }
+    // A continued decode or retained target prefix has no corresponding draft
+    // prefill features. Use the target rather than initializing a partial draft.
+    if (param.max_new_tokens == 1 || mContext->gen_seq_len > 0 ||
+        mContext->all_seq_len > param.input_embeds->getInfo()->dim[0]) {
+        ArGeneration ar(mLlm, mContext, mLlm->mConfig);
+        ar.generate(param);
+        return;
+    }
     mEaglePastLen = 0;
     mEagleRemove  = mEagleMeta->previous;
     int64_t treeDecodingTime = 0, eagleGenerateTime = 0;
     MNN::Timer _t;
     VARP inputEmbeds  = param.input_embeds;
     auto inputIds     = param.input_ids;
-    auto sampleToken  = mLlm->sample(param.outputs[0]);
+    auto sampleToken  = mLlm->sample(param.outputs[0], param.validLogitStart, param.validLogitSize);
+    if (sampleToken < 0) {
+        mContext->status = LlmStatus::INTERNAL_ERROR;
+        return;
+    }
     mContext->current_token = sampleToken;
     {
         std::lock_guard<std::mutex> _l(mContext->mutex);
@@ -344,8 +354,9 @@ void EagleGeneration::generate(GenerationParams& param) {
         mContext->output_tokens.push_back(mContext->current_token);
     }
     mLlm->updateContext(0, 1);
-    if (nullptr != mContext->os) {
-        *mContext->os << mLlm->tokenizer_decode(sampleToken) << std::flush;
+    if (processTokens({sampleToken})) {
+        mContext->decode_us += _t.durationInUs();
+        return;
     }
     inputIds.push_back(sampleToken);
     VARP hiddenStates = param.outputs[1];
@@ -359,8 +370,8 @@ void EagleGeneration::generate(GenerationParams& param) {
     auto draftInfo  = topkGenerate(inputIds, hiddenStates, inputEmbeds);
     eagleGenerateTime += _gt.durationInUs();
     std::vector<int> accpetLens;
-    auto newTokens = 0, steps = 0;
-    while (true) {
+    auto newTokens = 1, steps = 0;
+    while (newTokens < param.max_new_tokens) {
         if(mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
             break;
         }
@@ -369,6 +380,10 @@ void EagleGeneration::generate(GenerationParams& param) {
             break;
         }
         steps++;
+        if (draftInfo.draftTokens.empty()) {
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            break;
+        }
         MNN::Timer _dt;
         auto decodingInfo = treeDecoding(draftInfo);
         for (auto o : decodingInfo) {
@@ -377,12 +392,34 @@ void EagleGeneration::generate(GenerationParams& param) {
                 break;
             }
         }
-        if(decodingInfo.empty()) {
+        if(decodingInfo.size() < 2 || mContext->status == LlmStatus::INTERNAL_ERROR) {
+            mContext->status = LlmStatus::INTERNAL_ERROR;
             break;
         }
         
         treeDecodingTime += _dt.durationInUs();
         auto acceptInfo = evaluatePosterior(draftInfo, decodingInfo[0]);
+        // A tree can contain more accepted tokens than the remaining budget,
+        // or tokens beyond EOS. Never emit or retain those extra branches.
+        size_t acceptLen = std::min(acceptInfo.acceptTokens.size(),
+                                   static_cast<size_t>(param.max_new_tokens - newTokens));
+        for (size_t i = 0; i < acceptLen; ++i) {
+            if (mLlm->is_stop(acceptInfo.acceptTokens[i])) {
+                acceptLen = i + 1;
+                break;
+            }
+        }
+        acceptInfo.acceptTokens.resize(acceptLen);
+        acceptInfo.acceptIndices.resize(acceptLen);
+        mLlm->updateContext(acceptLen, acceptLen);
+        mLlm->mMeta->remove = acceptInfo.sampleTokens.size();
+        mLlm->mMeta->n_reserve = acceptLen;
+        mLlm->mMeta->reserveHost.resize(acceptLen * 2);
+        mLlm->mMeta->reserve = mLlm->mMeta->reserveHost.data();
+        for (size_t i = 0; i < acceptLen; ++i) {
+            mLlm->mMeta->reserve[2 * i] = acceptInfo.acceptIndices[i];
+            mLlm->mMeta->reserve[2 * i + 1] = 1;
+        }
         newTokens += acceptInfo.acceptTokens.size();
         accpetLens.push_back(acceptInfo.acceptTokens.size());
         {
@@ -395,8 +432,16 @@ void EagleGeneration::generate(GenerationParams& param) {
         }
         bool stop = processTokens(acceptInfo.acceptTokens);
         if (stop || newTokens >= param.max_new_tokens) {
-            std::lock_guard<std::mutex> _l(mContext->mutex);
-            mContext->output_tokens.push_back(steps);
+            if (!stop) {
+                // Apply the final tree compaction and cache the last emitted
+                // token, matching autoregressive continuation semantics.
+                auto outputs = mLlm->forwardVec({mContext->current_token});
+                if (outputs.empty()) {
+                    mContext->status = LlmStatus::INTERNAL_ERROR;
+                    break;
+                }
+                mLlm->updateContext(1, 0);
+            }
             break;
         }
         MNN::Timer _gt;
@@ -404,7 +449,8 @@ void EagleGeneration::generate(GenerationParams& param) {
         eagleGenerateTime += _gt.durationInUs();
     }
     mContext->decode_us += _t.durationInUs();
-    if(newTokens >= param.max_new_tokens) {
+    if (newTokens >= param.max_new_tokens && mContext->status == LlmStatus::RUNNING &&
+        !mLlm->is_stop(mContext->current_token)) {
         mContext->status = LlmStatus::MAX_TOKENS_FINISHED;
     }
 #if EAGLE_DEBUG

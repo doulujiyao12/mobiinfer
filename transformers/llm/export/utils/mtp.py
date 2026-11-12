@@ -1,8 +1,11 @@
+import copy
+import json
+from pathlib import Path
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
-from .transformers import Attention
+from .transformers import Attention, Decoder
 from utils.custom_op import FakeLinear
 from utils.spinner import spinner_run
 from .torch_utils import onnx_export
@@ -31,6 +34,7 @@ class Mtp(torch.nn.Module):
         mtps = {
             'mimo': MimoMtp,
             'poi_qwen2_mtp' : PoiQwenMtp,
+            'qwen3_5': Qwen35Mtp,
         }
         if model_type in mtps:
             return mtps[model_type]
@@ -78,6 +82,102 @@ class Mtp(torch.nn.Module):
 
     def forward(self, images):
         raise NotImplementedError
+
+
+def load_qwen35_mtp_checkpoint(model_path, origin_config):
+    """Load native MTP weights which HF deliberately omits from its main model."""
+    from safetensors import safe_open
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+
+    config = copy.deepcopy(origin_config.text_config)
+    if getattr(config, 'mtp_num_hidden_layers', 0) != 1:
+        raise ValueError('Qwen3.5 MTP currently requires exactly one native predictor layer')
+    if getattr(config, 'mtp_use_dedicated_embeddings', False):
+        raise ValueError('Qwen3.5 MTP dedicated embeddings are not supported')
+    config.layer_types = ['full_attention']
+    config._attn_implementation = 'eager'
+    raw = nn.Module()
+    raw.layers = nn.ModuleList([Qwen3_5DecoderLayer(config, 0)])
+    raw.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+    for name in ('norm', 'pre_fc_norm_embedding', 'pre_fc_norm_hidden'):
+        setattr(raw, name, Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
+    root = Path(model_path)
+    index = root / 'model.safetensors.index.json'
+    if index.is_file():
+        weight_map = json.loads(index.read_text())['weight_map']
+        shards = sorted({value for key, value in weight_map.items() if key.startswith('mtp.')})
+    else:
+        shards = [p.name for p in sorted(root.glob('*.safetensors'))]
+    state = {}
+    for shard in shards:
+        with safe_open(root / shard, framework='pt', device='cpu') as source:
+            for key in source.keys():
+                if key.startswith('mtp.'):
+                    state[key[len('mtp.'):]] = source.get_tensor(key)
+    if not state:
+        raise ValueError('Native mtp.* weights were not found in the Qwen3.5 checkpoint')
+    raw.load_state_dict(state, strict=True)
+    return raw.eval()
+
+
+class Qwen35Mtp(Mtp):
+    """Native Qwen3.5 predictor: normalized next embedding + normalized hidden.
+
+    Matches vLLM's Qwen3_5MultiTokenPredictor. The target and recursive draft
+    hidden states are post-final-norm; all RMSNorm weights retain HF's 1+w semantics.
+    """
+    def load(self):
+        self.layer = Decoder(self.mtp.layers[0], 0, self.config, self.rotary, self.config.model_map)
+        self.fc = self.mtp.fc
+        self.norm = self.mtp.norm
+        self.pre_fc_norm_embedding = self.mtp.pre_fc_norm_embedding
+        self.pre_fc_norm_hidden = self.mtp.pre_fc_norm_hidden
+        # Decoder holds the mapped children; do not export a second copy.
+        del self.mtp
+
+    def unload_param(self):
+        def replace(module, prefix):
+            for name, child in list(module.named_children()):
+                path = prefix + '/' + name
+                if isinstance(child, nn.Linear):
+                    key = path + '/Linear'
+                    self.unloaded_ops[key] = child
+                    setattr(module, name, FakeLinear(child.in_features, child.out_features,
+                                                     child.bias is not None, key))
+                else:
+                    replace(child, path)
+        self.layer.self_attn.export_fused_attn = True
+        replace(self.layer, '/mtp_layers.0')
+        self.unloaded_ops['/mtp/fc/Linear'] = self.fc
+        self.fc = FakeLinear(self.fc.in_features, self.fc.out_features, False, '/mtp/fc/Linear')
+
+    def forward(self, input_embed, hidden_states, attention_mask, position_ids, logits_index):
+        embedding = input_embed.reshape(1, -1, self.hidden_size)
+        hidden = hidden_states.reshape(1, -1, self.hidden_size)
+        hidden = self.fc(torch.cat([self.pre_fc_norm_embedding(embedding),
+                                    self.pre_fc_norm_hidden(hidden)], dim=-1))
+        hidden = self.layer(hidden, self.rotary(position_ids), attention_mask)
+        hidden = self.norm(hidden)
+        logits = self.lm_(hidden[:, logits_index.to(torch.int64):, :])
+        return logits, hidden
+
+    @spinner_run('export Qwen3.5 native MTP to ')
+    def export(self, onnx_path):
+        self.unload_param()
+        sequence = 3
+        embedding = torch.zeros(sequence, 1, self.hidden_size)
+        hidden = torch.zeros(1, sequence, self.hidden_size)
+        mask = (1 - torch.tril(torch.ones(1, 1, sequence, sequence))) * torch.finfo(torch.float32).min
+        positions = torch.arange(sequence, dtype=torch.int32).repeat(self.rotary.mrope_axes, 1)
+        index = torch.tensor([-1], dtype=torch.int32)
+        path = str(Path(onnx_path) / 'mtp.onnx')
+        onnx_export(self, (embedding, hidden, mask, positions, index), path,
+                    input_names=['input_embed', 'hidden_states', 'attention_mask', 'position_ids', 'logits_index'],
+                    output_names=['logits', 'draft_hidden_states'],
+                    dynamic_axes={'input_embed': {0: 'seq_len'}, 'hidden_states': {1: 'seq_len'},
+                                  'attention_mask': {2: 'seq_len', 3: 'kv_len'},
+                                  'position_ids': {1: 'seq_len'}})
+        return path
 
 
 class MimoMtp(Mtp):
