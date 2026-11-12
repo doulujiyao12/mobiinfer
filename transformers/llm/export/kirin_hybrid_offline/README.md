@@ -1,5 +1,7 @@
 # 离线NPU：单图 ViT + CPU LLM
 
+Qwen3-VL-2B-Instruct 与 Qwen3.5-2B 的新增单图 FP16 视觉、CPU EAGLE/MTP、模型入口和 App 更新要求见 [Qwen 单图离线视觉](../../../../docs/inference/qwen-offline-vision.md)。下文的固定 Mobi / W4A16 协议描述对应早期 Mobi 包，新适配器复用 Omni 调度并保留该实现。
+
 这是当前主要离线方案，App 入口为 **离线NPU**（原名“离线NPU-2”）。为兼容已发布模型包，内部模式和包协议仍使用 `offline_npu2` / `kirin_offline_npu2_v1`。旧 `offline`（视觉分块 OM）仅保留后台实现，按钮已移除；`full_npu` 保留独立实验入口。只修改本机 App 源码，不连接手机。
 
 模型已发布到 [ModelScope 离线NPU](https://www.modelscope.cn/models/fengerhu1/mobi_2B_offline_npu2_kirin9030_vit_w4a16_g64_llm_cpu_v1)。17 个发布文件，共 3,004,653,895 bytes，已逐项核验远端文件大小和 SHA256；发布记录见 `evidence_publication/modelscope_publication.json`。下载完整仓库，在新版 App 选择“离线NPU”并加载根目录 `config.json`。

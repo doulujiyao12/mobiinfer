@@ -4,6 +4,8 @@
 
 # Local build, export, and device-test artifacts.
 /.artifacts/
+/outputs/
+/.clawmate-upload-*/
 
 ### AndroidStudio ###
 # Covers files to be ignored for android development using Android Studio.

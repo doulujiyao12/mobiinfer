@@ -1,5 +1,14 @@
 # MNN Project Instructions
 
+## 本机模型存储位置（必须遵守）
+
+- **下载和生成的模型必须保存在 `/temp/models/` 下，不得存入本项目工作目录。** 本机各模型的实际地址及运行入口见 [models.md](models.md)。
+- **每次下载、生成、保存或迁移模型后，必须在 `models.md` 中记录或更新模型的实际保存地址、用途和运行配置入口。** 路径发生变化时同步更新已有记录，不保留失效地址作为当前入口。
+- 本规则覆盖原始浮点权重、量化 checkpoint、MNN / ONNX / OM / OMC 图、外置权重、导出中间产物、模型下载缓存和包含模型的压缩包。不要把这些文件写入仓库内的 `.artifacts/`、`outputs/`、`build/` 或 `models/`。
+- 执行下载、量化、导出和打包前，显式指定 `/temp/models/` 下的输入、输出及缓存目录；导出中间产物放入 `/temp/models/mobiinfer-work/`，模型压缩包放入 `/temp/models/archives/`。不要依赖工具默认的相对输出目录。
+- 项目目录可保留源码、文档、构建工具、原生库和不含模型数据的验证报告；保留版本库原有的小型测试夹具。不得通过复制模型回项目目录来修复旧路径，应更新调用路径。
+- 本规则针对本机构建主机；手机 App 仍使用其应用沙箱内的模型目录。
+
 MNN is a lightweight deep learning **inference engine** (not a training framework), targeting mobile and server platforms. Supports CNN / Transformer / LLM / Diffusion models. Code must prioritize **performance and binary size**.
 
 ## Restricted Access
@@ -103,6 +112,114 @@ For the following tasks, **read the Skill entry file first** and execute step by
 `entry/src/main/cpp/napi_init.cpp`，界面在 `entry/src/main/ets/`。
 `entry/libs/arm64-v8a/libMNN.so` 来自本仓库的 Harmony 构建。修改本机源码后需要重新编译、安装 App，下载模型不会更新已安装的原生库。
 
+## MNN 官方模型与 EAGLE-3 接入（2026-11-10）
+
+完整导出、编译与部署步骤见 [Qwen3-VL-2B + EAGLE-3 在线 HiAI](docs/inference/qwen3-vl-eagle3-hiai.md)。
+本节记录后续接入官方 MNN 模型时必须保留的配置、权重来源与验证边界，不改变下面的默认离线 NPU 方案。
+
+### 复用官方 MNN 模型
+
+- 优先复用官方已转换的 `.mnn`、`.mnn.weight`、tokenizer 与 `llm_config.json`，固定下载版本并记录 SHA256。已有可用的量化 MNN 包时，不必为了接入本项目重新生成 GPTQ 权重。
+- 图、权重与配置须配套；保留 `tie_embeddings` 的共享 embedding/head 文件偏移，不能用重新导出语言模型的配置覆盖它。不要把架构相同的 Mobi 权重与原始 Qwen 权重混用。
+- `.mnn` 格式不等于可以直接在 HiAI 上执行。先在 CPU 验证，再核对在线 NPU 路由、算子、布局和输入尺寸；必要时仅重新导出需要 NPU 执行的子模块，保留已验证的语言模型。
+- EAGLE 还要求主图支持批量验证接口（当前检查 `logits_index`）及匹配的 `hidden_states` 输出。主模型和 draft 必须配套，不能给任意普通 MNN 模型添加一个开关就使用官方 draft。
+
+本次使用的来源与产物：
+
+| 项目 | 地址 / 版本 |
+| --- | --- |
+| 官方主模型和已转换 draft | [MNN/Qwen3-VL-2B-Instruct-Eagle3-MNN](https://modelscope.cn/models/MNN/Qwen3-VL-2B-Instruct-Eagle3-MNN)，版本 `297b639db1226f884a15a3f503827e220074f1a3` |
+| 视觉原始权重 | [Qwen/Qwen3-VL-2B-Instruct](https://modelscope.cn/models/Qwen/Qwen3-VL-2B-Instruct)，权重 / 配置版本 `eb46e64af9b20837a9d6030aedc90f2086e587e9` |
+| 已发布运行包 | [fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN) |
+| 本机运行目录 | `/temp/models/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN` |
+
+最初在线发布包共 38 个文件，约 1.76 GB；增加单图离线视觉后的完整包为 54 个文件、约 2.58 GB，远端大小与 SHA256 均已核对。具体文件版本见包中的 `manifest.json`、`release_manifest.json` 和 `validation/sources.json`。
+
+### 模型组装与视觉处理
+
+使用 [prepare_qwen3_vl_eagle.py](project/harmony/prepare_qwen3_vl_eagle.py)；该脚本专用于本次 Qwen3-VL-2B EAGLE-3 包，不是任意 MNN 模型的通用转换器：
+
+```bash
+python project/harmony/prepare_qwen3_vl_eagle.py \
+  --mnn-dir /temp/models/Qwen3-VL-2B-Instruct-Eagle3-MNN \
+  --original-dir /temp/models/Qwen3-VL-2B-Instruct \
+  --mnnconvert /path/to/host/MNNConvert \
+  --visual-dir /temp/models/mobiinfer-work/qwen-eagle-new-visual \
+  --output /temp/models/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN-new
+```
+
+输出目录须为空。已经完成视觉导出时，可添加 `--reuse-visual`，复用含 `visual_config.json` 的视觉目录。
+
+- 官方语言主干与 EAGLE transformer / 特征投影保留 **W4/group64**，共享 embedding/head 保留官方 **W8/group64**。语言、draft、tokenizer 共 8 个运行文件不重新转换、不重新量化，核对其哈希与官方包一致。
+- ViT 来自匹配的原始 Qwen 浮点权重，主要线性层采用 **HQQ W8/group128 权重量化**。**量化没有使用参考图片或中间激活校准数据**；参考图片只用于量化后的特征与回答验证。导出时的示例输入也不等于量化校准。
+- 视觉 24 层 blocks 分为 6 个在线 HiAI chunk，CPU 执行 `visual_pre` / `visual_post`，包括视觉 merger。DeepStack 取第 5/11/17 层，对应 chunk 1/2/4，三路特征须按顺序保留。
+- LLM、draft、文本 embedding/head、采样与 KV 均在 CPU；`attention_mode: 8` 保留浮点 KV，`precision: low` 在支持的 ARM CPU 路径使用 FP16，主机参考为 FP32。
+- 该包是 **MNN 图 + 配套权重 + 设备在线编译缓存**。不使用 DOPT / OMG，不含离线 OMC；视觉 W8 存储不代表 NPU 原生 W8A8，也不是下面离线单图 W4A16 的校准方案。
+
+### EAGLE 启用规则与普通模型兼容
+
+EAGLE-3 是额外训练的 draft，原始 Qwen3-VL-2B 不自带这套 MTP / draft。当前由配置选择生成策略，**不扫描目录来自动决定是否启用 EAGLE**：
+
+```json
+{
+  "backend_type": "cpu",
+  "speculative_type": "eagle",
+  "hidden_states": true,
+  "sampler_type": "greedy",
+  "eagle_depth": 3,
+  "eagle_topk": 1,
+  "draft_predict_length": 3,
+  "reuse_kv": false,
+  "attention_mode": 8
+}
+```
+
+启用时配套文件为 `eagle.mnn`、`eagle.mnn.weight`、`eagle_fc.mnn`、`eagle_fc.mnn.weight`、`eagle_d2t.mnn`。缺少文件时尚无可靠的自动降级机制，须在分发与下载阶段保证完整。
+未设置 `speculative_type` 或设为 `""` 时使用普通自回归，不要求 draft 文件；同一份 `libMNN.so` 支持两种路径。仅放入 draft 文件不会启用 EAGLE。
+
+| 入口 | 视觉 blocks | 语言生成 |
+| --- | --- | --- |
+| `config.json` | HiAI 在线 NPU | CPU + EAGLE |
+| `config_ar.json` | HiAI 在线 NPU | CPU 自回归 |
+| `config_cpu.json` | CPU | CPU + EAGLE，主机验证用 |
+| `config_cpu_ar.json` | CPU | CPU 自回归，主机对照用 |
+
+切换配置须重新加载模型，无需因此重新编译库。当前树验证采用 argmax，不能把 penalty / temperature 配置当成已验证的等价采样模式。
+
+### 运行时修正、编译与 App 更新
+
+- `transformers/llm/engine/src/speculative_decoding/eagle.cpp`：树验证通过目标运行时 `gen_position_ids(1)` 获取位置基准，不能用 KV token 数代替图像后的 mRoPE 位置；生成预算包含首 token，按预算 / EOS 截断接受序列，维护输出文本、token 计数及末轮 KV，不将统计步数混入输出 token。
+- `transformers/llm/engine/src/llm.cpp`：完整 KV 重置时清除上一请求遗留的树节点保留信息，覆盖 EOS 后再次请求。
+- `transformers/llm/engine/demo/llm_demo.cpp`：一次将完整 token 预算交给 `response`。逐 token `generate(1)`、继续生成及缺少 draft 前缀特征的 KV 续接使用目标模型自回归，不能据此评估 EAGLE 加速。
+- 使用 `project/harmony/build_64.sh` 编译 ARM64 库，开启 LLM、Omni、低内存量化、Transformer 融合、HiAI、OpenCV / 图像解码与 chunk OM 缓存；具体命令见完整部署文档。无需额外 EAGLE 动态库，也不要使用已移除的 `MNN_CPU_WEIGHT_DEQUANT_GEMM` 开关。
+- 本次 EAGLE 实现与修正位于 **`libMNN.so`**，没有新增或修改 App NAPI 接口。更新手机需将新库打入 HAP 并安装；**不能说加入 EAGLE 就必须修改或重新编译 `libentry.so`**。接口和 ABI 兼容时可沿用旧桥接库；跨版本接口或 ABI 有变化时，须同步头文件并重编桥接。DevEco 构建可能自动重新链接它。
+- 已构建库及匹配头文件位于 `outputs/qwen3-vl-2b-eagle3-hiai/native/`；本次未同步 App 工程的库，也未安装手机 App。模型下载不会更新原生库；官方模型包更新与 App 更新须分别处理。
+
+### 验证要求与当前结论
+
+1. 使用相同原图输入，对比原始 HF 视觉计算、分块 PyTorch 映射和实际 MNN 量化输出，分别检查最终视觉特征与三组 DeepStack；同时报告 cosine 与相对 L2，不能只比 shape 或单看回答。
+2. 使用 [validate_eagle.cpp](project/harmony/tests/validate_eagle.cpp) 做真实模型集成检查，覆盖生成预算、EOS 后重置、图像输入、逐 token 续接和保留前缀。开启 `enable_debug` 后，通过算子回调确认实际执行 draft，不能仅凭配置判断。
+3. 保留同权重自回归对照。编译成功、主机 CPU 验证、真机 HiAI 执行、速度提升是不同结论，分别记录。
+
+本次主机 12 项集成检查、13 项 attention 测试与 32 项 SDK / 模型脚本测试通过，鸿蒙 ARM64 交叉编译完成。固定猫图的最终视觉特征 cosine 约 0.9988，三组 DeepStack 均超过 0.9987；这是有限图片验证，不是基于图片做过量化校准或完整质量评测。
+**长文本的 EAGLE 与自回归贪心续写存在差异，未建立逐 token 完全一致保证；本次没有连接手机，尚未验证该包的真机 HiAI 编译、缓存、内存与性能，也不能承诺 EAGLE 一定加速。**
+
+
+## Qwen3.5-2B 原生 MTP（2026-11-11）
+
+2026-11-12 两份 Qwen 包增加单图离线 ViT，说明见 [Qwen 单图离线视觉](docs/inference/qwen-offline-vision.md)。新增视觉为原始 checkpoint 的 FP16，不复用 Mobi 的冻结 W4；原 CPU LLM/draft、在线视觉保留。根 `offline_npu2` marker 中 `vision_executor=omni_full_vision_v1` 选择 Omni 完整视觉适配器，v2 视觉协议明确区分 DeepStack 3/0。必须同步新 `libMNN.so`、公共头和 `offline_npu2` 源码，重新编译 App；不要仍然告知“只替换 libMNN.so”。无新增 HiAI 算子，尚未真机验收。
+
+完整流程与验收边界见 [Qwen3.5-2B + MTP](docs/inference/qwen3.5-2b-mtp-hiai.md)。模型路径必须登记在 [models.md](models.md)，下载、导出及中间模型均放在 `/temp/models/`。
+
+已发布运行包：[fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN)。远端 `runtime/` 提供配套鸿蒙 ARM64 库；37 个文件的远端大小及 SHA256 已核对。使用新模型需更新 `libMNN.so` 和匹配头文件；本次没有新增 HiAI 算子，四个 HiAI 配套库沿用上一版 Qwen3-VL 的相同文件。
+
+- 使用 `project/harmony/prepare_qwen3_5_mtp.py` 导出 dense 2B 原始 checkpoint；不是复用 Qwen3-VL EAGLE 权重。ViT 24 层分为 6 个在线 HiAI blocks，pre/post 与 LLM/MTP 在 CPU，且此模型没有 DeepStack。
+- LLM / MTP 主干 HQQ W4/group64，embedding/head W8/group64，ViT FP16。CPU 采用 `dynamic_option=2`，默认 `precision=high` 保留 FP32 递归状态；未做新的 GPTQ 或图片激活校准。
+- checkpoint 混合 BF16 矩阵与 FP32 norm，必须避免按 BF16 整体加载后再转回 FP32。原生 MTP 输入顺序为归一化 next embedding、归一化 previous hidden；target / recursive draft hidden 均为 final norm 之后的值。
+- MTP 通过 `speculative_type=mtp`、`mtp_type=qwen3_5` 显式启用；greedy，默认 2 个 draft。CPU LinearAttention 用待提交输入重放接受前缀，同时维护卷积窗口与递归状态。旧 Qwen3-VL 普通解码和 EAGLE 路径继续支持。
+- 续接、缺少完整 hidden 前缀的 chunked prefill 等情形回退普通解码；不能把 `generate(1)` 循环当作 MTP 验证。当前不支持多原生 MTP 层、独立 MTP embedding 和随机拒绝采样。
+- 主机映射、实际 MNN 图文、状态回滚、重复请求及 Qwen3-VL 回归已验证；鸿蒙库已交叉编译。没有连接手机，不能宣称 HiAI 真机成功或性能提升。W4 相对原模型有可测误差，MTP 与 AR 可分叉且主机样例可能更慢。
+- 新库位于 `outputs/qwen3.5-2b-mtp-hiai/native/`。本次没有新增 NAPI 接口；不要要求用户额外下载一个“模型自带”的 `libentry.so`。
 
 ## OMG/OMC 离线 NPU 图编译
 

@@ -114,10 +114,10 @@ python project/harmony/compare_snapshots.py \
 
 整份 CPU LLM 权重文件 SHA256 保持为 `23c072fb9a870812cdf4c859bf2fe57b3b9594852fb8794dc34dbf62c0c29095`；冻结 W4 视觉外置权重也与已发布版本逐字节一致。重新编译得到的视觉 OMC 为 5,265,008 bytes，外置权重为 251,344,384 bytes。
 
-本机交付目录为 `.artifacts/mnn-master-20261018/`：
+本机原生库及验收记录位于 `.artifacts/mnn-master-20261018/`；模型已迁至 `/temp/models/mobi_2B_hybrid_kirin9030_mnn_20261018/`，不再占用项目目录。模型地址汇总见 [models.md](../../models.md)：
 
 - `native/`：真实鸿蒙 ARM64 libMNN、HiAI 库、配套头文件和命令行工具。
-- `model/config.json`：离线单图入口；`model/config_online.json`：在线 MNN 入口。
+- `/temp/models/mobi_2B_hybrid_kirin9030_mnn_20261018/config.json`：离线单图入口；同目录的 `config_online.json`：在线 MNN 入口。
 - `integration-report.json` 和 `validation/`：验收汇总与测试记录；模型包内也保留精度报告和文件哈希清单。
 
 大文件交付目录由 Git 忽略；构建中间产物保留于 `/tmp/mobi-mnn-validation`。失败候选不作为交付模型。

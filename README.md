@@ -50,7 +50,7 @@ NPU 耗时仅统计六段 ViT blocks 的累计 `Process` 调用时间，不含 C
 
 “在线”和“离线”指 **NPU 图的编译时机**。两种方式均在设备端执行模型推理。
 
-下表比较配套 App 当前发布的两种混合部署方案。仓库另提供[全模型 NPU 编译与执行](docs/inference/full-npu-kirin9030.md)，计算划分可覆盖 ViT 与 LLM。
+下表以 Mobi 发布包比较两种混合部署方案，位宽随模型包而定。Qwen3-VL-2B 和 Qwen3.5-2B 的新增离线视觉采用 FP16，见 [Qwen 单图离线视觉](docs/inference/qwen-offline-vision.md)。仓库另提供[全模型 NPU 编译与执行](docs/inference/full-npu-kirin9030.md)，计算划分可覆盖 ViT 与 LLM。
 
 | 对比项 | 在线 NPU 编译版本 | 离线 NPU 编译版本 |
 | --- | --- | --- |
@@ -117,8 +117,16 @@ git clone --branch coevomind-app --single-branch \
 | Mobi 2B 原始模型 | [YYDH21/mobi0402_2B_halfimage_rl](https://www.modelscope.cn/models/YYDH21/mobi0402_2B_halfimage_rl) | Hugging Face 格式原始权重，用于导出、量化及精度对照 |
 | Mobi 2B GPTQ 模型 | [YYDH21/mobi0402_2B_halfimage_rl-w8g128](https://www.modelscope.cn/models/YYDH21/mobi0402_2B_halfimage_rl-w8g128) | AutoRound 量化、GPTQ 格式保存的 W8/group128 权重，用于 MNN 导入 |
 | Mobi 2B NPU 完整运行包 | [fengerhu1/mobi_2B_offline_npu2_kirin9030_online_v2](https://www.modelscope.cn/models/fengerhu1/mobi_2B_offline_npu2_kirin9030_online_v2) | 包含完整 MNN ViT、单图离线 ViT 及 CPU LLM，支持在线 NPU 和 Kirin9030 离线 NPU，约 3.54 GB |
+| Qwen3.5-2B 原生 MTP 运行包 | [fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN) | 在线 HiAI / Kirin9030 单图离线视觉 + CPU LLM/MTP，主干 W4、视觉 FP16；尚未真机验收 |
+| Qwen3-VL-2B EAGLE-3 运行包 | [fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN) | 在线 HiAI / Kirin9030 单图离线视觉 + CPU LLM/EAGLE；CPU 主干 W4，离线视觉 FP16 |
 
 运行包中，离线 ViT 使用 W4A16，CPU LLM 沿用上述 GPTQ 模型的 W8 主干权重。各部分采用不同精度，具体布局见[模型包说明](transformers/llm/export/kirin_hybrid_offline/README.md)。
+
+Qwen3-VL-2B 的另一套部署配置使用 MNN 官方 W4 主模型与 EAGLE-3 draft，视觉 blocks 在线编译到 HiAI。模型准备、鸿蒙库编译及验证范围见 [Qwen3-VL + EAGLE-3 部署说明](docs/inference/qwen3-vl-eagle3-hiai.md)。
+
+Qwen3.5-2B 提供在线 HiAI 视觉与 CPU 原生 MTP 的导出配置，语言主干 / MTP 使用 W4，视觉保留 FP16。架构差异、导出方法及主机验证范围见 [Qwen3.5-2B + MTP 部署说明](docs/inference/qwen3.5-2b-mtp-hiai.md)；目前尚未完成该模型的真机验收，不保证 MTP 带来加速。
+
+上述两份 Qwen 包均增加了 Kirin9030 的单张离线 ViT 和外置 FP16 权重，原在线 / CPU 配置保留，LLM 与 draft 权重没有重新量化。需要更新配套 MNN 库、接口头和离线桥接源码后重新编译 App；模式选择与验证边界见 [Qwen 单图离线视觉](docs/inference/qwen-offline-vision.md)。
 
 也可通过 ModelScope SDK 下载完整运行包：
 
@@ -355,6 +363,7 @@ package/
 | [单图视觉离线 NPU](transformers/llm/export/kirin_hybrid_offline/README.md) | App 混合部署方案、DeepStack 对接、模型打包与验证 |
 | [全图 NPU 构建与验证](docs/inference/full-npu-kirin9030.md) | 全模型离线编译、图权重分离、W4 量化、CPU 精度检验与内存约束 |
 | [视觉 NPU 技术记录](docs/inference/visual-npu-notes.md) | 视觉分块方案、在线编译及历史问题排查 |
+| [Qwen3.5-2B 与原生 MTP](docs/inference/qwen3.5-2b-mtp-hiai.md) | 混合注意力、在线 HiAI 视觉、CPU MTP、W4 导出、精度检查与当前限制 |
 | [MNN LLM](transformers/README.md) | MNN 大模型导出与推理工具 |
 
 仓库支持全模型 NPU 编译与执行，已取得精度阶段性进展；设备内存约束下的图驻留、权重初始化与解码性能仍需优化。配套 App 的发布方案采用 **NPU ViT + CPU LLM** 作为资源与性能折中，详见相应技术文档。
