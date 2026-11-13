@@ -35,7 +35,7 @@ Mobiinfer-HarmonyOS 基于 [MNN](https://github.com/alibaba/MNN) 构建，面向
 
 ### 性能参考
 
-测试设备为 **Kirin9030**，模型为 **Mobi 2B（基于 Qwen3-VL-2B）**，每次输入一张图片。
+测试设备为 **Kirin9030**。视觉性能参考使用 **Mobi 2B（基于 Qwen3-VL-2B）**，每次输入一张图片。
 
 参考测试使用 App 的竖图目标尺寸 **270 × 600（宽 × 高）**，经模型预处理对齐后为 **256 × 608**。横图的目标尺寸为 600 × 270，对齐后为 608 × 256。
 
@@ -45,6 +45,15 @@ Mobiinfer-HarmonyOS 基于 [MNN](https://github.com/alibaba/MNN) 构建，面向
 | 在线 NPU 图执行（图已加载） | 约 **0.66 s** |
 
 NPU 耗时仅统计六段 ViT blocks 的累计 `Process` 调用时间，不含 CPU 视觉 pre/post、外部输入输出拷贝、模型加载及首次在线编译。CPU 视觉处理与 NPU 图执行的阶段口径不同，上表不用于计算端到端加速比；计时边界见[性能分析](docs/developer/kirin-npu/07-performance-and-troubleshooting.md#12-当前性能数据的正确含义)。实际耗时随图片尺寸和设备运行状态变化。
+
+语言解码性能参考如下，主模型与 draft 均在 CPU 执行，并启用对应的推测解码方案：
+
+| 模型运行包 | 解码方案 | Decoding 速度 |
+| --- | --- | --- |
+| [Qwen3-VL-2B + EAGLE-3](https://modelscope.cn/models/fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN) | EAGLE-3 | 约 **27 tokens/s** |
+| [Qwen3.5-2B + MTP](https://modelscope.cn/models/fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN) | 原生 MTP | 约 **16 tokens/s** |
+
+以上解码速度为真机测试参考值，仅对应 token 生成阶段，视觉处理、prefill、模型加载及 NPU 图编译另计。实际速度随上下文长度、draft 接受率、CPU 线程数和设备运行状态变化。
 
 ### 方案对比
 
@@ -110,21 +119,21 @@ git clone --branch coevomind-app --single-branch \
 
 ## 模型下载
 
-**Mobi 模型采用 Qwen3-VL 架构，由视觉编码器 ViT 和语言模型 LLM 组成。** 当前提供 Mobi 2B 的原始权重、GPTQ 格式量化权重和端侧运行包：
+**Mobi 模型采用 Qwen3-VL 架构，由视觉编码器 ViT 和语言模型 LLM 组成。** 当前提供 Mobi 2B 的原始权重、GPTQ 格式量化权重和端侧运行包，以及 Qwen3-VL-2B + EAGLE-3、Qwen3.5-2B + MTP 端侧运行包：
 
 | 模型 | ModelScope | 用途 |
 | --- | --- | --- |
 | Mobi 2B 原始模型 | [YYDH21/mobi0402_2B_halfimage_rl](https://www.modelscope.cn/models/YYDH21/mobi0402_2B_halfimage_rl) | Hugging Face 格式原始权重，用于导出、量化及精度对照 |
 | Mobi 2B GPTQ 模型 | [YYDH21/mobi0402_2B_halfimage_rl-w8g128](https://www.modelscope.cn/models/YYDH21/mobi0402_2B_halfimage_rl-w8g128) | AutoRound 量化、GPTQ 格式保存的 W8/group128 权重，用于 MNN 导入 |
 | Mobi 2B NPU 完整运行包 | [fengerhu1/mobi_2B_offline_npu2_kirin9030_online_v2](https://www.modelscope.cn/models/fengerhu1/mobi_2B_offline_npu2_kirin9030_online_v2) | 包含完整 MNN ViT、单图离线 ViT 及 CPU LLM，支持在线 NPU 和 Kirin9030 离线 NPU，约 3.54 GB |
-| Qwen3.5-2B 原生 MTP 运行包 | [fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN) | 在线 HiAI / Kirin9030 单图离线视觉 + CPU LLM/MTP，主干 W4、视觉 FP16；尚未真机验收 |
 | Qwen3-VL-2B EAGLE-3 运行包 | [fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3-VL-2B-Instruct-Eagle3-HiAI-MNN) | 在线 HiAI / Kirin9030 单图离线视觉 + CPU LLM/EAGLE；CPU 主干 W4，离线视觉 FP16 |
+| Qwen3.5-2B 原生 MTP 运行包 | [fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN](https://modelscope.cn/models/fengerhu1/Qwen3.5-2B-MTP-HiAI-MNN) | 在线 HiAI / Kirin9030 单图离线视觉 + CPU LLM/MTP，主干 W4、视觉 FP16 |
 
-运行包中，离线 ViT 使用 W4A16，CPU LLM 沿用上述 GPTQ 模型的 W8 主干权重。各部分采用不同精度，具体布局见[模型包说明](transformers/llm/export/kirin_hybrid_offline/README.md)。
+Mobi 运行包中，离线 ViT 使用 W4A16，CPU LLM 沿用上述 GPTQ 模型的 W8 主干权重。各部分采用不同精度，具体布局见[模型包说明](transformers/llm/export/kirin_hybrid_offline/README.md)。
 
 Qwen3-VL-2B 的另一套部署配置使用 MNN 官方 W4 主模型与 EAGLE-3 draft，视觉 blocks 在线编译到 HiAI。模型准备、鸿蒙库编译及验证范围见 [Qwen3-VL + EAGLE-3 部署说明](docs/inference/qwen3-vl-eagle3-hiai.md)。
 
-Qwen3.5-2B 提供在线 HiAI 视觉与 CPU 原生 MTP 的导出配置，语言主干 / MTP 使用 W4，视觉保留 FP16。架构差异、导出方法及主机验证范围见 [Qwen3.5-2B + MTP 部署说明](docs/inference/qwen3.5-2b-mtp-hiai.md)；目前尚未完成该模型的真机验收，不保证 MTP 带来加速。
+Qwen3.5-2B 提供在线 HiAI 视觉与 CPU 原生 MTP 的导出配置，语言主干 / MTP 使用 W4，视觉保留 FP16。架构差异、导出方法及主机验证范围见 [Qwen3.5-2B + MTP 部署说明](docs/inference/qwen3.5-2b-mtp-hiai.md)，真机解码速度见上方[性能参考](#性能参考)。
 
 上述两份 Qwen 包均增加了 Kirin9030 的单张离线 ViT 和外置 FP16 权重，原在线 / CPU 配置保留，LLM 与 draft 权重没有重新量化。需要更新配套 MNN 库、接口头和离线桥接源码后重新编译 App；模式选择与验证边界见 [Qwen 单图离线视觉](docs/inference/qwen-offline-vision.md)。
 
