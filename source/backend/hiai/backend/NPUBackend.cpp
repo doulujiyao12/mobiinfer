@@ -475,19 +475,27 @@ bool HiaiForceV320(const Backend::Info& info,
 
         int ret = mngerClient->Init(nullptr);
         if (ret != 0) {
-            MNN_ERROR("[NPU] Model Manager Init Failed.");
+            MNN_ERROR("[NPU] Model Manager Init failed: model=%s ret=%d (0x%08x) om_bytes=%u\n",
+                      model_name.c_str(), ret, static_cast<unsigned>(ret), modelBufferData.length);
             return nullptr;
         }
 
         shared_ptr<hiai::AiModelBuilder> mcbuilder = make_shared<hiai::AiModelBuilder>(mngerClient);
         hiai::MemBuffer* buffer = mcbuilder->InputMemBufferCreate(modelBufferData.data, modelBufferData.length);
         if (buffer == nullptr) {
-            MNN_ERROR("[NPU] create MemBuffer failed");
+            MNN_ERROR("[NPU] InputMemBufferCreate failed: model=%s om_bytes=%u\n",
+                      model_name.c_str(), modelBufferData.length);
             return nullptr;
         }
 
         shared_ptr<hiai::AiModelDescription> desc = make_shared<hiai::AiModelDescription>(model_name, 4, 0, 0, 0);
-        desc->SetModelBuffer(buffer->GetMemBufferData(), buffer->GetMemBufferSize());
+        ret = desc->SetModelBuffer(buffer->GetMemBufferData(), buffer->GetMemBufferSize());
+        if (ret != hiai::AI_SUCCESS) {
+            MNN_ERROR("[NPU] SetModelBuffer failed: model=%s ret=%d (0x%08x) om_bytes=%u\n",
+                      model_name.c_str(), ret, static_cast<unsigned>(ret), modelBufferData.length);
+            mcbuilder->MemBufferDestroy(buffer);
+            return nullptr;
+        }
 
         vector<shared_ptr<hiai::AiModelDescription>> model_desc;
         model_desc.push_back(desc);
@@ -495,7 +503,8 @@ bool HiaiForceV320(const Backend::Info& info,
 
         ret = mngerClient->Load(model_desc);
         if (ret != 0) {
-            MNN_ERROR("[NPU] Model Load Failed.");
+            MNN_ERROR("[NPU] Model Load failed: model=%s ret=%d (0x%08x) om_bytes=%u\n",
+                      model_name.c_str(), ret, static_cast<unsigned>(ret), modelBufferData.length);
             mngerClient = nullptr;
         }
 
@@ -987,19 +996,17 @@ bool HiaiForceV320(const Backend::Info& info,
                     matchIndex = iter->second;
                 }
             }
-            // Last resort: size-based heuristic (may fail for same-shape outputs).
+            // A size-only fallback is safe only for a unique physical slot.
+            // Logical output indexes differ once Identity outputs are merged.
             if (matchIndex == -1) {
-                MNN_HIAI_LOG("WARNNINGGG -> pointer comparison failed, fallback to size.");
-                if (mMNNOutTensors.size() == 1) {
-                    matchIndex = 0;
-                } else {
-                    for(int i = 0; i < mMNNOutTensors.size(); i++) {
-                        if(mMNNOutTensors[i]->elementSize() == srcTensor->elementSize()) {
-                            matchIndex = i;
-                            break;
-                        }
+                int matches = 0;
+                for (size_t i = 0; i < mOutputTensors.size(); ++i) {
+                    if (mOutputTensors[i]->GetSize() == static_cast<size_t>(srcTensor->size())) {
+                        matchIndex = static_cast<int>(i);
+                        ++matches;
                     }
                 }
+                if (matches != 1) matchIndex = -1;
             }
             if (matchIndex == -1 || matchIndex >= (int)mOutputTensors.size()) {
                 MNN_HIAI_LOG("  -> Cannot recover output mapping (match=%d, npuOut=%zu)! Aborting copy.",
@@ -1077,6 +1084,7 @@ bool HiaiForceV320(const Backend::Info& info,
         mKeepConsts.clear();
         mGrapMap.clear();
         mOutGEOpMap.clear();
+        mOutputAliases.clear();
         mInputOps.clear();
         mInputTensors.clear();
         mOutputTensors.clear();
@@ -1124,6 +1132,7 @@ bool HiaiForceV320(const Backend::Info& info,
         }
         mGrapMap.clear();
         mOutGEOpMap.clear();
+        mOutputAliases.clear();
         mInputOps.clear();
         mInputTensors.clear();
         mOutputTensors.clear();
@@ -1203,7 +1212,7 @@ bool HiaiForceV320(const Backend::Info& info,
         identity.addValue(pNPUModelCacheIdentity);
         identity.addValue(mPrecision);
         identity.add(mNPURuntime->mHiaiRuntimeVersion.data(), mNPURuntime->mHiaiRuntimeVersion.size());
-        const uint32_t version = 1;
+        const uint32_t version = 2; // Physical output aliases are now registered only once.
         identity.addValue(version);
         for (const auto& command : commands) {
             const auto type = command.op->type();
@@ -1330,7 +1339,7 @@ bool HiaiForceV320(const Backend::Info& info,
     std::string NPUBackend::onGetGraphCacheContext() const {
 #if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
         if (!isExplicitHiAISession() && !mNPURuntime->mHiaiRuntimeVersion.empty()) {
-            return "hiai-module-v1:" + mNPURuntime->mHiaiRuntimeVersion + ":" + std::to_string(mPrecision);
+            return "hiai-module-v2:" + mNPURuntime->mHiaiRuntimeVersion + ":" + std::to_string(mPrecision);
         }
 #endif
         return {};
@@ -1499,7 +1508,7 @@ bool HiaiForceV320(const Backend::Info& info,
         // It remains stable across App launches while separating graph chunks and all
         // input/output tensor layouts that affect HiAI online compilation.
         std::ostringstream signature;
-        signature << "hiai_om_cache_v3|ops=" << mGrapMap.size();
+        signature << "hiai_om_cache_v3|outputs=alias-v2|ops=" << mGrapMap.size();
         signature << "|model=" << pNPUModelCacheIdentity
                   << "|precision=" << static_cast<int>(mPrecision)
                   << "|ddk=" << mNPURuntime->mHiaiRuntimeVersion;
@@ -1678,12 +1687,17 @@ bool HiaiForceV320(const Backend::Info& info,
             mHostOutputTensors = mOutputTensors;
         }
         // Build mMNNOutTensors and match each MNN output tensor to a DDK output slot.
-        // We cannot assume 1:1 index correspondence because the DDK may produce a
-        // different number of outputs (e.g. when hidden_states and deepstack originate
-        // from the same DDK node, the DDK may merge them into one output buffer).
-        // Match by byte size: first pass prefers unmatched DDK slots, second pass
-        // reuses any matching slot so that same-shape MNN outputs can share one DDK buffer.
-
+        // Identity outputs share their producer's exact slot. Equal byte sizes
+        // alone do not imply aliases: different DeepStack features often have
+        // identical shapes. Cached graphs already record every exact slot.
+        std::map<const Tensor*, int> resolvedOutputs;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK && MNN_HIAI_USE_LOCAL_NPU_FIXES
+        if (mFastGraphLoaded) {
+            for (const auto& binding : mResizeCache.outputs) {
+                resolvedOutputs[mResizeCacheCommands[binding.command].outputs[binding.tensor]] = binding.slot;
+            }
+        }
+#endif
         std::vector<bool> ddkSlotUsed(mOutputTensors.size(), false);
         bool outputMappingValid = true;
         for (auto opMap : mOutGEOpMap) {
@@ -1691,23 +1705,28 @@ bool HiaiForceV320(const Backend::Info& info,
                 mMNNOutTensors.push_back(tensor);
                 int mnnBytes = (int)tensor->size();
                 int ddkSlot = -1;
-                // Pass 1: prefer an unmatched DDK slot with the same byte size.
-                for (int di = 0; di < (int)mOutputTensors.size(); di++) {
-                    if (!ddkSlotUsed[di] && (int)mOutputTensors[di]->GetSize() == mnnBytes) {
-                        ddkSlot = di;
-                        ddkSlotUsed[di] = true;
-                        break;
+                const auto alias = mOutputAliases.find(tensor);
+                const auto resolved = resolvedOutputs.find(alias == mOutputAliases.end() ? tensor : alias->second);
+                if (resolved != resolvedOutputs.end()) {
+                    ddkSlot = resolved->second;
+                    if (ddkSlot < 0 || ddkSlot >= static_cast<int>(mOutputTensors.size()) ||
+                        static_cast<int>(mOutputTensors[ddkSlot]->GetSize()) != mnnBytes) {
+                        ddkSlot = -1;
                     }
                 }
-                // Pass 2: if no unmatched slot, reuse any slot with the same size
-                // (handles DDK merging same-shape outputs into one buffer).
-                if (ddkSlot == -1) {
+                // Only a physical output may claim a new slot. An unresolved
+                // alias is an error, not permission to borrow an equal-sized one.
+                if (resolved == resolvedOutputs.end() && alias == mOutputAliases.end()) {
                     for (int di = 0; di < (int)mOutputTensors.size(); di++) {
-                        if ((int)mOutputTensors[di]->GetSize() == mnnBytes) {
+                        if (!ddkSlotUsed[di] && (int)mOutputTensors[di]->GetSize() == mnnBytes) {
                             ddkSlot = di;
                             break;
                         }
                     }
+                }
+                if (ddkSlot >= 0) {
+                    ddkSlotUsed[ddkSlot] = true;
+                    resolvedOutputs[tensor] = ddkSlot;
                 }
                 auto memPtr = TensorUtils::getDescribeOrigin(tensor)->mem.get();
                 if (memPtr != nullptr && ddkSlot >= 0) {
@@ -1723,7 +1742,7 @@ bool HiaiForceV320(const Backend::Info& info,
             }
         }
         if (mOutputTensors.size() != mMNNOutTensors.size()) {
-            MNN_HIAI_LOG("getInOutTensorInfo: MISMATCH npuOutputs=%zu vs mnnOutputs=%zu (same-shape outputs will share DDK buffer)",
+            MNN_HIAI_LOG("getInOutTensorInfo: npuOutputs=%zu logicalOutputs=%zu (explicit aliases share a DDK buffer)",
                          mOutputTensors.size(), mMNNOutTensors.size());
         }
         return outputMappingValid ? 0 : -1;
@@ -2006,7 +2025,8 @@ bool HiaiForceV320(const Backend::Info& info,
 
         if (mMgrClient == nullptr) {
             MNN_ERROR("[NPU] Model Manager Client is null \n");
-            MNN_HIAI_LOG("bulidIRModelAndLoad: LoadModelSync FAILED (NPU firmware rejected OM model)");
+            MNN_ERROR("[NPU] LoadModelSync failed: chunk=%s model=%s om_bytes=%u; see the stage/return code above\n",
+                      pNPUModelDirPath.c_str(), modelName.c_str(), om_model_buff.length);
             ir_build.ReleaseModelBuff(om_model_buff);
             return INVALID_VALUE;
         }
@@ -2432,6 +2452,33 @@ bool HiaiForceV320(const Backend::Info& info,
             }
         }
         if(!tensors.empty()) {
+            // Register a GE output only once. Identity / no-op Interp may alias
+            // an existing terminal node (hidden_states + DeepStack). Repeating
+            // that node in Graph::SetOutputs can build an OM that fails to load.
+            // Explicit HCL sessions retain their existing positional I/O path.
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+            if (!isExplicitHiAISession() && op->outputIndexes()->size() == 1) {
+                for (auto& entry : mOutGEOpMap) {
+                    if (entry.first != HIAI_op.back() || entry.second.empty()) continue;
+                    const auto canonical = entry.second.front();
+                    const bool singleOutput = std::all_of(
+                        entry.second.begin(), entry.second.end(), [&](const Tensor* tensor) {
+                            const auto alias = mOutputAliases.find(tensor);
+                            return tensor == canonical ||
+                                   (alias != mOutputAliases.end() && alias->second == canonical);
+                        });
+                    if (!singleOutput) continue; // Do not merge distinct ports of a multi-output op.
+                    for (auto tensor : tensors) {
+                        if (tensor == canonical || mOutputAliases.count(tensor)) continue;
+                        mOutputAliases[tensor] = canonical;
+                        entry.second.push_back(tensor);
+                    }
+                    MNN_HIAI_LOG("  +terminal alias registered: op=%s producer=%s logical_outputs=%zu physical_outputs=%zu",
+                                 opNameStr, entry.first->GetName().c_str(), entry.second.size(), mOutGEOpMap.size());
+                    return;
+                }
+            }
+#endif
             mOutGEOpMap.emplace_back(make_pair(HIAI_op[HIAI_op.size()-1], tensors));
             MNN_HIAI_LOG("  +terminal output(s) registered: count=%zu (total outputs=%zu)",
                          tensors.size(), mOutGEOpMap.size());

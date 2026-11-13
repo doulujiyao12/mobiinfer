@@ -451,20 +451,20 @@ static bool visualChunkDumpVarp(const std::string& base, VARP var,
 #endif // MNN_VISUAL_CHUNK_INPUT_DUMP
 
 static VARP makeHostBridgeVar(const VARP& src, const char* name) {
-    if (src.get() == nullptr || src->getInfo() == nullptr) return src;
+    if (src.get() == nullptr || src->getInfo() == nullptr) return nullptr;
     auto info = src->getInfo();
     auto srcHost = src->readMap<uint8_t>();
     if (srcHost == nullptr) {
-        MNN_ERROR("[vision-chunk] makeHostBridgeVar: source host null, keep original var (shape=[%s])\n",
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: source host null (shape=[%s])\n",
                   varShapeString(src).c_str());
-        return src;
+        return nullptr;
     }
     auto bridge = Express::_Input(info->dim, NCHW, info->type);
     auto dstHost = bridge->writeMap<uint8_t>();
     if (dstHost == nullptr) {
-        MNN_ERROR("[vision-chunk] makeHostBridgeVar: bridge writeMap null, keep original var (shape=[%s])\n",
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: bridge writeMap null (shape=[%s])\n",
                   varShapeString(src).c_str());
-        return src;
+        return nullptr;
     }
     ::memcpy(dstHost, srcHost, (size_t)info->size * (size_t)info->type.bytes());
     if (name != nullptr) {
@@ -1694,6 +1694,8 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                       varShapeString(preOut[0]).c_str(),
                       varShapeString(preOut[1]).c_str(),
                       varShapeString(attention_mask).c_str());
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return {};
         }
         VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
         
@@ -1853,13 +1855,23 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                     auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
                     if (chunkOut.empty()) {
                         MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
+                        mContext->status = LlmStatus::INTERNAL_ERROR;
                         return std::vector<int>(0);
                     }
                     curHidden = makeHostBridgeVar(chunkOut[0], "vision_chunk_hidden_bridge");
-                    (void)curHidden->readMap<void>();
+                    if (curHidden.get() == nullptr) {
+                        MNN_ERROR("[vision-chunk] chunk[%zu] hidden output unavailable; aborting request\n", i);
+                        mContext->status = LlmStatus::INTERNAL_ERROR;
+                        return {};
+                    }
                     for (size_t j = 1; j < chunkOut.size(); j++) {
-                        (void)chunkOut[j]->readMap<void>();
-                        allDeepstack.push_back(makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge"));
+                        auto deepstack = makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge");
+                        if (deepstack.get() == nullptr) {
+                            MNN_ERROR("[vision-chunk] chunk[%zu] DeepStack output[%zu] unavailable; aborting request\n", i, j);
+                            mContext->status = LlmStatus::INTERNAL_ERROR;
+                            return {};
+                        }
+                        allDeepstack.push_back(deepstack);
                     }
                 }
 #if VISUAL_CHUNK_DUMP_OUTPUT
@@ -3110,7 +3122,11 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
         } else if (mode == "video") {
             mul_ids = processVideoContent(content, multimodal_input.videos);
         }
-
+        if (mul_ids.empty()) {
+            MNN_ERROR("[Omni] %s preprocessing failed; aborting multimodal request\n", mode.c_str());
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return {};
+        }
         ids.insert(ids.end(), mul_ids.begin(), mul_ids.end());
         searchStart = match.suffix().first;
     }

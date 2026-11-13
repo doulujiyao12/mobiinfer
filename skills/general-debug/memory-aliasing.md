@@ -97,6 +97,12 @@ MNN_PRINT("[MyOp] cos=%p sin=%p qTmp=%p kTmp=%p out=%p\n",
 - 调用顺序至关重要：只有 `compute()` 之后才知道实际分配结果，反过来做检查等于空跑；
 - 若图重排后仍重叠，需要在 converter 侧调整 op 顺序（如 `reorderQKVProjections`），或直接放弃这次 fusion。
 
+外部后端还要区分**逻辑输出 Tensor**与**物理图输出节点/端口**。例如 HiAI 中，`Identity`
+可让 hidden_states 与 DeepStack 共用同一生产节点；检查 `SetOutputs` 是否重复注册该节点，
+保留逻辑别名与物理槽位的显式映射。不能仅凭 shape / 字节数相同就合并输出，独立的 DeepStack
+特征往往同形状。修复这类绑定后，同时更新 OM、resize 元数据和 Module 缓存的实现版本，
+防止旧绑定绕过修复。主机可验证注册及映射逻辑，但设备加载是否恢复仍须真机确认。
+
 ### Step 5: 越界写 / 未初始化
 
 如果地址不别名但结果仍错，考虑：

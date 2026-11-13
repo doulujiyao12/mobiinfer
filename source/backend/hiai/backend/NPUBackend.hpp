@@ -437,6 +437,9 @@ namespace MNN {
         // in which we call graph.SetOutputs(), otherwise mOutputTensors[i] will not
         // correspond to mMNNOutTensors[i] when onCopyBuffer uses the same index.
         vector<pair<shared_ptr<ge::Operator>, MNNTensorList>> mOutGEOpMap;
+        // Several logical outputs (Identity / no-op Interp) can share one GE
+        // output. Keep the alias explicit instead of guessing from equal sizes.
+        std::map<const Tensor*, const Tensor*> mOutputAliases;
 
         map<int, std::vector<ge::Operator>> mInputOps;
 
